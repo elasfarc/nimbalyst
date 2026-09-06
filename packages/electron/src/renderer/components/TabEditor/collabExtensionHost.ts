@@ -17,19 +17,17 @@
  *     for collaborative documents).
  */
 
-import { Awareness } from 'y-protocols/awareness';
-import type {
-  DocumentSyncStatus,
-  AwarenessState as WireAwarenessState,
-} from '@nimbalyst/runtime/sync';
+import type { Awareness } from 'y-protocols/awareness';
+import { pickCursorColor } from './collabCursorColor';
+import type { DocumentSyncStatus } from '@nimbalyst/runtime/sync';
 import type { DocumentSyncProvider } from '@nimbalyst/runtime/sync';
 import type {
   CollaborationContext,
   CollaborationStatus,
   EditorHost,
+  EditorViewport,
   ExtensionStorage,
   RevisionSnapshotAdapter,
-  StandardAwarenessState,
 } from '@nimbalyst/runtime';
 import type { CollabDocumentConfig } from '../../utils/collabDocumentOpener';
 import { store, editorDirtyAtom, makeEditorKey } from '@nimbalyst/runtime/store';
@@ -39,119 +37,26 @@ import {
   setEditorContextItems as storeSetEditorContextItems,
 } from '../../stores/editorContextStore';
 import type { EditorContext, EditorContextItem } from '@nimbalyst/runtime';
-
-/** Origin tag for awareness updates we inject from remote broadcasts. */
-const REMOTE_AWARENESS_ORIGIN = Symbol('nimbalyst:collab-remote-awareness');
+import {
+  createEditorAPIOwnerToken,
+  registerEditorAPI,
+  unregisterEditorAPI,
+} from '@nimbalyst/runtime';
+import {
+  createHostedCollaborationComments,
+  type CollaborationCommentsHostConfig,
+  type HostedCollaborationComments,
+} from './collaborationCommentsService';
 
 /**
- * Bridges DocumentSyncProvider's awareness (string userId keys + custom JSON)
- * to a y-protocols `Awareness` instance (numeric clientID keys + standard
- * awareness event shape). Returns the Awareness instance plus a cleanup fn.
- *
- * Wire-format choice: the extension awareness path puts the full y-protocols
- * local state on the wire as-is. DocumentSync's `AwarenessState` was widened
- * to `Record<string, unknown> & { user: { name, color, id? } }` precisely so
- * this works without translation.
+ * The DocumentSync -> y-protocols awareness bridge now lives in the runtime so
+ * the browser collaborative host shares one presence dialect with this one. It
+ * is re-exported here because every renderer call site imports it from this
+ * module, and a `vi.mock` of this path in their tests must keep intercepting it.
  */
-export function createExtensionAwarenessBridge(args: {
-  syncProvider: DocumentSyncProvider;
-  /** The Y.Doc owned by the sync provider; Awareness clientID derives from it. */
-  yDoc: import('yjs').Doc;
-  /** Local user identity to set on the Awareness instance immediately. */
-  user: { id: string; name: string; color: string };
-}): { awareness: Awareness; destroy: () => void } {
-  const { syncProvider, yDoc, user } = args;
-
-  const awareness = new Awareness(yDoc);
-  // Seed the local state with the standard user block so other clients can
-  // dedupe and render avatars before the extension publishes anything.
-  awareness.setLocalState({ user } satisfies StandardAwarenessState);
-
-  // Forward local awareness changes -> DocumentSync wire.
-  // We listen to the 'update' event so we catch every state change (including
-  // field changes via setLocalStateField). The origin guard prevents the echo
-  // when we inject remote state below.
-  const localUpdateHandler = (
-    _changes: { added: number[]; updated: number[]; removed: number[] },
-    origin: unknown
-  ) => {
-    if (origin === REMOTE_AWARENESS_ORIGIN) return;
-    const state = awareness.getLocalState();
-    if (state) {
-      syncProvider.setLocalAwareness(state as WireAwarenessState);
-    }
-  };
-  awareness.on('update', localUpdateHandler);
-
-  // Map remote userIds (string) to stable numeric clientIDs in our Awareness.
-  // Never reuse our own awareness.clientID for a remote user.
-  const userIdToClientId = new Map<string, number>();
-  let nextRemoteClientId = awareness.clientID + 1;
-  const allocateClientId = (userId: string): number => {
-    const existing = userIdToClientId.get(userId);
-    if (existing !== undefined) return existing;
-    // Skip past our own clientID if we collide.
-    while (nextRemoteClientId === awareness.clientID) nextRemoteClientId++;
-    const id = nextRemoteClientId++;
-    userIdToClientId.set(userId, id);
-    return id;
-  };
-
-  // Receive remote awareness from DocumentSync -> inject into Awareness.
-  const awarenessUnsub = syncProvider.onAwarenessChange((states) => {
-    const presentClientIds = new Set<number>();
-    const added: number[] = [];
-    const updated: number[] = [];
-
-    for (const [userId, state] of states) {
-      const clientId = allocateClientId(userId);
-      presentClientIds.add(clientId);
-      const wasPresent = awareness.states.has(clientId);
-      // Ensure remote state carries `user.id` so SDK consumers can use it
-      // for deduping; the DocumentSync wrapper provides userId out-of-band.
-      const stateWithId: StandardAwarenessState = {
-        ...(state as Record<string, unknown>),
-        user: {
-          ...(state.user as { name: string; color: string }),
-          id: (state.user as { id?: string }).id ?? userId,
-        },
-      };
-      awareness.states.set(clientId, stateWithId);
-      const prevMeta = awareness.meta.get(clientId);
-      awareness.meta.set(clientId, {
-        clock: (prevMeta?.clock ?? 0) + 1,
-        lastUpdated: Date.now(),
-      });
-      if (wasPresent) updated.push(clientId);
-      else added.push(clientId);
-    }
-
-    // Anyone in our remote map but missing from the broadcast has gone away.
-    const removed: number[] = [];
-    for (const clientId of awareness.states.keys()) {
-      if (clientId === awareness.clientID) continue;
-      if (presentClientIds.has(clientId)) continue;
-      awareness.states.delete(clientId);
-      removed.push(clientId);
-    }
-
-    if (added.length === 0 && updated.length === 0 && removed.length === 0) {
-      return;
-    }
-    const event = { added, updated, removed };
-    awareness.emit('change', [event, REMOTE_AWARENESS_ORIGIN]);
-    awareness.emit('update', [event, REMOTE_AWARENESS_ORIGIN]);
-  });
-
-  return {
-    awareness,
-    destroy: () => {
-      awarenessUnsub();
-      awareness.off('update', localUpdateHandler);
-      awareness.destroy();
-    },
-  };
-}
+export {
+  createExtensionAwarenessBridge,
+} from '@nimbalyst/runtime/sync';
 
 /**
  * Build a `CollaborationContext` backed by an existing `DocumentSyncProvider`
@@ -168,6 +73,8 @@ export function createCollaborationContext(args: {
   syncProvider: DocumentSyncProvider;
   awareness: Awareness;
   activeConfig: CollabDocumentConfig;
+  /** Omit when this host cannot provide live document-comment authority. */
+  comments?: CollaborationCommentsHostConfig;
   /**
    * Called whenever a custom editor registers (or unregisters) a revision
    * snapshot adapter. The CollaborativeTabEditor uses this to publish a
@@ -176,17 +83,29 @@ export function createCollaborationContext(args: {
    */
   onRevisionAdapterChange?: (adapter: RevisionSnapshotAdapter | null) => void;
 }): CollaborationContext {
-  const { syncProvider, awareness, activeConfig, onRevisionAdapterChange } = args;
+  const {
+    syncProvider,
+    awareness,
+    activeConfig,
+    comments,
+    onRevisionAdapterChange,
+  } = args;
   let currentAdapter: RevisionSnapshotAdapter | null = null;
+  const contentFlushes = new Set<() => void | Promise<void>>();
+  const yDoc = syncProvider.getYDoc();
+  const hostedComments = comments
+    ? createHostedCollaborationComments({ yDoc, host: comments })
+    : null;
 
-  return {
-    yDoc: syncProvider.getYDoc(),
+  const context: CollaborationContext = {
+    yDoc,
     awareness,
     user: {
-      id: activeConfig.userId,
-      name: activeConfig.userName ?? activeConfig.userId,
-      color: pickCursorColor(activeConfig.userId),
+      id: activeConfig.teamMemberId,
+      name: activeConfig.userName ?? activeConfig.teamMemberId,
+      color: pickCursorColor(activeConfig.teamMemberId),
     },
+    ...(hostedComments ? { comments: hostedComments.service } : {}),
     getStatus: () => syncProvider.getStatus() as CollaborationStatus,
     onStatusChange: (cb) => statusFanout(syncProvider).subscribe(cb),
     loadInitialContent: async () => {
@@ -216,7 +135,91 @@ export function createCollaborationContext(args: {
         }
       };
     },
+    registerContentFlush: (flush: () => void | Promise<void>) => {
+      contentFlushes.add(flush);
+      return () => {
+        contentFlushes.delete(flush);
+      };
+    },
   };
+
+  contentFlushRegistry.set(context, contentFlushes);
+  if (hostedComments) {
+    commentsCleanupRegistry.set(context, hostedComments.destroy);
+    hostedCommentsRegistry.set(context, hostedComments);
+  }
+  return context;
+}
+
+const commentsCleanupRegistry = new WeakMap<CollaborationContext, () => void>();
+const hostedCommentsRegistry = new WeakMap<
+  CollaborationContext,
+  HostedCollaborationComments
+>();
+
+/**
+ * The host's own handle on this tab's comments — the panel source and the
+ * platform-only mutations behind the comments pane.
+ *
+ * Kept off `CollaborationContext` deliberately: the context is what an
+ * extension receives, and it must expose only `comments.service`. Undefined
+ * when this host cannot provide comment authority for the document.
+ */
+export function getHostedCollaborationComments(
+  collaboration: CollaborationContext,
+): HostedCollaborationComments | undefined {
+  return hostedCommentsRegistry.get(collaboration);
+}
+
+/** Release tab-scoped comment adapters, controller, and repository lease. */
+export function disposeCollaborationContext(
+  collaboration: CollaborationContext,
+): void {
+  const cleanup = commentsCleanupRegistry.get(collaboration);
+  commentsCleanupRegistry.delete(collaboration);
+  cleanup?.();
+}
+
+// ---------------------------------------------------------------------------
+// Pending-content flush registry
+//
+// `registerContentFlush` is part of the public CollaborationContext, but the
+// drain is host-internal: only the host decides when a write must be complete.
+// Keyed off the context object rather than returned alongside it so the factory
+// keeps its single-value contract, the same shape as `statusFanouts` below.
+// ---------------------------------------------------------------------------
+
+const contentFlushRegistry = new WeakMap<
+  CollaborationContext,
+  Set<() => void | Promise<void>>
+>();
+
+/**
+ * Drain every binding's pending local content into the Y.Doc, then wait for the
+ * server to persist it. Resolves `false` if the server did not confirm.
+ *
+ * A binding that never registers a flush contributes nothing here, so this
+ * still closes the provider-to-server half for every collaborative document.
+ */
+export async function flushCollaborativeContent(
+  collaboration: CollaborationContext,
+): Promise<boolean> {
+  let drained = true;
+  for (const flush of contentFlushRegistry.get(collaboration) ?? []) {
+    try {
+      await flush();
+    } catch (error) {
+      // Every binding still gets its turn, and the ack still runs -- one
+      // binding's failure must not strand the others' pending content. What it
+      // must do is fail the result: a binding that could not push its newest
+      // edit leaves a document the server ack says nothing about, and reporting
+      // that as a completed write is how an edit goes missing in silence.
+      console.error('[collabExtensionHost] Pending content flush failed:', error);
+      drained = false;
+    }
+  }
+  const acked = await collaboration.flushWithAck();
+  return drained && acked;
 }
 
 // ---------------------------------------------------------------------------
@@ -269,16 +272,6 @@ export function notifyCollabStatus(
 // Collab-enabled EditorHost factory
 // ---------------------------------------------------------------------------
 
-function pickCursorColor(seed: string): string {
-  const colors = [
-    '#E05555', '#2BA89A', '#3A8FD6', '#D97706',
-    '#9B59B6', '#E06B8F', '#3B82F6', '#16A34A',
-  ];
-  let h = 0;
-  for (let i = 0; i < seed.length; i++) h = (h * 31 + seed.charCodeAt(i)) | 0;
-  return colors[Math.abs(h) % colors.length];
-}
-
 export interface CollabExtensionHostArgs {
   filePath: string;
   fileName: string;
@@ -297,6 +290,15 @@ export interface CollabExtensionHostArgs {
   /** Inline collaborative embeds are always marked embedded + read-only. */
   embedded?: boolean;
   readOnly?: boolean;
+  /**
+   * Receives the editor's scroll viewport when it publishes one.
+   *
+   * Only surfaces that show several documents in sequence supply this -- today
+   * the feedback detail popover, which carries the reader's place from one
+   * design alternative to the next. Everywhere else the editor's registration
+   * is dropped, which is the same as never registering.
+   */
+  onViewportRegistered?: (viewport: EditorViewport | null) => void;
 }
 
 /**
@@ -325,9 +327,11 @@ export function createCollabExtensionHost(
     subscribeToThemeChanges,
     embedded = false,
     readOnly = false,
+    onViewportRegistered,
   } = args;
 
   const editorKey = makeEditorKey(filePath);
+  const editorAPIOwnerToken = createEditorAPIOwnerToken(`collab:${filePath}`);
 
   const storage: ExtensionStorage = {
     get: () => undefined,
@@ -397,7 +401,38 @@ export function createCollabExtensionHost(
       if (embedded) return;
       storeSetEditorContextItems(filePath, items);
     },
-    registerEditorAPI(): void {},
+    /*
+     * Not gated on `embedded`, unlike its neighbours. Those guards exist to
+     * stop an inline embed from writing into surfaces that belong to the
+     * *tab* -- the AI context store, the editor API registry, both keyed by
+     * file path and both of which an embed would corrupt for whatever else has
+     * the same document open. A viewport goes nowhere but the caller that
+     * asked for it, and the surface that wants one is an embed by definition.
+     */
+    registerViewport(viewport: EditorViewport | null): void {
+      onViewportRegistered?.(viewport);
+    },
+    registerEditorAPI(api: unknown | null): void {
+      if (embedded) return;
+      if (api) {
+        // Not a no-op: `flushEditorSave` runs after every mutating extension AI
+        // tool, and for a collaborative document "saved" means the edit reached
+        // the Y.Doc and the server acked it. Returning early would let the tool
+        // report success while the write sat in the binding's debounce, where a
+        // peer update replaces it wholesale.
+        registerEditorAPI(
+          filePath,
+          api,
+          () => flushCollaborativeContent(collaboration).then(() => undefined),
+          {
+            ownerToken: editorAPIOwnerToken,
+            priority: 'visible',
+          },
+        );
+      } else {
+        unregisterEditorAPI(filePath, editorAPIOwnerToken);
+      }
+    },
     registerMenuItems(): void {},
 
     collaboration,

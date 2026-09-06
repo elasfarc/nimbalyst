@@ -47,6 +47,26 @@ export function getPreloadPath(): string {
 }
 
 /**
+ * The preload for the hidden animation-encoder window, resolved the same way as
+ * the main one. Built to <outDir>/preload/animationVideo.js.
+ */
+export function getAnimationVideoPreloadPath(): string {
+  return getPreloadPath().replace(/index\.js$/, 'animationVideo.js');
+}
+
+/**
+ * Resolve the trustworthy local page used by the hidden WebCodecs window.
+ * `about:blank` has an opaque origin in Electron and does not expose
+ * VideoEncoder, while a local file is a secure context.
+ */
+export function getAnimationVideoPagePath(): string {
+  if (app.isPackaged) {
+    return join(app.getAppPath(), 'out/renderer/animation-video.html');
+  }
+  return join(getPackageRoot(), 'animation-video.html');
+}
+
+/**
  * Get the path for the restart signal file used by dev-loop.sh.
  * Uses a per-instance suffix when NIMBALYST_USER_DATA_DIR is set
  * so multiple dev-loop instances don't cross-talk.

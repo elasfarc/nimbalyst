@@ -4,7 +4,8 @@
  * Three linking mechanisms:
  * 1. Session-based: After proposal-widget commits, links to session's tracker items
  * 2. Issue key parsing: Parses NIM-123 from any commit message detected by GitRefWatcher
- * 3. Auto-close: Fixes/Closes/Resolves keywords change tracker item status to "done"
+ * 3. Auto-close: Fixes/Closes/Resolves keywords move the item to whichever status
+ *    its own type completes on (see `trackerStatusCategory`)
  *
  * The passive GitRefWatcher path is opt-in (`enabled`, per-project overridable),
  * because it reacts to every commit in the repo including ones no agent was part
@@ -13,6 +14,7 @@
  * sign-off as exists. Only `autoCloseOnCommit` gates it.
  */
 
+import { execFile } from 'child_process';
 import Store from 'electron-store';
 import { logger } from '../utils/logger';
 import { parseJsonObjectColumn } from '../utils/jsonColumn';
@@ -20,7 +22,15 @@ import { isLocalIssueKey } from '../../shared/localIssueKey';
 import type { CommitDetectedEvent } from '../file/GitRefWatcher';
 import type { TrackerAutomationSettings } from '../utils/store';
 import { getEffectiveTrackerAutomation } from '../utils/store';
+import { getCurrentIdentity } from './TrackerIdentityService';
+import { appendActivity } from './tracker/trackerActivity';
 import type { LinkedCommit } from '@nimbalyst/runtime';
+import type { TrackerIdentity } from '@nimbalyst/runtime/core/DocumentService';
+import {
+  getDoneStatusValue,
+  getWorkflowStatusFieldName,
+  isTerminalStatus,
+} from '@nimbalyst/runtime/plugins/TrackerPlugin/models/trackerStatusCategory';
 
 // ---------------------------------------------------------------------------
 // Issue key parsing
@@ -86,6 +96,67 @@ export function getIssueKeyPrefix(issueKey: string | null | undefined): string |
   if (separatorIndex <= 0) return undefined;
 
   return trimmed.slice(0, separatorIndex).toUpperCase();
+}
+
+// ---------------------------------------------------------------------------
+// Commit author
+// ---------------------------------------------------------------------------
+
+/**
+ * Read a commit's author name and email. The callback form of `execFile` is
+ * used rather than `promisify` so a mocked `execFile` still sees the call.
+ */
+function readCommitAuthor(
+  workspacePath: string,
+  commitHash: string,
+): Promise<{ name: string; email: string } | null> {
+  return new Promise((resolve) => {
+    execFile(
+      'git',
+      ['show', '-s', '--format=%an%n%ae', commitHash],
+      { cwd: workspacePath },
+      (error, stdout) => {
+        if (error) {
+          resolve(null);
+          return;
+        }
+        const [name = '', email = ''] = String(stdout).split('\n').map((line) => line.trim());
+        resolve(name || email ? { name, email } : null);
+      },
+    );
+  });
+}
+
+function sameEmail(left: string | null | undefined, right: string | null | undefined): boolean {
+  return Boolean(left && right && left.trim().toLowerCase() === right.trim().toLowerCase());
+}
+
+/**
+ * Who to attribute a commit-driven activity entry to.
+ *
+ * The local identity wins whenever the commit's author is this machine's git
+ * user: it carries the signed-in email and display name, which is what every
+ * other activity writer stamps, so the entry coalesces and filters with them.
+ * A commit by anyone else is attributed to its author from git, and a commit
+ * whose author cannot be read at all falls back to the local identity rather
+ * than going unattributed.
+ */
+async function resolveCommitAuthorIdentity(
+  workspacePath: string,
+  commitHash: string,
+): Promise<TrackerIdentity> {
+  const local = getCurrentIdentity(workspacePath);
+  const author = await readCommitAuthor(workspacePath, commitHash);
+  if (!author) return local;
+  if (sameEmail(author.email, local.gitEmail) || sameEmail(author.email, local.email)) {
+    return local;
+  }
+  return {
+    email: author.email || null,
+    displayName: author.name || author.email,
+    gitName: author.name || null,
+    gitEmail: author.email || null,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -353,7 +424,13 @@ export class CommitTrackerLinker {
   }
 
   /**
-   * Set a tracker item's status to "done" via a commit closing keyword.
+   * Close a tracker item via a commit closing keyword.
+   *
+   * The status written is the one the item's OWN type closes into, not the
+   * literal `'done'`. Every type ends on a different value -- a plan on
+   * `completed`, a release on `released` -- so hardcoding `'done'` stamped a
+   * status that was not in the type's option list at all, surviving only
+   * because the validator downgrades unknown select values to warnings.
    */
   private async closeTrackerItem(
     itemId: string,
@@ -364,7 +441,7 @@ export class CommitTrackerLinker {
     if (!db) return;
 
     const result = await db.query(
-      `SELECT data FROM tracker_items WHERE id = $1 AND workspace = $2`,
+      `SELECT type, data FROM tracker_items WHERE id = $1 AND workspace = $2`,
       [itemId, workspacePath]
     );
     if (result.rows.length === 0) return;
@@ -373,26 +450,37 @@ export class CommitTrackerLinker {
       ? JSON.parse(result.rows[0].data)
       : result.rows[0].data || {};
 
-    if (data.status === 'done') return; // Already closed
+    const type = String(result.rows[0].type ?? data.type ?? '');
+    const statusField = getWorkflowStatusFieldName(type);
+    const oldStatus = data[statusField];
 
-    const oldStatus = data.status;
-    data.status = 'done';
+    // Already terminal -- including cancelled. A commit must not reopen an
+    // abandoned item by "closing" it.
+    if (isTerminalStatus(type, oldStatus)) return;
 
-    // Add activity log entry
-    const activity: any[] = data.activity || [];
-    activity.push({
-      action: 'status_changed',
-      field: 'status',
+    const closingStatus = getDoneStatusValue(type);
+    if (!closingStatus) {
+      // A type with no done-category status (an idea ends cancelled or
+      // converted, never "done") cannot be closed by a commit. Leaving the
+      // status alone is right; inventing one is how the out-of-schema write
+      // this method used to make got started.
+      logger.main.info(
+        `[CommitTrackerLinker] ${itemId} (${type}) has no completed status; leaving it open`,
+      );
+      return;
+    }
+
+    data[statusField] = closingStatus;
+
+    // Through the shared writer, never a raw push: sync merges the trail on
+    // entry `id` and sorts on a numeric `timestamp`, so a hand-built entry
+    // collapses with its siblings the first time the item syncs.
+    appendActivity(data, await resolveCommitAuthorIdentity(workspacePath, commitHash), 'status_changed', {
+      field: statusField,
       oldValue: oldStatus,
-      newValue: 'done',
-      timestamp: new Date().toISOString(),
+      newValue: closingStatus,
       note: `Closed via commit ${commitHash.slice(0, 7)}`,
     });
-    // Cap activity at 100
-    if (activity.length > 100) {
-      activity.splice(0, activity.length - 100);
-    }
-    data.activity = activity;
 
     await db.query(
       `UPDATE tracker_items SET data = $1, updated = NOW() WHERE id = $2`,

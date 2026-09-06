@@ -1,14 +1,14 @@
 {
   "id": "com.nimbalyst.datamodellm",
   "name": "DatamodelLM",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "AI-assisted data modeling with visual entity-relationship diagrams",
   "author": "Nimbalyst",
   "main": "dist/index.js",
   "styles": "dist/index.css",
   "apiVersion": "1.0.0",
   "marketplace": {
-    "changelog": "1.0.2: Share selected model elements with AI and reopen shared documents more reliably.\n1.0.1: Collaborative editing support, light-theme readability fixes, and more reliable external file edits.",
+    "changelog": "1.0.3: Shared data models keep every edit.\n1.0.2: Share selected model elements with AI and reopen shared documents more reliably.\n1.0.1: Collaborative editing support, light-theme readability fixes, and more reliable external file edits.",
     "categories": ["data"],
     "tags": ["prisma", "database", "schema", "erd", "entity-relationship", "data-model"],
     "icon": "database",
@@ -46,6 +46,7 @@
         "supportsTranscriptEmbed": true,
         "collaboration": {
           "supported": true,
+          "documentType": "datamodel",
           "awarenessFields": ["editingEntityId", "selectedEntityId", "selectedRelationshipId"]
         }
       }
@@ -65,19 +66,6 @@
         "defaultContent": "// @nimbalyst {\"viewport\":{\"x\":0,\"y\":0,\"zoom\":1},\"positions\":{},\"entityViewMode\":\"standard\"}\n\ndatasource db {\n  provider = \"postgresql\"\n  url      = env(\"DATABASE_URL\")\n}\n"
       }
     ],
-    "slashCommands": [
-      {
-        "id": "datamodellm.insert",
-        "title": "Data Model",
-        "description": "Insert a data model diagram",
-        "icon": "database",
-        "keywords": ["datamodel", "schema", "erd", "database", "entity", "prisma"],
-        "handler": "handleInsertDataModel"
-      }
-    ],
-    "nodes": ["DataModelNode"],
-    "transformers": ["DATAMODEL_TRANSFORMER"],
-    "hostComponents": ["DataModelPickerMenuHost"],
     "claudePlugin": {
       "path": "claude-plugin",
       "displayName": "Data Model Commands",

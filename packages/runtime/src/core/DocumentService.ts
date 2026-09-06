@@ -134,6 +134,8 @@ export interface TrackerActivity {
   newValue?: string;
   /** Epoch ms */
   timestamp: number;
+  /** Free-text context for the change, e.g. which commit closed the item */
+  note?: string;
 }
 
 /**
@@ -145,6 +147,12 @@ export interface TrackerItem {
   issueNumber?: number;
   /** Human-readable key like NIM-123 assigned by the shared tracker room. */
   issueKey?: string;
+  /**
+   * This machine's private number for the item, like NIM.12 -- a dot, never a
+   * dash. Never synced, and the same value on another machine means a
+   * different item, so it is a private handle rather than a shared reference.
+   */
+  localKey?: string;
   type: TrackerItemType;
   /** All type tags including primary type. Enables multi-type items. */
   typeTags?: string[];

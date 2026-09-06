@@ -40,6 +40,8 @@ When fixing a bug, **always ensure a tracker bug item exists** before starting t
 
 Do not stop at step 3. An item left in `in-review` after its fix shipped is a false backlog entry — the user has to clear it by hand. If the item has no issue key, say so when you propose the commit rather than silently omitting the reference.
 
+`Fixes NIM-123` belongs in the **commit message only**. Issue keys are scoped to a tracker room or local workspace: peers in the same room share an identity, but the same key can name a different item in an unrelated workspace. A `NIM-###` in a code comment or runtime log string therefore means nothing reliable to anyone reading this public repo. Cite the GitHub issue (`#123`) there instead. See the tracker-key rule in [CLAUDE.md](../CLAUDE.md).
+
 **How to create:**
 
 ```

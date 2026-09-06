@@ -33,11 +33,37 @@ body {
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   overflow: hidden;
+  /* The canvas every surface sits on. Without it the window falls through to
+     the browser default white wherever a surface forgets its own background,
+     which is how team mode shipped white on a light extension theme. The
+     tray-panel window overrides this below; it must stay see-through. */
+  background: var(--nim-bg);
+  color: var(--nim-text);
 }
 
 #root {
   height: 100vh;
   overflow: hidden;
+}
+
+/* Menu-bar sessions panel window (`?mode=tray-panel`). The BrowserWindow is
+   created with `transparent: true` + `vibrancy: 'popover'`, so nothing in the
+   root chain may paint an opaque backdrop or the native material is hidden. */
+html.tray-panel-window,
+html.tray-panel-window body,
+html.tray-panel-window #root {
+  background: transparent;
+}
+
+/*
+ * The menu bar island's window is a large transparent canvas; only the island
+ * itself paints. The window is click-through everywhere else, so an opaque root
+ * here would both hide the menu bar and look like a black slab across it.
+ */
+html.menu-bar-island-window,
+html.menu-bar-island-window body,
+html.menu-bar-island-window #root {
+  background: transparent;
 }
 
 /* =============================================================================
@@ -216,6 +242,23 @@ body[data-dev-mode="true"] .nav-quick-access::before {
     opacity: 1;
     transform: translateY(0);
   }
+}
+
+/* Marks the block a `file.md:653` link scrolled to. Block granularity is
+   approximate, so the flash is how the reader tells the target from its
+   neighbours. Duration is mirrored in revealMarkdownLine.ts. */
+@keyframes nim-revealed-block-fade {
+  from {
+    background-color: color-mix(in srgb, var(--nim-primary) 22%, transparent);
+  }
+  to {
+    background-color: transparent;
+  }
+}
+
+.nim-revealed-block {
+  animation: nim-revealed-block-fade 1.6s ease-out forwards;
+  border-radius: 3px;
 }
 
 @keyframes walkthrough-pulse {
@@ -869,16 +912,18 @@ body[data-dev-mode="true"] .nav-quick-access::before {
   }
 }
 
-/* Inbox (org-management window): the delivery list and its right-hand context
-   pane only both fit once the surface is wide. Below the threshold the pane is
-   dropped and the list takes the full width -- the org window's default size
-   lands in that narrow band, so this is the common case, not the exception.
+/* Inbox (org-management window): the context pane is user-sized (see
+   InboxContextSlot), so it is dropped only once the surface cannot hold the
+   narrowest pane beside the narrowest list -- 280 + 320 in inboxPreferences.
+   Above that the drag clamp keeps both readable; the old 900px threshold hid
+   the pane at widths where it fits perfectly well.
    .inbox-surface sets container-type/name via [container-type:inline-size], so
    this resolves against the surface itself rather than the OS window (the left
-   nav is 200px of it). Native CSS because the @tailwindcss/container-queries
-   plugin is not installed. */
-@container inbox-surface (max-width: 900px) {
-  .inbox-context-slot {
+   nav is 200px of it). Qualified by .inbox-surface so it outranks the
+   equal-specificity Tailwind `flex` utility on the slot. Native CSS because the
+   @tailwindcss/container-queries plugin is not installed. */
+@container inbox-surface (max-width: 600px) {
+  .inbox-surface .inbox-context-slot {
     display: none;
   }
 }

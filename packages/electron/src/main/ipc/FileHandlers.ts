@@ -4,6 +4,7 @@ import { readFileSync, existsSync, mkdirSync, writeFileSync } from 'fs';
 import { basename, join, dirname, extname } from 'path';
 import { windowStates, savingWindows, recentlyDeletedFiles, findWindowByFilePath, createWindow, getWindowId, windows, documentServices } from '../window/WindowManager';
 import { loadFileIntoWindow, saveFile } from '../file/FileOperations';
+import { shouldBlockEmptyOverwrite, wouldDiscardUnseenContent, writeRecoverySnapshot } from '../file/safeFileWrite';
 import { openFileWithDialog, openFile } from '../file/FileOpener';
 import { startFileWatcher, stopFileWatcher } from '../file/FileWatcher';
 import { AUTOSAVE_DELAY } from '../utils/constants';
@@ -42,18 +43,9 @@ function getFileType(filePath: string): string {
     return typeMap[ext] || 'other';
 }
 
-// Helper function to get word count category
-function getWordCountCategory(content: string): 'small' | 'medium' | 'large' {
-    const wordCount = content.split(/\s+/).filter(word => word.length > 0).length;
-    if (wordCount < 500) return 'small';
-    if (wordCount < 2000) return 'medium';
-    return 'large';
-}
-
-// Helper function to check if content has frontmatter
-function hasFrontmatter(content: string): boolean {
-    return content.trimStart().startsWith('---');
-}
+// getWordCountCategory / hasFrontmatter lived here to build the `file_saved`
+// payload. Both went with that event -- they had no other caller, and the word
+// count in particular walked the whole document on every autosave.
 
 export function registerFileHandlers() {
     const analytics = AnalyticsService.getInstance();
@@ -203,6 +195,44 @@ export function registerFileHandlers() {
                 return { success: false, deleted: true, filePath };
             }
 
+            // An editor that never finished mounting serializes to an empty
+            // buffer, and the conflict check above still passes because disk
+            // matches last-known. Without this the autosave that follows
+            // cleanly writes 0 bytes over the user's file (GitHub #647).
+            // Only reads disk when the incoming content is already blank.
+            if (content.trim().length === 0) {
+                let diskContent = '';
+                try {
+                    diskContent = readFileSync(filePath, 'utf-8');
+                } catch (readError) {
+                    console.error('[SAVE] Failed to read file for empty-write check:', readError);
+                }
+                if (shouldBlockEmptyOverwrite({ content, diskContent, source: saveSource })) {
+                    logger.main.warn(`[SAVE] Refused empty autosave over non-empty file: ${filePath}`);
+                    return { success: false, errorType: 'empty_write_blocked', filePath };
+                }
+            }
+
+            // #3684: a write with no baseline skipped the conflict check above,
+            // so nothing established that this writer ever saw what is on disk.
+            // Snapshot it before it is gone. Emitted *before* the destructive
+            // act, per .claude/rules/destructive-data-paths.md -- a crash
+            // mid-write must not take the evidence with it.
+            if (existsSync(filePath)) {
+                try {
+                    const diskContent = readFileSync(filePath, 'utf-8');
+                    if (wouldDiscardUnseenContent({ content, diskContent, lastKnownContent })) {
+                        const snapshotPath = writeRecoverySnapshot(filePath, diskContent, Date.now());
+                        logger.main.warn(
+                            `[SAVE] Unconditional overwrite of ${filePath}; discarded content saved to ${snapshotPath}`,
+                        );
+                    }
+                } catch (snapshotError) {
+                    // Best effort -- never block the write the user asked for.
+                    logger.main.error('[SAVE] Failed to snapshot discarded content:', snapshotError);
+                }
+            }
+
             // Mark that we're saving to prevent file watcher from reacting
             savingWindows.add(windowId);
             SessionFileWatcher.markEditorSave(filePath);
@@ -226,12 +256,11 @@ export function registerFileHandlers() {
                         // Add a small delay to ensure file is fully written before reading
                         setTimeout(async () => {
                             try {
+                                // refreshFileMetadata already calls
+                                // updateTrackerItemsCache for the same path;
+                                // calling it again here just doubled the
+                                // tracker_items queries on every save.
                                 await documentService.refreshFileMetadata(filePath);
-                                // Also refresh tracker items for this file
-                                const relativePath = relativeFilePath;
-                                // console.log('[SAVE] Updating tracker items for:', relativePath);
-                                await (documentService as any).updateTrackerItemsCache(relativePath);
-                                // console.log('[SAVE] Tracker items update completed');
                             } catch (err) {
                                 console.error('[SAVE] Failed to refresh metadata/tracker items:', err);
                             }
@@ -247,13 +276,11 @@ export function registerFileHandlers() {
                 savingWindows.delete(windowId);
             }, AUTOSAVE_DELAY);
 
-            // Track successful file save
-            analytics.sendEvent('file_saved', {
-                saveType: saveSourceAnalytics.saveType,
-                fileType: getFileType(filePath),
-                hasFrontmatter: hasFrontmatter(content),
-                wordCount: getWordCountCategory(content)
-            });
+            // `file_saved` was removed here. It fired on every save including
+            // debounced autosave -- 650,472 events in 30 days, the second-largest
+            // event in the product -- and nothing consumed the count. Throttling
+            // it would only have produced an "active editing" proxy that also had
+            // no consumer. `file_save_failed` below is the signal worth keeping.
             saveFailureTelemetry.markSuccess(filePath);
 
             // Push file index update for .md files in sync-enabled projects

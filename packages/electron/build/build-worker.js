@@ -89,14 +89,128 @@ async function buildWorker() {
           __dirname,
           '../../../node_modules/@electric-sql/pglite/dist/index.cjs',
         ),
+        // The worker imports a couple of leaf modules from the runtime
+        // (`storage/toolOutputRetention`, ...). Those deep subpaths are not in
+        // the runtime's `exports` map, so node resolution would fall back to
+        // the `@nimbalyst/runtime` barrel — which drags Lexical, CSS and
+        // `?raw` YAML imports into this CJS bundle and fails the build. Alias
+        // the package to its source tree the way electron.vite.config.ts does,
+        // so a deep import stays a single leaf module.
+        '@nimbalyst/runtime': path.join(__dirname, '../../runtime/src'),
       },
       define: {
         'process.env.NODE_ENV': JSON.stringify(process.env.NODE_ENV || 'production'),
       },
     });
 
+    // ------------------------------------------------------------------------
+    // SQLite backup verification worker — a short-lived thread that opens one
+    // backup file read-only, runs the structural check, posts the result and
+    // exits. Split out of the SQLite worker because that check is synchronous
+    // and multi-GB: run in-thread it stops the query message loop for a minute
+    // or more. Ships beside sqlite-worker.bundle.js; the spawner locates it
+    // relative to its own bundle.
+    // ------------------------------------------------------------------------
+    await esbuild.build({
+      entryPoints: [
+        path.join(__dirname, '../src/main/database/sqlite/worker/sqliteVerifyWorker.ts'),
+      ],
+      bundle: true,
+      platform: 'node',
+      target: 'node18',
+      outfile: path.join(outDir, 'sqlite-verify-worker.bundle.js'),
+      external: ['worker_threads', 'path', 'fs', 'better-sqlite3'],
+      minify: false,
+      sourcemap: process.env.NODE_ENV !== 'production',
+      format: 'cjs',
+      loader: { '.node': 'file' },
+      define: {
+        'process.env.NODE_ENV': JSON.stringify(process.env.NODE_ENV || 'production'),
+      },
+    });
+
+    // ------------------------------------------------------------------------
+    // Recovery verification worker. Distinct from the backup verifier above:
+    // that one runs `quick_check` to confirm a backup copied cleanly, which is
+    // not enough to authorize replacing a live database. This one runs the full
+    // `integrity_check` plus the required-schema and content-indicator checks
+    // that gate a destructive restore, and it has to stay off both the main
+    // thread and the query-serving thread for the same reason.
+    // ------------------------------------------------------------------------
+    await esbuild.build({
+      entryPoints: [
+        path.join(__dirname, '../src/main/database/recovery/recoveryVerifyWorker.ts'),
+      ],
+      bundle: true,
+      platform: 'node',
+      target: 'node18',
+      outfile: path.join(outDir, 'sqlite-recovery-verify-worker.bundle.js'),
+      external: ['worker_threads', 'path', 'fs', 'better-sqlite3'],
+      minify: false,
+      sourcemap: process.env.NODE_ENV !== 'production',
+      format: 'cjs',
+      loader: { '.node': 'file' },
+      define: {
+        'process.env.NODE_ENV': JSON.stringify(process.env.NODE_ENV || 'production'),
+      },
+    });
+
+    await esbuild.build({
+      entryPoints: [
+        path.join(__dirname, '../src/main/workers/historyDiffWorker.ts'),
+      ],
+      bundle: true,
+      platform: 'node',
+      target: 'node18',
+      outfile: path.join(outDir, 'history-diff-worker.bundle.js'),
+      external: ['worker_threads'],
+      minify: false,
+      sourcemap: process.env.NODE_ENV !== 'production',
+      format: 'cjs',
+    });
+
+    // Animation GIF encoder — palette derivation and LZW encoding for
+    // .anim.json exports. Off-thread because both are synchronous JS measured
+    // in tens of seconds on a ten-second animation, which stops every IPC call
+    // in the app while it runs.
+    await esbuild.build({
+      entryPoints: [
+        path.join(__dirname, '../src/main/workers/gifEncodeWorker.ts'),
+      ],
+      bundle: true,
+      platform: 'node',
+      target: 'node18',
+      outfile: path.join(outDir, 'gif-encode-worker.bundle.js'),
+      external: ['worker_threads'],
+      minify: false,
+      sourcemap: process.env.NODE_ENV !== 'production',
+      format: 'cjs',
+    });
+
+    // Reads + sha256-hashes markdown files for ProjectFileSync's manifest off
+    // the main thread. Node builtins only — nothing to keep external beyond the
+    // worker plumbing itself.
+    await esbuild.build({
+      entryPoints: [
+        path.join(__dirname, '../src/main/workers/projectManifestWorker.ts'),
+      ],
+      bundle: true,
+      platform: 'node',
+      target: 'node18',
+      outfile: path.join(outDir, 'project-manifest-worker.bundle.js'),
+      external: ['worker_threads'],
+      minify: false,
+      sourcemap: process.env.NODE_ENV !== 'production',
+      format: 'cjs',
+    });
+
     console.log('Worker bundle created successfully at out/worker.bundle.js');
     console.log('SQLite worker bundle created successfully at out/sqlite-worker.bundle.js');
+    console.log('SQLite verify worker bundle created successfully at out/sqlite-verify-worker.bundle.js');
+    console.log('Recovery verify worker bundle created successfully at out/sqlite-recovery-verify-worker.bundle.js');
+    console.log('History diff worker bundle created successfully at out/history-diff-worker.bundle.js');
+    console.log('GIF encode worker bundle created successfully at out/gif-encode-worker.bundle.js');
+    console.log('Project manifest worker bundle created successfully at out/project-manifest-worker.bundle.js');
 
     // Copy PGLite runtime files that are loaded dynamically at runtime
     // The binary loader embeds some files, but PGLite loads these via fs.readFile

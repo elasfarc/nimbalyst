@@ -17,6 +17,10 @@
 import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
 
 import { SettingsControlService } from "../services/SettingsControlService";
+import {
+  buildExtensionInventory,
+  scanInstalledExtensions,
+} from "../services/extensionInventory";
 
 // ─── Tool descriptors ───────────────────────────────────────────────
 
@@ -116,6 +120,20 @@ const TOOLS = [
     },
   },
   {
+    name: "appearance_set_spellcheck_languages",
+    description:
+      "Set the spellchecker language(s) as Chromium BCP-47 codes (e.g. [\"en-CA\"], [\"en-US\",\"fr\"]). " +
+      "Pass an empty array to clear the override and derive the language from the OS locale. " +
+      "No effect on macOS, which uses the system spellchecker.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        languages: { type: "array", items: { type: "string" } },
+      },
+      required: ["languages"],
+    },
+  },
+  {
     name: "analytics_set_enabled",
     description: "Enable or disable anonymous usage analytics.",
     inputSchema: {
@@ -159,6 +177,22 @@ const TOOLS = [
     },
   },
   {
+    name: "extensions_list",
+    description:
+      "List this install's extensions: which are installed (with enabled state and whether they are built-in) and which further extensions the marketplace registry offers. Use it before recommending an extension so you can tell installed-but-disabled (needs enabling) from not-installed (needs installing). If the registry is unreachable the installed half is still returned and registryAvailable is false. Never installs anything -- surface nimbalyst://install/<extensionId> and let the user decide.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        includeAvailable: {
+          type: "boolean",
+          description:
+            "Include the registry's not-yet-installed extensions. Defaults to true. Pass false when you only need the installed set, which avoids a registry fetch.",
+        },
+      },
+      required: [],
+    },
+  },
+  {
     name: "extension_set_enabled",
     description:
       "Enable or disable an installed extension by ID. Does not install or uninstall -- use the nimbalyst-extension-dev tools for that.",
@@ -193,23 +227,9 @@ const TOOLS = [
     },
   },
   {
-    name: "tracker_set_sync_policy",
-    description:
-      "Set the sync mode for a tracker type within a workspace. Modes: 'local' (no sync), 'shared' (sync to team), 'hybrid' (per-item).",
-    inputSchema: {
-      type: "object",
-      properties: {
-        workspacePath: { type: "string" },
-        trackerType: { type: "string", description: "Tracker type ID (e.g. 'bug', 'task')." },
-        mode: { type: "string", enum: ["local", "shared", "hybrid"] },
-      },
-      required: ["workspacePath", "trackerType", "mode"],
-    },
-  },
-  {
     name: "tracker_set_issue_key_prefix",
     description:
-      "Set the issue key prefix for a workspace (e.g. 'NIM' produces NIM-1, NIM-2). Uppercase letter first, 1-16 chars, A-Z 0-9 _ - only.",
+      "Set the team project's unique issue-key prefix (e.g. 'NIM' produces NIM-1, NIM-2). The server rejects prefixes held by another project in the organization and may suggest a free alternative. Use 2-5 uppercase letters.",
     inputSchema: {
       type: "object",
       properties: {
@@ -285,6 +305,15 @@ export async function dispatchSettingsTool(
       case "appearance_set_spellcheck":
         return respond(await svc.setSpellcheck(aiSessionId, { enabled: !!args.enabled }));
 
+      case "appearance_set_spellcheck_languages":
+        return respond(
+          await svc.setSpellcheckLanguages(aiSessionId, {
+            languages: Array.isArray(args.languages)
+              ? (args.languages as unknown[]).filter((x): x is string => typeof x === "string")
+              : [],
+          }),
+        );
+
       case "analytics_set_enabled":
         return respond(await svc.setAnalytics(aiSessionId, { enabled: !!args.enabled }));
 
@@ -307,6 +336,15 @@ export async function dispatchSettingsTool(
           }),
         );
 
+      case "extensions_list": {
+        // Read-only: no rate limit, no audit entry, no settings mutation.
+        if (args.includeAvailable === false) {
+          const installed = await scanInstalledExtensions();
+          return respond({ ok: true, installed, available: [], registryAvailable: false });
+        }
+        return respond({ ok: true, ...(await buildExtensionInventory()) });
+      }
+
       case "extension_set_enabled":
         return respond(
           await svc.setExtensionEnabled(aiSessionId, {
@@ -320,15 +358,6 @@ export async function dispatchSettingsTool(
           await svc.setWorkspaceTrust(aiSessionId, {
             workspacePath: args.workspacePath,
             trusted: !!args.trusted,
-            mode: args.mode,
-          }),
-        );
-
-      case "tracker_set_sync_policy":
-        return respond(
-          await svc.setTrackerSyncPolicy(aiSessionId, {
-            workspacePath: args.workspacePath,
-            trackerType: args.trackerType,
             mode: args.mode,
           }),
         );

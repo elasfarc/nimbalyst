@@ -18,17 +18,21 @@
 
 import * as path from 'path';
 import * as fs from 'fs/promises';
-import * as zlib from 'zlib';
-import { promisify } from 'util';
 import { parse as parseShellCommand } from 'shell-quote';
-import { diffLines } from 'diff';
 import { database } from '../database/PGLiteDatabaseWorker';
+import { jsonKeyAccessor } from '../database/jsonKeyExpr';
 import { logger } from '../utils/logger';
 import { TranscriptMigrationRepository } from '@nimbalyst/runtime/storage/repositories/TranscriptMigrationRepository';
 import { AISessionsRepository } from '@nimbalyst/runtime';
 import type { TranscriptEvent, ToolCallPayload } from '@nimbalyst/runtime/ai/server/transcript/types';
-
-const gunzip = promisify(zlib.gunzip);
+import {
+  MAX_HISTORY_DIFF_INPUT_BYTES,
+  computeBoundedHistoryDiff,
+  type HistoryDiffComputationResult,
+  type HistoryDiffFailureCode,
+  type HistoryDiffOmissionReason,
+} from './HistoryDiffService';
+import { historyDiffWorkerClient } from './HistoryDiffWorkerClient';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -60,6 +64,23 @@ export interface ToolCallDiffResult {
   linesAdded?: number;
   linesRemoved?: number;
   debugInfo?: string; // how this file was linked to the tool call
+  historySource?: 'history-post-edit' | 'history-disk-fallback';
+  omissionReason?: HistoryDiffOmissionReason;
+  inputBytes?: { before: number; after: number };
+  limitBytes?: number;
+  errorCode?: HistoryDiffFailureCode;
+}
+
+export interface ToolCallDiffLoadResult {
+  state: 'ready' | 'partial' | 'none' | 'failed';
+  diffs: ToolCallDiffResult[];
+  omissions: Array<{
+    filePath: string;
+    reason: HistoryDiffOmissionReason;
+    inputBytes?: { before: number; after: number };
+    limitBytes?: number;
+  }>;
+  errorCode?: HistoryDiffFailureCode;
 }
 
 export interface ToolCallFileEdit {
@@ -155,8 +176,10 @@ export interface SessionEnrichmentContext {
   preEditByFileAndTool: Map<string, Buffer>;
   /** latest pre-edit document_history content per filePath (toolUseId-agnostic fallback) */
   preEditLatestByFile: Map<string, Buffer>;
-  /** memoized current on-disk content per filePath (null = unreadable/deleted) */
-  diskContentCache: Map<string, string | null>;
+  /** ai-edit document_history content keyed by `${filePath}\u0000${toolUseId}` (latest wins) */
+  postEditByFileAndTool: Map<string, Buffer>;
+  /** memoized current on-disk bytes per filePath (null = unreadable/deleted) */
+  diskContentCache: Map<string, Buffer | null>;
 }
 
 // ---------------------------------------------------------------------------
@@ -165,6 +188,15 @@ export interface SessionEnrichmentContext {
 
 const TIME_CUTOFF_MS = 10_000; // 10 second hard cutoff around tool call
 const MIN_MATCH_SCORE = 30; // Must have at least a filename match
+
+/**
+ * The ceiling `scoreMatch` can return: an exact metadata toolUseId match scores
+ * 100 and returns immediately. Every other path tops out at 70 (40 name_in_args
+ * + 30 name_in_output). A file already recorded at this score therefore cannot
+ * be improved by a later pass — the match loop would `continue` on it anyway —
+ * which is what makes it safe to leave such files out of the candidate set.
+ */
+const MAX_MATCH_SCORE = 100;
 const WORKSPACE_CLEAR_WINNER_MARGIN = 12;
 const WORKSPACE_MIN_CONFIDENCE_SCORE = 55;
 
@@ -240,6 +272,30 @@ const TOOL_ITEM_TYPES = new Set([
 /** Count newline-delimited lines in a string. Returns 0 for empty strings. */
 function countLines(text: string): number {
   return text.length === 0 ? 0 : text.split('\n').length;
+}
+
+function applyHistoryDiffOutcome(
+  target: ToolCallDiffResult,
+  outcome: HistoryDiffComputationResult & {
+    source: 'history-post-edit' | 'history-disk-fallback';
+  },
+): void {
+  target.historySource = outcome.source;
+  if (outcome.status === 'ready') {
+    target.diffs = [{ oldString: outcome.oldString, newString: outcome.newString }];
+    target.linesAdded = outcome.linesAdded;
+    target.linesRemoved = outcome.linesRemoved;
+    return;
+  }
+  if (outcome.status === 'omitted') {
+    target.omissionReason = outcome.reason;
+    target.inputBytes = outcome.inputBytes;
+    target.limitBytes = outcome.limitBytes;
+    return;
+  }
+  if (outcome.status === 'failed') {
+    target.errorCode = outcome.errorCode;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -942,10 +998,73 @@ class ToolCallMatcherImpl {
       }
       const sessionFiles = [...sessionFilesByKey.values()];
 
-      // 3. Load tool call windows from raw ai_agent_messages
-      const windows = await getRawToolCallWindows(sessionId, workspacePath);
+      // A session with no edited files cannot produce a match, so avoid the
+      // raw-message scan entirely.
+      if (sessionFiles.length === 0) return 0;
 
-      if (windows.length === 0 || sessionFiles.length === 0) return 0;
+      // Load existing matches BEFORE the raw-message scan (NIM-3085).
+      // matchSession runs after every tool execution, and the scan below is
+      // unbounded for any session carrying toolUseIds — i.e. every Claude Code
+      // session — so re-deriving settled matches made this O(messages) per tool
+      // call, O(N^2) per session, against the largest table in the database.
+      // Knowing what is already matched lets us skip the scan entirely once a
+      // session reaches steady state.
+      const existingResult = await database.query<{
+        session_file_id: string;
+        match_score: number;
+        tool_use_id: string | null;
+      }>(
+        `SELECT session_file_id, match_score, tool_use_id FROM ai_tool_call_file_edits WHERE session_id = $1`,
+        [sessionId]
+      );
+      // Best existing score per file (a file may have multiple rows from legacy data)
+      const existingBestScore = new Map<string, number>();
+      for (const row of existingResult.rows) {
+        const prev = existingBestScore.get(row.session_file_id) ?? 0;
+        existingBestScore.set(row.session_file_id, Math.max(prev, ensureNumber(row.match_score)));
+      }
+
+      // Only files without a match, or with a beatable one, are worth scoring.
+      // Dedup above still ran over the FULL set, so watcher/tracker duplicate
+      // rows collapse exactly as before — we narrow after dedup, never before,
+      // or a settled row could drop out and let its duplicate match a second time.
+      const filesNeedingWork = sessionFiles.filter(
+        file => (existingBestScore.get(file.id) ?? -1) < MAX_MATCH_SCORE
+      );
+      if (filesNeedingWork.length === 0) return 0;
+
+      // Bound raw history for providers whose file rows have no definitive
+      // tool IDs (notably Codex). Exact metadata toolUseId matches deliberately
+      // bypass scoreMatch's time cutoff, so sessions carrying any such ID must
+      // retain the unbounded lookup to preserve those matches.
+      // Computed over filesNeedingWork, not all files: a session whose only
+      // outstanding rows are Codex-style now gets the bounded window even if
+      // settled Claude Code rows exist alongside them.
+      const hasDefinitiveToolUseIds = filesNeedingWork.some(file =>
+        typeof file.metadata?.toolUseId === 'string' && file.metadata.toolUseId.length > 0
+      );
+      let rawWindowOptions: { afterDate: Date; beforeDate: Date } | undefined;
+      if (!hasDefinitiveToolUseIds) {
+        const fileTimestamps = filesNeedingWork.map(file => ensureNumber(file.timestamp_ms));
+        const hasInvalidTimestamp = fileTimestamps.some(timestamp => !Number.isFinite(timestamp));
+        let minFileTs = Infinity;
+        let maxFileTs = -Infinity;
+        for (const timestamp of fileTimestamps) {
+          if (timestamp < minFileTs) minFileTs = timestamp;
+          if (timestamp > maxFileTs) maxFileTs = timestamp;
+        }
+        if (!hasInvalidTimestamp) {
+          rawWindowOptions = {
+            afterDate: new Date(minFileTs - TIME_CUTOFF_MS),
+            beforeDate: new Date(maxFileTs + TIME_CUTOFF_MS),
+          };
+        }
+      }
+
+      // 3. Load tool call windows from raw ai_agent_messages.
+      const windows = await getRawToolCallWindows(sessionId, workspacePath, rawWindowOptions);
+
+      if (windows.length === 0) return 0;
 
       // 4. Deduplicate windows by toolCallItemId.
       // When both item.started and item.completed exist for the same tool call,
@@ -962,23 +1081,8 @@ class ToolCallMatcherImpl {
         toolWindowCount: deduped.length,
       });
 
-      // 6. Load existing matches so we can skip unchanged files and replace stale ones
-      const existingResult = await database.query<{
-        session_file_id: string;
-        match_score: number;
-        tool_use_id: string | null;
-      }>(
-        `SELECT session_file_id, match_score, tool_use_id FROM ai_tool_call_file_edits WHERE session_id = $1`,
-        [sessionId]
-      );
-      // Best existing score per file (a file may have multiple rows from legacy data)
-      const existingBestScore = new Map<string, number>();
-      for (const row of existingResult.rows) {
-        const prev = existingBestScore.get(row.session_file_id) ?? 0;
-        existingBestScore.set(row.session_file_id, Math.max(prev, ensureNumber(row.match_score)));
-      }
-
-      // 7. Match each file, replacing old matches when a better one is found
+      // 6. Match each file, replacing old matches when a better one is found.
+      //    (Existing matches were loaded before the scan above.)
       const matches: Array<{
         sessionId: string;
         sessionFileId: string;
@@ -993,7 +1097,7 @@ class ToolCallMatcherImpl {
       // Track file IDs where a new match replaces an old one
       const replacedFileIds: string[] = [];
 
-      for (const file of sessionFiles) {
+      for (const file of filesNeedingWork) {
         const metadataToolUseId = file.metadata?.toolUseId;
         const fileTimestamp = ensureNumber(file.timestamp_ms);
 
@@ -1200,6 +1304,7 @@ class ToolCallMatcherImpl {
       toolEditsByItemId: new Map(),
       preEditByFileAndTool: new Map(),
       preEditLatestByFile: new Map(),
+      postEditByFileAndTool: new Map(),
       diskContentCache: new Map(),
     };
 
@@ -1251,25 +1356,36 @@ class ToolCallMatcherImpl {
       ctx.toolEditsByItemId.set(itemId, list);
     }
 
-    // 4. All pre-edit history snapshots for the session (content is compressed;
+    // 4. All pre/post-edit history snapshots for the session (content is compressed;
     //    bounded by distinct edits, decompressed lazily per file in computeHistoryDiff).
-    //    SQLite must use json_extract (matching idx_history_preedit_session, migration
-    //    18) -- writing metadata->>'x' makes the dialect translator parameterize the
-    //    JSON key as metadata->>?, which no expression index can match. PGLite needs
-    //    the ->> operator (its metadata is jsonb; json_extract has no jsonb overload).
-    //    Same split as HistoryManager.getPendingFilesForSession.
-    const isSqlite = database.getEngine() === 'sqlite';
-    const sessionIdExpr = isSqlite ? `json_extract(metadata, '$.sessionId')` : `metadata->>'sessionId'`;
-    const typeExpr = isSqlite ? `json_extract(metadata, '$.type')` : `metadata->>'type'`;
-    const toolUseIdExpr = isSqlite ? `json_extract(metadata, '$.toolUseId')` : `metadata->>'toolUseId'`;
-    const historyResult = await database.query<{ file_path: string; content: Buffer; tool_use_id: string | null }>(
-      `SELECT file_path, content, ${toolUseIdExpr} AS tool_use_id
+    //    The accessor has to match idx_history_preedit_session (migration 18);
+    //    jsonKeyExpr picks the indexed form per backend.
+    const md = jsonKeyAccessor(database.getEngine(), 'metadata');
+    const sessionIdExpr = md('sessionId');
+    const typeExpr = md('type');
+    const toolUseIdExpr = md('toolUseId');
+    const historyResult = await database.query<{
+      file_path: string;
+      content: Buffer;
+      tool_use_id: string | null;
+      snapshot_type: 'pre-edit' | 'ai-edit';
+    }>(
+      `SELECT file_path, content, ${toolUseIdExpr} AS tool_use_id, ${typeExpr} AS snapshot_type
        FROM document_history
-       WHERE ${sessionIdExpr} = $1 AND ${typeExpr} = 'pre-edit'
+       WHERE ${sessionIdExpr} = $1 AND ${typeExpr} IN ('pre-edit', 'ai-edit')
        ORDER BY timestamp DESC`,
       [sessionId]
     );
     for (const row of historyResult.rows) {
+      if (row.snapshot_type === 'ai-edit') {
+        if (row.tool_use_id) {
+          const key = this.preEditKey(row.file_path, row.tool_use_id);
+          if (!ctx.postEditByFileAndTool.has(key)) {
+            ctx.postEditByFileAndTool.set(key, row.content);
+          }
+        }
+        continue;
+      }
       // Rows are newest-first; keep the first (latest) seen for each key.
       if (!ctx.preEditLatestByFile.has(row.file_path)) {
         ctx.preEditLatestByFile.set(row.file_path, row.content);
@@ -1363,16 +1479,52 @@ class ToolCallMatcherImpl {
     this.diffInFlight.set(cacheKey, promise);
     try {
       const result = await promise;
-      // Cap the cache to avoid unbounded growth in long-lived sessions.
-      if (this.diffCache.size >= this.DIFF_CACHE_MAX_ENTRIES) {
-        const firstKey = this.diffCache.keys().next().value;
-        if (firstKey !== undefined) this.diffCache.delete(firstKey);
+      // Exact pre/post snapshots are immutable. Legacy current-disk fallback
+      // is not, so retaining it would make later file changes appear frozen.
+      if (!result.some((item) => item.historySource === 'history-disk-fallback')) {
+        // Cap the cache to avoid unbounded growth in long-lived sessions.
+        if (this.diffCache.size >= this.DIFF_CACHE_MAX_ENTRIES) {
+          const firstKey = this.diffCache.keys().next().value;
+          if (firstKey !== undefined) this.diffCache.delete(firstKey);
+        }
+        this.diffCache.set(cacheKey, result);
       }
-      this.diffCache.set(cacheKey, result);
       return result;
     } finally {
       this.diffInFlight.delete(cacheKey);
     }
+  }
+
+  async getDiffsForToolCallResult(
+    sessionId: string,
+    toolCallItemId: string,
+    toolCallTimestamp?: number,
+  ): Promise<ToolCallDiffLoadResult> {
+    const raw = await this.getDiffsForToolCall(sessionId, toolCallItemId, toolCallTimestamp);
+    const diffs = raw.filter((item) =>
+      !item.omissionReason &&
+      !item.errorCode &&
+      (item.diffs.length > 0 || !!item.content),
+    );
+    const omissions = raw
+      .filter((item): item is ToolCallDiffResult & { omissionReason: HistoryDiffOmissionReason } => !!item.omissionReason)
+      .map((item) => ({
+        filePath: item.filePath,
+        reason: item.omissionReason,
+        inputBytes: item.inputBytes,
+        limitBytes: item.limitBytes,
+      }));
+    const failed = raw.find((item) => item.errorCode);
+
+    if (failed?.errorCode && diffs.length === 0 && omissions.length === 0) {
+      return { state: 'failed', diffs: [], omissions: [], errorCode: failed.errorCode };
+    }
+    if (diffs.length > 0 && (omissions.length > 0 || failed)) {
+      return { state: 'partial', diffs, omissions, errorCode: failed?.errorCode };
+    }
+    if (diffs.length > 0) return { state: 'ready', diffs, omissions: [] };
+    if (omissions.length > 0) return { state: 'partial', diffs: [], omissions };
+    return { state: 'none', diffs: [], omissions: [] };
   }
 
   private async computeDiffsForToolCall(
@@ -1559,10 +1711,8 @@ class ToolCallMatcherImpl {
         if (result.diffs.length === 0 && !result.content) {
           const historyDiff = await this.computeHistoryDiff(sessionId, result.filePath, lookup.toolCallItemId, ctx);
           if (historyDiff) {
-            result.diffs = [{ oldString: historyDiff.oldString, newString: historyDiff.newString }];
-            result.linesAdded = historyDiff.linesAdded;
-            result.linesRemoved = historyDiff.linesRemoved;
-            result.debugInfo += ' | diff: history snapshot';
+            applyHistoryDiffOutcome(result, historyDiff);
+            result.debugInfo += ` | diff: ${historyDiff.status} ${historyDiff.source}`;
           } else {
             result.debugInfo += ' | diff: no history snapshot found';
           }
@@ -2050,115 +2200,94 @@ class ToolCallMatcherImpl {
     filePath: string,
     toolUseId?: string,
     ctx?: SessionEnrichmentContext
-  ): Promise<{ oldString: string; newString: string; linesAdded: number; linesRemoved: number } | null> {
+  ): Promise<(HistoryDiffComputationResult & {
+    source: 'history-post-edit' | 'history-disk-fallback';
+  }) | null> {
     try {
-      // Find the pre-edit tag for this file+session from document_history.
-      // When toolUseId is provided, find the exact tag for that tool call.
-      // Otherwise fall back to the latest tag (legacy behavior).
-      let compressed: Buffer | undefined;
+      let compressedBefore: Buffer | undefined;
+      let compressedAfter: Buffer | undefined;
       if (ctx) {
-        // Snapshots for the whole session were bulk-loaded; resolve in memory.
-        // Mirror the query precedence: toolUseId-specific first, then latest-for-file.
-        compressed = (toolUseId ? ctx.preEditByFileAndTool.get(this.preEditKey(filePath, toolUseId)) : undefined)
-          ?? ctx.preEditLatestByFile.get(filePath);
+        compressedBefore = toolUseId
+          ? ctx.preEditByFileAndTool.get(this.preEditKey(filePath, toolUseId))
+          : ctx.preEditLatestByFile.get(filePath);
+        compressedAfter = toolUseId
+          ? ctx.postEditByFileAndTool.get(this.preEditKey(filePath, toolUseId))
+          : undefined;
       } else {
-        let result = toolUseId
-          ? await database.query<{ content: Buffer }>(`
-              SELECT content
-              FROM document_history
-              WHERE file_path = $1
-                AND metadata->>'sessionId' = $2
-                AND metadata->>'type' = 'pre-edit'
-                AND metadata->>'toolUseId' = $3
-              ORDER BY timestamp DESC
-              LIMIT 1
-            `, [filePath, sessionId, toolUseId])
-          : await database.query<{ content: Buffer }>(`
-              SELECT content
-              FROM document_history
-              WHERE file_path = $1
-                AND metadata->>'sessionId' = $2
-                AND metadata->>'type' = 'pre-edit'
-              ORDER BY timestamp DESC
-              LIMIT 1
-            `, [filePath, sessionId]);
+        const md = jsonKeyAccessor(database.getEngine(), 'metadata');
+        const sessionIdExpr = md('sessionId');
+        const typeExpr = md('type');
+        const toolUseIdExpr = md('toolUseId');
 
-        // If the toolUseId-specific query returned no rows, fall back to the
-        // latest-tag query (best-effort) before giving up.
-        if (toolUseId && result.rows.length === 0) {
-          result = await database.query<{ content: Buffer }>(`
-              SELECT content
-              FROM document_history
-              WHERE file_path = $1
-                AND metadata->>'sessionId' = $2
-                AND metadata->>'type' = 'pre-edit'
-              ORDER BY timestamp DESC
-              LIMIT 1
-            `, [filePath, sessionId]);
+        if (toolUseId) {
+          const snapshots = await database.query<{
+            content: Buffer;
+            snapshot_type: 'pre-edit' | 'ai-edit';
+          }>(`
+            SELECT content, ${typeExpr} AS snapshot_type
+            FROM document_history
+            WHERE file_path = $1
+              AND ${sessionIdExpr} = $2
+              AND ${toolUseIdExpr} = $3
+              AND ${typeExpr} IN ('pre-edit', 'ai-edit')
+            ORDER BY timestamp DESC
+          `, [filePath, sessionId, toolUseId]);
+          compressedBefore = snapshots.rows.find((row) => row.snapshot_type === 'pre-edit')?.content;
+          compressedAfter = snapshots.rows.find((row) => row.snapshot_type === 'ai-edit')?.content;
+        } else {
+          const result = await database.query<{ content: Buffer }>(`
+            SELECT content
+            FROM document_history
+            WHERE file_path = $1
+              AND ${sessionIdExpr} = $2
+              AND ${typeExpr} = 'pre-edit'
+            ORDER BY timestamp DESC
+            LIMIT 1
+          `, [filePath, sessionId]);
+          compressedBefore = result.rows[0]?.content;
         }
-
-        compressed = result.rows[0]?.content;
       }
 
-      if (!compressed) return null;
+      if (!compressedBefore) return null;
 
-      const decompressed = await gunzip(compressed);
-      const beforeContent = decompressed.toString('utf-8');
-
-      // Read current file from disk (memoized per file when a session context
-      // is present -- the same file is edited by many tool calls).
-      let currentContent: string;
-      if (ctx) {
-        if (ctx.diskContentCache.has(filePath)) {
-          const cached = ctx.diskContentCache.get(filePath);
-          if (cached == null) return null; // File deleted/unreadable
-          currentContent = cached;
+      let source: 'history-post-edit' | 'history-disk-fallback';
+      let after: Buffer | undefined;
+      if (compressedAfter) {
+        source = 'history-post-edit';
+      } else {
+        source = 'history-disk-fallback';
+        if (ctx?.diskContentCache.has(filePath)) {
+          after = ctx.diskContentCache.get(filePath) ?? undefined;
         } else {
           try {
-            currentContent = await fs.readFile(filePath, 'utf-8');
-            ctx.diskContentCache.set(filePath, currentContent);
+            const stat = await fs.stat(filePath);
+            after = stat.size > MAX_HISTORY_DIFF_INPUT_BYTES
+              ? Buffer.alloc(MAX_HISTORY_DIFF_INPUT_BYTES + 1)
+              : await fs.readFile(filePath);
+            ctx?.diskContentCache.set(filePath, after);
           } catch {
-            ctx.diskContentCache.set(filePath, null);
-            return null; // File may have been deleted
+            ctx?.diskContentCache.set(filePath, null);
+            return null;
           }
         }
-      } else {
-        try {
-          currentContent = await fs.readFile(filePath, 'utf-8');
-        } catch {
-          return null; // File may have been deleted
-        }
+        if (!after) return null;
       }
 
-      if (beforeContent === currentContent) return null;
-
-      // Compute line-level diff — only return the changed lines, not the entire file.
-      // DiffViewer renders oldString as all-red and newString as all-green,
-      // so we must only include the actual removed/added lines.
-      const changes = diffLines(beforeContent, currentContent);
-      const removedLines: string[] = [];
-      const addedLines: string[] = [];
-
-      for (const change of changes) {
-        if (change.removed) {
-          removedLines.push(change.value);
-        } else if (change.added) {
-          addedLines.push(change.value);
-        }
-        // Skip unchanged lines (context)
-      }
-
-      if (removedLines.length === 0 && addedLines.length === 0) return null;
-
-      const oldString = removedLines.join('');
-      const newString = addedLines.join('');
-
-      return {
-        oldString,
-        newString,
-        linesAdded: newString ? newString.split('\n').filter(l => l !== '').length : 0,
-        linesRemoved: oldString ? oldString.split('\n').filter(l => l !== '').length : 0,
-      };
+      const result = await computeBoundedHistoryDiff({
+        compressedBefore,
+        compressedAfter,
+        after,
+        runDiff: historyDiffWorkerClient.runDiff,
+      });
+      logger.main.debug('[ToolCallMatcher] history diff result', {
+        sessionId,
+        toolUseId,
+        source,
+        status: result.status,
+        reason: result.status === 'omitted' ? result.reason : undefined,
+        inputBytes: result.status === 'omitted' ? result.inputBytes : undefined,
+      });
+      return { ...result, source };
     } catch (error) {
       logger.main.error('[ToolCallMatcher] computeHistoryDiff failed:', error);
       return null;
@@ -2329,17 +2458,17 @@ class ToolCallMatcherImpl {
       // legacy data.
       for (const result of results) {
         if (result.diffs.length === 0 && !result.content) {
-          let historyDiff: { oldString: string; newString: string; linesAdded: number; linesRemoved: number } | null = null;
+          let historyDiff: (HistoryDiffComputationResult & {
+            source: 'history-post-edit' | 'history-disk-fallback';
+          }) | null = null;
           for (const id of (primaryLookupId === fallbackLookupId ? [primaryLookupId] : [primaryLookupId, fallbackLookupId])) {
             if (!id) continue;
             historyDiff = await this.computeHistoryDiff(sessionId, result.filePath, id, ctx);
             if (historyDiff) break;
           }
           if (historyDiff) {
-            result.diffs = [{ oldString: historyDiff.oldString, newString: historyDiff.newString }];
-            result.linesAdded = historyDiff.linesAdded;
-            result.linesRemoved = historyDiff.linesRemoved;
-            result.debugInfo += ' | diff: history snapshot';
+            applyHistoryDiffOutcome(result, historyDiff);
+            result.debugInfo += ` | diff: ${historyDiff.status} ${historyDiff.source}`;
           } else {
             result.debugInfo += ' | diff: no history snapshot found';
           }
@@ -2347,7 +2476,7 @@ class ToolCallMatcherImpl {
       }
 
       // Filter to only entries that have diff data
-      return results.filter(r => r.diffs.length > 0 || r.content);
+      return results.filter(r => r.diffs.length > 0 || r.content || r.omissionReason || r.errorCode);
     } catch (error) {
       logger.main.error('[ToolCallMatcher] getDiffsFromToolCallContent failed:', error);
       return [];

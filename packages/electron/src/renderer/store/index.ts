@@ -97,6 +97,7 @@ export {
   anySessionProcessingAtom,
   anyPendingInteractivePromptAtom,
   markSessionReadAtom,
+  markSessionsReadAtom,
   setActiveSessionAtom,
   // Session list loading
   sessionListLoadingAtom,
@@ -131,6 +132,7 @@ export {
   sessionDocumentContextAtom,
   sessionEffortLevelRawAtom,
   sessionThinkingModeRawAtom,
+  sessionOpenCodeRoleAtom,
   sessionLoadingAtom,
   sessionModeAtom,
   sessionModelAtom,
@@ -203,6 +205,10 @@ export {
   fileTreeAtom,
   rawFileTreeAtom,
   fileTreeLoadedAtom,
+  workspaceRootPathsAtom,
+  buildFileTreeForest,
+  normalizeTreePath,
+  replaceFolderChildren,
   gitStatusMapAtom,
   fileGitStatusAtom,
   expandedDirsAtom,
@@ -490,3 +496,14 @@ export {
   clearVoiceActiveSession,
   persistAndClearVoiceSession,
 } from './listeners/voiceModeListeners';
+
+export {
+  feedbackRequestAtomKey,
+  feedbackRequestTargetKey,
+  feedbackRequestActiveViewerAtomFamily,
+  feedbackRequestAtomFamily,
+  feedbackRequestProgressAtomFamily,
+  feedbackRequestResponsesForViewerAtomFamily,
+  feedbackRequestStateAtomFamily,
+  feedbackRequestStateForTargetAtomFamily,
+} from './atoms/feedbackRequests';

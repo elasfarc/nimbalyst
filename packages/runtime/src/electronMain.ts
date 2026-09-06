@@ -33,6 +33,17 @@ export type {
   ConversationSyncEvent,
   ConversationTarget,
 } from './sync/ConversationSync';
+export {
+  FeedbackRequestSync,
+  FeedbackRequestSyncError,
+} from './sync/FeedbackRequestSync';
+export type {
+  FeedbackRequestNudgeReceipt,
+  FeedbackRequestSyncConfig,
+  FeedbackRequestSyncEvent,
+  FeedbackRequestSyncState,
+  FeedbackRequestTarget,
+} from './sync/FeedbackRequestSync';
 export type {
   AgentMessage,
   ChatAttachment,
@@ -90,10 +101,22 @@ export type {
 export {
   clearFileSystemService,
   clearFileSystemServiceFor,
+  getFileSystemServiceForPath,
   setFileSystemService,
   setFileSystemServiceFor,
 } from './core/FileSystemService';
 export { VIRTUAL_DOCS, isVirtualPath } from './constants/virtualDocs';
+export {
+  PLAN_INVALID_STATUS_SIGNAL_KIND,
+  PLAN_STATUS_DRIFT_SIGNAL_KIND,
+  derivePlanStatusSignals,
+  normalizePlanStatusForProjection,
+} from './plugins/TrackerPlugin/models/planStatusIntegrity';
+export type {
+  InvalidPlanStatusSignal,
+  PlanStatusDriftSignal,
+  StalePlanStatus,
+} from './plugins/TrackerPlugin/models/planStatusIntegrity';
 export { fuzzyMatchPath } from './utils/fuzzyMatch';
 export { DocumentContextService } from './ai/services/DocumentContextService';
 export {
@@ -103,6 +126,17 @@ export {
   resolveClaudeCodeParentContextWindow,
 } from './ai/modelConstants';
 export { slimClaudeCodeChunkForStorage } from './ai/server/providers/claudeCode/toolChunkUtils';
+export {
+  capClaudeCodeChunkForStorage,
+  capToolResultContent,
+  capToolResultText,
+  STORAGE_TOOL_RESULT_BUDGET_BYTES,
+} from './storage/toolOutputBudget';
+export {
+  isTombstoned,
+  tombstoneMarker,
+  tombstoneRawContent,
+} from './storage/toolOutputRetention';
 export { AISessionsRepository } from './storage/repositories/AISessionsRepository';
 export { AgentMessagesRepository } from './storage/repositories/AgentMessagesRepository';
 export { SessionFilesRepository } from './storage/repositories/SessionFilesRepository';

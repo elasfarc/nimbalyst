@@ -1,4 +1,4 @@
-import { BrowserWindow, dialog, app, nativeImage, ipcMain, screen, nativeTheme, Menu, type IpcMainEvent, type IpcMainInvokeEvent } from 'electron';
+import { BrowserWindow, app, nativeImage, ipcMain, screen, Menu, type IpcMainEvent, type IpcMainInvokeEvent } from 'electron';
 import { safeHandle, safeOn } from '../utils/ipcRegistry';
 import { join, basename } from 'path';
 import { existsSync } from 'fs';
@@ -19,11 +19,12 @@ export function allowControllerWindowShow(): void {
 import { stopFileWatcher } from '../file/FileWatcher';
 import { stopWorkspaceWatcher, startWorkspaceWatcher } from '../file/WorkspaceWatcher.ts';
 import { getFolderContents } from '../utils/FileTree';
-import { getTitleBarColors } from '../theme/ThemeManager';
+import { getBackgroundColor, getTitleBarColors } from '../theme/ThemeManager';
 import { ElectronDocumentService, setupDocumentServiceHandlers } from '../services/ElectronDocumentService';
 import { ElectronFileSystemService } from '../services/ElectronFileSystemService';
 import { isWorktreePath, resolveProjectPath } from '../utils/workspaceDetection';
 import { getPreloadPath } from '../utils/appPaths';
+import { createUnresponsiveHandler } from './unresponsiveHandler';
 import {
   setFileSystemService,
   clearFileSystemService,
@@ -31,6 +32,7 @@ import {
 } from '@nimbalyst/runtime';
 import { navigationHistoryService } from '../services/NavigationHistoryService';
 import { revealReadyWindow } from './revealReadyWindow';
+import { registerStartupWindow } from './StartupActivation';
 import { signalFirstWindowLoaded } from '../services/startupMaintenanceGate';
 import { AnalyticsService } from '../services/analytics/AnalyticsService';
 import { FeatureTrackingService } from '../services/analytics/FeatureTrackingService';
@@ -40,9 +42,15 @@ import { addNimAssetRoot } from '../protocols/nimAssetProtocol';
 import { addNimPreviewWorkspaceRoot } from '../protocols/nimPreviewProtocol';
 import { scheduleAttachmentStagingCleanup } from '../services/attachments/attachmentStagingCleanup';
 import { windows, windowStates, anyWindowReferencesWorkspace, resolveDocumentServicePath, getWindowIdForWindow } from './windowState';
+import {
+    matchWorkspaceWindow,
+    type WorkspaceWindowCandidate,
+    type WorkspaceWindowMatch,
+} from './workspaceWindowMatch';
 import { shouldSaveSessionOnWindowClose } from './sessionSaveOnClose';
 import {
     registerCustomTitleBarWindow,
+    registerFullScreenChrome,
     titleBarOptionsForWindow,
 } from './windowChrome';
 
@@ -179,8 +187,13 @@ export function getFocusedOrNewWindow(): BrowserWindow {
 export interface CreateWindowOptions {
     /** Show the window without activating the app (no focus steal). */
     showInactive?: boolean;
-    /** Keep a restored window hidden if the user switched away during startup. */
-    deferShowUntilAppActive?: boolean;
+    /**
+     * This window is part of app launch: reveal it without activating and let
+     * StartupActivation foreground the app once, at the end of startup.
+     */
+    startupReveal?: boolean;
+    /** Among the startup windows, the one that should end up frontmost. */
+    startupFrontmost?: boolean;
 }
 
 export function createWindow(
@@ -239,23 +252,15 @@ export function createWindow(
             }
         }
 
-        // Determine the current theme and set appropriate background color
-        // IMPORTANT: These colors MUST match the CSS theme files exactly to prevent flash
+        // Passed to the renderer as a query param so it can apply the theme on
+        // first paint; this is the persisted id, extension themes included.
         const currentTheme = getTheme();
-        // console.log('[WINDOW-MANAGER] Creating window with theme:', currentTheme);
-        let backgroundColor = '#ffffff'; // Default to white for light theme
 
-        if (currentTheme === 'dark') {
-            backgroundColor = '#2d2d2d'; // Matches --nim-bg in NimbalystTheme.css (dark)
-        } else if (currentTheme === 'crystal-dark') {
-            backgroundColor = '#0f172a'; // Matches --nim-bg in NimbalystTheme.css (crystal-dark)
-        } else if (currentTheme === 'light') {
-            backgroundColor = '#ffffff'; // Matches --nim-bg in NimbalystTheme.css (light)
-        } else {
-            // system/auto - use nativeTheme which should match prefers-color-scheme
-            backgroundColor = nativeTheme.shouldUseDarkColors ? '#2d2d2d' : '#ffffff';
-        }
-        // console.log('[WINDOW-MANAGER] Background color:', backgroundColor);
+        // The canvas colour behind the renderer, painted before any CSS parses.
+        // Single source of truth in ThemeManager: it prefers the real --nim-bg
+        // the renderer last reported (the only way an extension or file-based
+        // theme's colour is knowable here) and falls back to the base themes.
+        const backgroundColor = getBackgroundColor();
 
         const preloadPath = getPreloadPath();
 
@@ -295,6 +300,13 @@ export function createWindow(
         const window = new BrowserWindow(windowOptions);
         if (isWorkspaceMode) {
             registerCustomTitleBarWindow(window);
+            registerFullScreenChrome(window);
+        }
+
+        // Join the startup cohort before ready-to-show can fire, so launch
+        // knows to wait for this window before foregrounding the app once.
+        if (options?.startupReveal) {
+            registerStartupWindow(window, { frontmost: options.startupFrontmost });
         }
 
         // Generate a unique window ID
@@ -653,20 +665,11 @@ export function createWindow(
         });
 
         // Handle unresponsive renderer
-        window.webContents.on('unresponsive', () => {
-            console.warn('[MAIN] Window became unresponsive');
-            const choice = dialog.showMessageBoxSync(window, {
-                type: 'warning',
-                buttons: ['Reload', 'Keep Waiting'],
-                defaultId: 0,
-                message: 'The window is not responding',
-                detail: 'Would you like to reload the window?'
-            });
-
-            if (choice === 0 && !window.isDestroyed()) {
-                window.reload();
-            }
-        });
+        window.webContents.on('unresponsive', createUnresponsiveHandler({
+            message: 'The window is not responding',
+            logLabel: '[MAIN]',
+            getWindow: () => window
+        }));
 
         // Handle responsive again
         window.webContents.on('responsive', () => {
@@ -804,64 +807,40 @@ export function findWindowByFilePath(filePath: string): BrowserWindow | null {
  * @returns The BrowserWindow for that workspace, or null if not found
  */
 export function findWindowByWorkspace(workspacePath: string): BrowserWindow | null {
-    // First try exact match — primary or any rail-warm additional path.
-    // Prefer windows where the path is currently active so MCP routes to
-    // the visible project when several windows host the same workspace.
-    let bestActiveMatch: BrowserWindow | null = null;
-    let bestAnyMatch: BrowserWindow | null = null;
+    return findWorkspaceWindowMatch(workspacePath)?.window ?? null;
+}
 
-    for (const [windowId, window] of windows) {
+/** A window that can host the workspace, plus how it currently relates to it. */
+export interface WorkspaceWindowMatchResult extends WorkspaceWindowMatch {
+    window: BrowserWindow;
+}
+
+/**
+ * Same lookup as `findWindowByWorkspace`, but it also reports whether the
+ * matched window is *showing* the workspace. Callers that reuse a window need
+ * that: a window keeps referencing every rail project, so the window that has
+ * Project-A may be displaying Project-B, and focusing it changes nothing on
+ * screen (https://github.com/nimbalyst/nimbalyst/issues/1427).
+ */
+export function findWorkspaceWindowMatch(workspacePath: string): WorkspaceWindowMatchResult | null {
+    const candidates: WorkspaceWindowCandidate[] = [];
+    for (const [windowId] of windows) {
         const state = windowStates.get(windowId);
         if (!state) continue;
-
-        const isActive = (state.activeWorkspacePath ?? state.workspacePath) === workspacePath;
-        const isReferenced =
-            state.workspacePath === workspacePath ||
-            state.additionalWorkspacePaths?.includes(workspacePath) === true;
-
-        if (isActive) {
-            bestActiveMatch = window;
-            break;
-        }
-        if (isReferenced && !bestAnyMatch) {
-            bestAnyMatch = window;
-        }
+        candidates.push({
+            windowId,
+            workspacePath: state.workspacePath,
+            activeWorkspacePath: state.activeWorkspacePath,
+            additionalWorkspacePaths: state.additionalWorkspacePaths,
+        });
     }
 
-    if (bestActiveMatch) return bestActiveMatch;
-    if (bestAnyMatch) return bestAnyMatch;
+    const match = matchWorkspaceWindow(candidates, workspacePath, { isWorktreePath, resolveProjectPath });
+    if (!match) return null;
 
-    // If the given path is a worktree, try to find window by parent project path
-    if (isWorktreePath(workspacePath)) {
-        const projectPath = resolveProjectPath(workspacePath);
-        for (const [windowId, window] of windows) {
-            const state = windowStates.get(windowId);
-            if (!state) continue;
-            if (
-                state.workspacePath === projectPath ||
-                state.additionalWorkspacePaths?.includes(projectPath)
-            ) {
-                return window;
-            }
-        }
-    }
-
-    // If the given path is a project path, check if any window is a worktree of that project
-    for (const [windowId, window] of windows) {
-        const state = windowStates.get(windowId);
-        if (!state) continue;
-        const candidatePaths: string[] = [];
-        if (state.workspacePath) candidatePaths.push(state.workspacePath);
-        if (state.additionalWorkspacePaths) candidatePaths.push(...state.additionalWorkspacePaths);
-
-        for (const candidate of candidatePaths) {
-            if (isWorktreePath(candidate) && resolveProjectPath(candidate) === workspacePath) {
-                return window;
-            }
-        }
-    }
-
-    return null;
+    const window = windows.get(match.windowId);
+    if (!window) return null;
+    return { ...match, window };
 }
 
 /**

@@ -11,6 +11,26 @@ import {
 } from '../../atoms/trackers';
 import { windowModeAtom } from '../../atoms/windowMode';
 import { initDeepLinkListeners } from '../deepLinkListeners';
+import {
+  resetCommentPanelRequests,
+  subscribeCommentPanelRequests,
+} from '../../../components/TabEditor/collabCommentPanelRequests';
+import { normalizeSettingsDestination } from '../../../components/Settings/settingsRoutes';
+import {
+  consumeInboxRowSelectionRequest,
+} from '../../../components/TeamMode/orgWindowCommandBus';
+import {
+  conversationRoute,
+  PROJECT_ORG_MODE_SURFACE_ID,
+  orgWindowRouteAtomFamily,
+} from '../../../components/TeamMode/orgWindowState';
+
+/** What App.tsx actually navigates to for the currently-queued settings command. */
+function resolvedSettingsDestination() {
+  const command = store.get(openSettingsCommandAtom);
+  if (!command) return null;
+  return normalizeSettingsDestination({ category: command.category, scope: command.scope });
+}
 
 describe('tracker deep-link routing', () => {
   let cleanup: (() => void) | undefined;
@@ -23,6 +43,11 @@ describe('tracker deep-link routing', () => {
     store.set(activeWorkspacePathAtom, '/workspace/source');
     store.set(windowModeAtom, 'files');
     store.set(pendingCollabDocumentAtom, null);
+    store.set(
+      orgWindowRouteAtomFamily(PROJECT_ORG_MODE_SURFACE_ID),
+      conversationRoute('conversation-before-link'),
+    );
+    consumeInboxRowSelectionRequest(PROJECT_ORG_MODE_SURFACE_ID);
     store.set(trackerModeLayoutAtom, {
       ...store.get(trackerModeLayoutAtom),
       selectedType: 'plan',
@@ -56,6 +81,8 @@ describe('tracker deep-link routing', () => {
     store.set(activeWorkspacePathAtom, null);
     store.set(windowModeAtom, 'files');
     store.set(pendingCollabDocumentAtom, null);
+    consumeInboxRowSelectionRequest(PROJECT_ORG_MODE_SURFACE_ID);
+    resetCommentPanelRequests();
   });
 
   it('binds a shared-document link to the workspace scope selected by the desktop host', () => {
@@ -75,6 +102,29 @@ describe('tracker deep-link routing', () => {
       orgId: 'org-target',
       analyticsSource: 'deep_link',
     });
+  });
+
+  it('carries a comment notification thread target to the document comments pane', () => {
+    cleanup = initDeepLinkListeners();
+
+    handlers['deep-link:open-shared-document']({
+      documentId: 'doc-target',
+      orgId: 'org-target',
+      workspacePath: '/workspace/target',
+      threadId: 'thread-7',
+    });
+
+    // The pane does not exist yet -- the document is still opening -- so the
+    // request has to be waiting for it under the document's own URI. Thread
+    // identity only: nothing about where the anchor is travels with the link.
+    const delivered: unknown[] = [];
+    const unsubscribe = subscribeCommentPanelRequests(
+      'collab://org:org-target:doc:doc-target',
+      (request) => delivered.push(request),
+    );
+    unsubscribe();
+
+    expect(delivered).toEqual([{ threadId: 'thread-7', source: 'deep-link' }]);
   });
 
   it('keeps links without view on the plain tracker selection path', () => {
@@ -114,6 +164,29 @@ describe('tracker deep-link routing', () => {
       selectedType: 'all',
       selectedItemId: 'tracker-document',
       itemViews: { 'tracker-document': 'document' },
+    });
+  });
+
+  it('opens a project-org feedback request in Org mode with its Inbox row latched', () => {
+    cleanup = initDeepLinkListeners();
+
+    handlers['deep-link:open-org-feedback-request']({
+      requestId: 'request-target',
+      orgId: 'org-project',
+      workspacePath: '/workspace/target',
+    });
+
+    expect(store.get(activeWorkspacePathAtom)).toBe('/workspace/target');
+    expect(store.get(windowModeAtom)).toBe('org');
+    // "Awaiting my reply" is the row a feedback request belongs to, and the
+    // reason axis is navigation now — landing on All would show the recipient
+    // every delivery except, potentially, the one they clicked a link for.
+    expect(store.get(orgWindowRouteAtomFamily(PROJECT_ORG_MODE_SURFACE_ID)))
+      .toEqual({ view: 'inbox', filter: 'awaiting' });
+    expect(consumeInboxRowSelectionRequest(PROJECT_ORG_MODE_SURFACE_ID)).toEqual({
+      orgId: 'org-project',
+      sourceKind: 'feedbackRequest',
+      sourceId: 'request-target',
     });
   });
 });
@@ -179,7 +252,7 @@ describe('team-invitation deep-link handoff', () => {
     );
   });
 
-  it('sends an invitee with no matching account to account settings to sign in', async () => {
+  it('sends an invitee with no matching account to the account sign-in panel', async () => {
     pendingInvite = {
       status: 'sign-in-required',
       orgId: 'org-acme',
@@ -188,13 +261,25 @@ describe('team-invitation deep-link handoff', () => {
 
     cleanup = initDeepLinkListeners();
 
+    // Asserted through the resolver App.tsx feeds the command into, not on the
+    // raw command: a scope-less `{ category: 'account' }` normalizes all the way
+    // down to Application -> Notifications, which is where invitees were landing
+    // with nothing on screen to sign in with.
     await vi.waitFor(() => {
-      expect(store.get(openSettingsCommandAtom)).toMatchObject({ category: 'account' });
+      expect(resolvedSettingsDestination()).toEqual({ scope: 'account', category: 'account' });
     });
     expect(errorNotificationService.showWarning).toHaveBeenCalledWith(
       'Sign in to accept this invitation',
       expect.stringContaining('invitee@test.com'),
       expect.anything(),
     );
+
+    // The toast outlives the navigation behind it, so its button has to be able
+    // to re-issue the same destination.
+    const options = vi.mocked(errorNotificationService.showWarning).mock.calls.at(-1)?.[2];
+    expect(options?.action?.label).toBe('Sign in');
+    store.set(openSettingsCommandAtom, null);
+    options?.action?.onClick();
+    expect(resolvedSettingsDestination()).toEqual({ scope: 'account', category: 'account' });
   });
 });

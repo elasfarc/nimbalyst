@@ -14,6 +14,8 @@ import {
 } from '../window/WindowManager';
 import type { SessionNotificationNavigationTarget } from '../../shared/sessionNotificationNavigation';
 import { composeNotificationTitle } from '../../shared/notificationTitle';
+import { resolveNotificationIcon, type NotificationKind } from './notificationIcons';
+import { AISessionsRepository } from '@nimbalyst/runtime/storage/repositories/AISessionsRepository';
 
 const NOTIFICATION_OUTCOME_TIMEOUT_MS = 2_000;
 
@@ -34,7 +36,10 @@ interface PendingNavigation {
 export interface NotificationOptions {
   title: string;
   body: string;
+  /** Explicit artwork. Overrides whatever `kind` would have resolved to. */
   icon?: string;
+  /** What this notification is about; selects the per-kind artwork. */
+  kind?: NotificationKind;
   sessionId?: string;
   workspacePath: string;  // REQUIRED: stable identifier for routing
   sourceLabel?: string;
@@ -188,12 +193,21 @@ class NotificationService {
       }
     }
 
+    // Producers pass the path the agent is *running* in, which for a worktree
+    // session is the worktree, not the project. Sessions are stored under the
+    // project path, so routing a click on the running path makes the renderer's
+    // `sessions:list` come back empty and report the session as missing.
+    const clickOptions: NotificationOptions = {
+      ...options,
+      workspacePath: await this.resolveOwningWorkspacePath(options),
+    };
+
     try {
       // Create and show the notification using Electron API (production mode)
       const notification = new Notification({
         title: options.title,
         body: options.body,
-        icon: options.icon || this.getAppIcon(),
+        icon: options.icon || resolveNotificationIcon(options.kind) || this.getAppIcon(),
         silent: options.silent === true ? true : false,
         urgency: options.urgency || 'normal', // macOS notification urgency
         timeoutType: options.timeoutType || 'default', // Use system default timeout
@@ -201,7 +215,7 @@ class NotificationService {
 
       // Handle notification click - focus window and switch to session
       notification.on('click', () => {
-        this.handleNotificationClick(options);
+        this.handleNotificationClick(clickOptions);
       });
 
       // Track notification
@@ -331,6 +345,32 @@ class NotificationService {
     }
 
     await shell.openExternal(target);
+  }
+
+  /**
+   * The workspace a click must route to: the project that owns the session, not
+   * whatever directory the agent happened to run in. The session record is the
+   * only authority on this -- a worktree path and its project are unrelated
+   * strings as far as session storage is concerned.
+   *
+   * Falls back to the notified path when the session cannot be read, which is
+   * the pre-existing behaviour and still routes correctly for the common case
+   * of a session that is not in a worktree.
+   */
+  private async resolveOwningWorkspacePath(options: NotificationOptions): Promise<string> {
+    if (!options.sessionId) return options.workspacePath;
+
+    try {
+      const session = await AISessionsRepository.get(options.sessionId);
+      return session?.workspacePath?.trim() || options.workspacePath;
+    } catch (error) {
+      logger.main.warn(
+        '[NotificationService] Could not resolve the owning workspace for session',
+        options.sessionId,
+        error,
+      );
+      return options.workspacePath;
+    }
   }
 
   /**
@@ -570,6 +610,15 @@ class NotificationService {
   }
 
   /**
+   * A question the agent asked reads differently from an approval it is waiting
+   * on: one wants an answer only the user has, the other wants a yes/no on work
+   * already drafted. They get their own artwork.
+   */
+  private getBlockedIconKind(blockingType: BlockingType): NotificationKind {
+    return blockingType === 'question' ? 'agent-question' : 'needs-input';
+  }
+
+  /**
    * Get notification body for a blocking type.
    */
   private getBlockedBody(blockingType: BlockingType, sessionName: string): string {
@@ -606,6 +655,7 @@ class NotificationService {
     await this.showNotification({
       title: composeNotificationTitle(sessionName, this.getBlockedTitle(blockingType)),
       body: this.getBlockedBody(blockingType, sessionName),
+      kind: this.getBlockedIconKind(blockingType),
       sessionId,
       workspacePath,
       sourceLabel: sessionName,

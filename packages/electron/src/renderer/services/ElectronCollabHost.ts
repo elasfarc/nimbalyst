@@ -19,7 +19,6 @@ import type {
   SharedDocument,
   SharedFolder,
 } from '@nimbalyst/collab-client/docs';
-import { asTeamJwt } from '@nimbalyst/runtime/auth/jwtScopes';
 import { store } from '@nimbalyst/runtime/store';
 import { errorNotificationService } from './ErrorNotificationService';
 import {
@@ -36,7 +35,7 @@ import { trackTeamAnalyticsEvent } from '../utils/teamAnalytics';
 import { readReceiptService } from './RendererReadReceiptService';
 import { CollaborationHealthAttemptTracker } from '../../shared/analytics/collaborationHealth';
 import { historyDialogFileAtom } from '../store/atoms/historyDialog';
-import { buildCollabUri } from '../utils/collabUri';
+import { buildCollabUri } from '@nimbalyst/collab-protocol';
 import {
   buildSharedDocumentDeepLink,
   buildSharedFolderDeepLink,
@@ -336,13 +335,28 @@ export class ElectronCollabHost implements CollabHost<ElectronDocsCapability> {
     if (!result.success || !result.jwt) {
       throw new Error(result.error || 'Failed to get team JWT');
     }
-    return asTeamJwt(result.jwt);
+    return result.jwt;
   }
 
   async getMembers(orgId: string): Promise<TeamMemberSummary[]> {
     const scope = await this.resolveScope();
     if (scope.orgId !== orgId) throw new Error('Requested members for a different organization');
     return (await this.ensureDataSource()).getMembers();
+  }
+
+  onMembersChanged(cb: () => void): () => void {
+    let unsubscribe: (() => void) | null = null;
+    let cancelled = false;
+    void this.ensureDataSource().then((source) => {
+      if (cancelled) return;
+      unsubscribe = source.onMembersChanged(cb);
+    }).catch((error) => {
+      console.error('[ElectronCollabHost] Failed to observe member directory:', error);
+    });
+    return () => {
+      cancelled = true;
+      unsubscribe?.();
+    };
   }
 
   openArtifact(ref: CollabArtifactRef, source: CollabOpenSource): void {
@@ -445,15 +459,16 @@ export class ElectronCollabHost implements CollabHost<ElectronDocsCapability> {
     }
     if (!result.success || !result.config) {
       const message = result.error || 'No team found for this project';
-      throw new CollabScopeResolutionError(message, {
-        retryable: !message.includes('Not authenticated') && !message.includes('No team found'),
-      });
+      // The resolver knows whether its own failure was terminal; classifying by
+      // substring here read a timed-out team-directory fetch as a definitive
+      // "this project has no team" and latched the mode off for the session.
+      throw new CollabScopeResolutionError(message, { retryable: result.retryable === true });
     }
-    const { orgId, teamProjectId, serverUrl, userId, userName, userEmail } = result.config;
+    const { orgId, teamProjectId, serverUrl, teamMemberId, userName, userEmail, urlExtraQuery } = result.config;
     return {
       scopeKey: requestedScopeKey,
       orgId,
-      indexConfig: { teamProjectId, serverUrl, userId, userName, userEmail },
+      indexConfig: { teamProjectId, serverUrl, teamMemberId, userName, userEmail, urlExtraQuery },
     };
   }
 
@@ -471,6 +486,24 @@ export class ElectronCollabHost implements CollabHost<ElectronDocsCapability> {
       },
       onConversationDescriptorUpdated: (descriptor) => {
         void applyConversationDescriptorBroadcast({ orgId: scope.orgId, descriptor });
+      },
+      onFeedbackIndexLoaded: (entries) => {
+        void window.electronAPI.invoke('feedback-request-index:replace-snapshot', {
+          target: { workspacePath: scope.scopeKey, orgId: scope.orgId },
+          teamMemberId: scope.indexConfig.teamMemberId,
+          entries,
+        }).catch((error) => {
+          console.error('[ElectronCollabHost] Failed to persist feedback index snapshot:', error);
+        });
+      },
+      onFeedbackIndexChanged: (entry) => {
+        void window.electronAPI.invoke('feedback-request-index:upsert', {
+          target: { workspacePath: scope.scopeKey, orgId: scope.orgId },
+          teamMemberId: scope.indexConfig.teamMemberId,
+          entry,
+        }).catch((error) => {
+          console.error('[ElectronCollabHost] Failed to persist feedback index update:', error);
+        });
       },
       onMemberAdded: (member) => {
         void (window as any).electronAPI.org.applyMemberUpserted(
@@ -498,6 +531,12 @@ export class ElectronCollabHost implements CollabHost<ElectronDocsCapability> {
         scope,
         getJwt: () => this.getTeamJwt(scope.orgId),
         events: this.createDataSourceEvents(scope),
+      });
+      void window.electronAPI.invoke('feedback-request-index:list', {
+        workspacePath: scope.scopeKey,
+        orgId: scope.orgId,
+      }).catch((error) => {
+        console.error('[ElectronCollabHost] Failed to load cached feedback index:', error);
       });
       this.dataSource = source;
       return source;

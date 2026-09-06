@@ -67,7 +67,6 @@ import { MetaAgentMode } from '../MetaAgentMode/MetaAgentMode';
 import { tipCreateWorktreeSessionRequestAtom } from '../../tips/atoms';
 import {
   blitzDialogOpenAtom,
-  isGitRepoAtom,
   sessionQuickOpenRequestedAtom,
   selectSessionActionAtom,
   openSessionInTabActionAtom,
@@ -77,6 +76,7 @@ import {
   addSessionToWorktreeActionAtom,
 } from '../../store/actions/sessionHistoryActions';
 import { defaultAgentModelAtom } from '../../store/atoms/appSettings';
+import { useGitRepoProbe } from '../../hooks/useGitRepoProbe';
 export interface AgentModeRef {
   createNewSession: (initialDraft?: string) => Promise<string | undefined>;
   createNewWorktreeSession: (options?: { baseBranch?: string; name?: string }) => Promise<void>;
@@ -87,6 +87,7 @@ export interface AgentModeRef {
   previousTab: () => void;
   toggleRightPanel: () => void;
   showRightPanel: (mode: AgentRightPanelMode) => void;
+  toggleEditorMaximized: () => void;
 }
 
 export interface AgentModePanelState {
@@ -131,10 +132,10 @@ export const AgentMode = forwardRef<AgentModeRef, AgentModeProps>(function Agent
   // Ref to the workstream panel for closing tabs
   const workstreamPanelRef = useRef<AgentWorkstreamPanelRef>(null);
 
-  // Git repo status for the worktree feature. Stored per-workspace in an
-  // atom so SessionHistory and the New Worktree action atom can read it
-  // without prop-threading.
-  const isGitRepo = useAtomValue(isGitRepoAtom(workspacePath));
+  // Git repo status for the worktree feature. Shared per-workspace through
+  // `isGitRepoAtom` so SessionHistory and the New Worktree action atom see
+  // the same answer; `undefined` until the probe resolves.
+  const isGitRepo = useGitRepoProbe(workspacePath);
 
   // Blitz dialog open state. Lives in an atom so SessionHistory's
   // "New Blitz" button can open the dialog via an action atom while the
@@ -304,51 +305,6 @@ export const AgentMode = forwardRef<AgentModeRef, AgentModeProps>(function Agent
     return cleanup;
   }, [workspacePath]);
 
-  // Check if workspace is a git repository (needed for worktree feature).
-  // Writes the per-workspace `isGitRepoAtom` so SessionHistory and the
-  // worktree action atoms can read it without prop drilling.
-  //
-  // Past bug: the effect's only dep is `workspacePath`, so a single
-  // transient failure (electronAPI not ready, IPC reject) would write
-  // `false` and the atom would stay false forever, leaving the
-  // New Worktree / New Blitz / Super Loop buttons disabled even though
-  // the workspace is a git repo. Only write `false` when we have a
-  // definitive answer from the IPC; bail out silently otherwise and
-  // retry shortly until electronAPI is available.
-  useEffect(() => {
-    if (!workspacePath) return;
-
-    let cancelled = false;
-    let retryTimer: ReturnType<typeof setTimeout> | undefined;
-
-    const probe = () => {
-      if (cancelled) return;
-      const invoke = window.electronAPI?.invoke;
-      if (!invoke) {
-        // electronAPI not ready yet — retry briefly. Don't lock the
-        // atom to `false` in the meantime.
-        retryTimer = setTimeout(probe, 250);
-        return;
-      }
-      invoke('git:is-repo', workspacePath)
-        .then(result => {
-          if (cancelled) return;
-          store.set(isGitRepoAtom(workspacePath), Boolean(result?.success && result.isRepo));
-        })
-        .catch(() => {
-          if (cancelled) return;
-          store.set(isGitRepoAtom(workspacePath), false);
-        });
-    };
-
-    probe();
-
-    return () => {
-      cancelled = true;
-      if (retryTimer) clearTimeout(retryTimer);
-    };
-  }, [workspacePath]);
-
   // Push navigation entry when selected workstream changes (unified cross-mode navigation)
   const pushNavigationEntry = useSetAtom(pushNavigationEntryAtom);
   const isRestoringNavigation = useAtomValue(isRestoringNavigationAtom);
@@ -380,7 +336,7 @@ export const AgentMode = forwardRef<AgentModeRef, AgentModeProps>(function Agent
   useEffect(() => {
     if (trayNewSessionRequest) {
       setTrayNewSessionRequest(false);
-      void dispatchCreateNewSession(undefined);
+      void dispatchCreateNewSession({ launchSource: 'tray' });
     }
   }, [trayNewSessionRequest, setTrayNewSessionRequest, dispatchCreateNewSession]);
 
@@ -547,7 +503,8 @@ export const AgentMode = forwardRef<AgentModeRef, AgentModeProps>(function Agent
   // setter identities returned by useSetAtom are stable, so the deps array
   // does not churn.
   useImperativeHandle(ref, () => ({
-    createNewSession: (initialDraft?: string) => dispatchCreateNewSession(initialDraft),
+    createNewSession: (initialDraft?: string) =>
+      dispatchCreateNewSession({ initialDraft, launchSource: 'new_session_button' }),
     createNewWorktreeSession: async (options?: { baseBranch?: string; name?: string }) => {
       await dispatchCreateNewWorktreeSession(options);
     },
@@ -577,6 +534,10 @@ export const AgentMode = forwardRef<AgentModeRef, AgentModeProps>(function Agent
           toggleFilesSidebar(selectedWorkstreamId);
         }
       }
+    },
+    toggleEditorMaximized: () => {
+      // The maximize state lives with the workstream panel that owns the tabs.
+      workstreamPanelRef.current?.toggleEditorMaximized();
     },
   }), [
     dispatchCreateNewSession,
@@ -628,7 +589,7 @@ export const AgentMode = forwardRef<AgentModeRef, AgentModeProps>(function Agent
         onAddSessionToWorktree={dispatchAddSessionToWorktree}
         onCreateWorktreeSession={createWorktreeSession}
         onWorktreeArchived={handleWorktreeArchived}
-        isGitRepo={isGitRepo}
+        isGitRepo={isGitRepo === true}
         onSwitchToAgentMode={onSwitchToAgentMode}
         onOpenSessionInChat={onOpenSessionInChat}
       />
@@ -637,7 +598,7 @@ export const AgentMode = forwardRef<AgentModeRef, AgentModeProps>(function Agent
     <div className="agent-mode-empty flex flex-col items-center justify-center h-full gap-4 text-nim-muted">
       <p className="m-0 text-sm">Select a session or create a new one to get started</p>
       <button
-        onClick={() => dispatchCreateNewSession(undefined)}
+        onClick={() => dispatchCreateNewSession({ launchSource: 'new_session_button' })}
         className="agent-mode-new-button py-2 px-4 rounded-md border border-nim-border bg-nim-bg-secondary text-nim cursor-pointer text-sm transition-colors hover:bg-nim-bg-active"
       >
         New Session

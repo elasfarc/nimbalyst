@@ -1,3 +1,5 @@
+import { parseCollabUri } from '@nimbalyst/collab-protocol';
+
 export interface ImportedDocumentReference {
   documentId: string;
   name: string;
@@ -171,38 +173,44 @@ export function parseCollabReferenceDocumentId(href: string | null | undefined):
   if (deepLinkMatch) {
     return decodeURIComponent(deepLinkMatch[1]);
   }
-  const collabUriMatch = trimmed.match(/^collab:\/\/org:[^:]+:doc:(.+)$/);
-  if (collabUriMatch) {
-    return collabUriMatch[1];
+  try {
+    return parseCollabUri(trimmed).documentId;
+  } catch {
+    return null;
   }
-  return null;
 }
 
-export function resolveDocumentLinkLookupPath(
+/**
+ * Candidate workspace paths for a link href, in the order they should be tried.
+ *
+ * A bare href like `sibling.md` is ambiguous here: markdown authors mean "next
+ * to this document" (CommonMark), while `@` mention chips export a bare
+ * *workspace-relative* path. So a bare href yields both, document-relative
+ * first. Explicit `./` / `../` and absolute hrefs are unambiguous and yield one.
+ */
+export function resolveDocumentLinkLookupPaths(
   storedPath: string,
   currentDocumentPath: string | null,
   workspacePath: string | null,
-): string {
+): string[] {
   const normalizedPath = normalizeDocumentLinkHref(storedPath);
   if (!normalizedPath) {
-    return '';
+    return [];
   }
 
   if (isAbsolutePath(normalizedPath)) {
     if (!workspacePath) {
-      return normalizePath(normalizedPath);
+      return [normalizePath(normalizedPath)];
     }
-    return (
+    return [
       toWorkspaceRelativePath(normalizedPath, workspacePath) ??
-      normalizePath(normalizedPath)
-    );
+        normalizePath(normalizedPath),
+    ];
   }
 
-  const isExplicitlyDocumentRelative =
-    normalizedPath.startsWith('./') || normalizedPath.startsWith('../');
-  if (isExplicitlyDocumentRelative) {
+  const relativeToDocument = (): string | null => {
     if (!currentDocumentPath) {
-      return normalizedPath;
+      return null;
     }
 
     const absoluteTarget = joinAndNormalize(
@@ -217,7 +225,17 @@ export function resolveDocumentLinkLookupPath(
     return (
       toWorkspaceRelativePath(absoluteTarget, workspacePath) ?? absoluteTarget
     );
+  };
+
+  const isExplicitlyDocumentRelative =
+    normalizedPath.startsWith('./') || normalizedPath.startsWith('../');
+  if (isExplicitlyDocumentRelative) {
+    return [relativeToDocument() ?? normalizedPath];
   }
 
-  return normalizePath(normalizedPath);
+  const candidates = [relativeToDocument(), normalizePath(normalizedPath)];
+  return candidates.filter(
+    (candidate, index): candidate is string =>
+      Boolean(candidate) && candidates.indexOf(candidate) === index,
+  );
 }

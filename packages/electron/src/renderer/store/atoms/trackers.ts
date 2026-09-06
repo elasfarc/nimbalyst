@@ -8,6 +8,7 @@
 import { atom, type Setter } from 'jotai';
 import { atomFamily } from '../debug/atomFamilyRegistry';
 import { store } from '@nimbalyst/runtime/store';
+import type { TrackerDataSource } from '@nimbalyst/collab-client/trackers';
 
 // ============================================================
 // Types
@@ -78,6 +79,27 @@ function migrateViewMode(
 }
 
 /**
+ * Reload the team-shared saved views for a workspace.
+ *
+ * The shared views are normally populated by the tracker sync listener's
+ * startup snapshot, but `initTrackerPanelLayout` clears them synchronously and
+ * the two run on independent async chains -- when the snapshot's IPC round
+ * trips beat React's commit of `workspacePath`, the clear lands last and the
+ * team's views vanish from the sidebar until an unrelated share/unshare event
+ * happens to refill them (#3731). Whoever clears the atom must also refill it.
+ */
+async function refreshSharedSavedViews(workspacePath: string): Promise<void> {
+  try {
+    const records = await window.electronAPI.invoke('tracker-saved-views:list', workspacePath);
+    // A response for a project the user has already left must not repopulate.
+    if (currentWorkspacePath !== workspacePath) return;
+    store.set(replaceSharedTrackerViewsAtom, records);
+  } catch (err) {
+    console.error('[trackers] Failed to load shared saved views:', err);
+  }
+}
+
+/**
  * Initialize tracker layout from workspace state.
  * Call this when workspace path is known.
  */
@@ -89,6 +111,7 @@ export async function initTrackerPanelLayout(workspacePath: string): Promise<voi
   store.set(trackerModeLayoutAtom, DEFAULT_MODE_LAYOUT);
   store.set(trackerSavedViewsAtom, []);
   store.set(sharedTrackerSavedViewsAtom, []);
+  void refreshSharedSavedViews(workspacePath);
 
   try {
     const workspaceState = await window.electronAPI.invoke(
@@ -102,18 +125,26 @@ export async function initTrackerPanelLayout(workspacePath: string): Promise<voi
       const alreadyMigrated = savedModeLayout.viewModeMigrated === true;
       const migratedViewMode = migrateViewMode(savedModeLayout.viewMode, alreadyMigrated);
 
+      const selectedType = savedModeLayout.selectedType ?? DEFAULT_MODE_LAYOUT.selectedType;
+      const typeColumnConfigs = normalizeTypeColumnConfigs(savedModeLayout.typeColumnConfigs);
+      const legacyGroupBy = readLegacyTypeGroupBy(savedModeLayout.typeColumnConfigs, selectedType);
       const newLayout: TrackerModeLayout = {
-        selectedType: savedModeLayout.selectedType ?? DEFAULT_MODE_LAYOUT.selectedType,
+        selectedType,
         activeFilters: Array.isArray(savedModeLayout.activeFilters)
           ? savedModeLayout.activeFilters
           : DEFAULT_MODE_LAYOUT.activeFilters,
         viewMode: migratedViewMode,
         selectedItemId: savedModeLayout.selectedItemId ?? DEFAULT_MODE_LAYOUT.selectedItemId,
         sidebarWidth: savedModeLayout.sidebarWidth ?? DEFAULT_MODE_LAYOUT.sidebarWidth,
+        sidebarCollapsed: typeof savedModeLayout.sidebarCollapsed === 'boolean'
+          ? savedModeLayout.sidebarCollapsed
+          : DEFAULT_MODE_LAYOUT.sidebarCollapsed,
         detailPanelWidth: savedModeLayout.detailPanelWidth ?? DEFAULT_MODE_LAYOUT.detailPanelWidth,
-        typeColumnConfigs: savedModeLayout.typeColumnConfigs ?? DEFAULT_MODE_LAYOUT.typeColumnConfigs,
+        typeColumnConfigs,
         typeColumnFilters: savedModeLayout.typeColumnFilters ?? DEFAULT_MODE_LAYOUT.typeColumnFilters,
-        groupBy: savedModeLayout.groupBy ?? DEFAULT_MODE_LAYOUT.groupBy,
+        typeViewSettings: normalizeTypeViewSettings(savedModeLayout.typeViewSettings),
+        groupBy: normalizeTrackerGroupBy(savedModeLayout.groupBy ?? legacyGroupBy),
+        ordering: normalizeTrackerOrdering(savedModeLayout.ordering),
         sortBy: typeof savedModeLayout.sortBy === 'string' ? savedModeLayout.sortBy : DEFAULT_MODE_LAYOUT.sortBy,
         sortDirection: savedModeLayout.sortDirection === 'asc' || savedModeLayout.sortDirection === 'desc'
           ? savedModeLayout.sortDirection
@@ -124,6 +155,10 @@ export async function initTrackerPanelLayout(workspacePath: string): Promise<voi
           || savedModeLayout.recentlyViewedDays === 90
           ? savedModeLayout.recentlyViewedDays
           : DEFAULT_MODE_LAYOUT.recentlyViewedDays,
+        // Persisted layouts written before this key existed have no value here,
+        // and `??` is what makes them read as `open` on upgrade rather than
+        // `undefined` (which would show everything and quietly defeat the point).
+        statusScope: normalizeTrackerStatusScope(savedModeLayout.statusScope),
         inboxScope: savedModeLayout.inboxScope === 'type' ? 'type' : DEFAULT_MODE_LAYOUT.inboxScope,
         itemViews: normalizeItemViews(savedModeLayout.itemViews),
         documentListPaneVisible: typeof savedModeLayout.documentListPaneVisible === 'boolean'
@@ -140,6 +175,8 @@ export async function initTrackerPanelLayout(workspacePath: string): Promise<voi
         ),
         documentRightPanelMode: normalizeDocumentPanelMode(savedModeLayout.documentRightPanelMode),
         documentChatSessions: normalizeDocumentChatSessions(savedModeLayout.documentChatSessions),
+        collapsedOwnershipSections: normalizeCollapsedOwnershipSections(savedModeLayout.collapsedOwnershipSections),
+        expandedNavFolders: normalizeExpandedNavFolders(savedModeLayout.expandedNavFolders),
         viewModeMigrated: true,
       };
 
@@ -176,20 +213,55 @@ export async function initTrackerPanelLayout(workspacePath: string): Promise<voi
 export type TrackerFilterChip = 'mine' | 'unassigned' | 'high-priority' | 'recently-updated'
   | 'favorites' | 'recently-viewed' | 'recently-edited-by-others' | 'archived';
 
+/** Which slice of the lifecycle a view shows. */
+export type TrackerStatusScope = 'open' | 'all' | 'closed';
+
+export function normalizeTrackerStatusScope(raw: unknown): TrackerStatusScope {
+  return raw === 'all' || raw === 'closed' ? raw : 'open';
+}
+
 /** Per-type column configuration (re-exported from runtime) */
 export type { TypeColumnConfig } from '@nimbalyst/runtime/plugins/TrackerPlugin/components/trackerColumns';
 import type { TypeColumnConfig } from '@nimbalyst/runtime/plugins/TrackerPlugin/components/trackerColumns';
 import type { SortColumn, SortDirection } from '@nimbalyst/runtime/plugins/TrackerPlugin';
 import type { InboxScope, TrackerFilterSet } from '@nimbalyst/runtime/plugins/TrackerPlugin/models';
 import {
+  normalizeTrackerOrdering,
+  type TrackerOrdering,
+} from '@nimbalyst/runtime/plugins/TrackerPlugin/models/trackerOrdering';
+import {
   mergeSavedViews,
   normalizeViewDefinition,
   normalizeViewMode,
+  normalizeTrackerGroupBy,
   parseSharedSavedView,
   serializeSharedSavedView,
   type SavedView,
   type TrackerGroupBy,
 } from '../../components/TrackerMode/trackerSavedViews';
+import type { TrackerViewMode } from '../../components/TrackerMode/trackerViewModes';
+import type { TrackerOwnership } from '../../components/TrackerMode/trackerNavigationTree';
+import {
+  normalizeCollapsedOwnershipSections,
+  normalizeExpandedNavFolders,
+} from '../../components/TrackerMode/trackerSidebarCollapse';
+
+/**
+ * The Display Settings a tracker type remembers for itself: which view renders,
+ * how it groups, and how it orders and sorts within a group.
+ *
+ * Stored per type (see {@link TrackerModeLayout.typeViewSettings}) because a bug
+ * list and a plan roadmap want different presentations, the same way they
+ * already want different columns (#1412). Every field is optional -- an absent
+ * one falls back to the same-named root field on the layout.
+ */
+export interface TrackerTypeViewSettings {
+  viewMode: TrackerViewMode;
+  groupBy: TrackerGroupBy;
+  ordering: TrackerOrdering;
+  sortBy: SortColumn;
+  sortDirection: SortDirection;
+}
 
 export interface TrackerModeLayout {
   /** Selected type filter in sidebar ('all' or specific type) */
@@ -202,6 +274,8 @@ export interface TrackerModeLayout {
    * - `table`  -- virtualized, in-place-editable RevoGrid table
    *               (`TrackerGridView`).
    * - `kanban` -- column-per-status board (`KanbanBoard`).
+   * - `timeline` -- items along a time axis, one row per grouping bucket
+   *               (`TrackerTimelineView`).
    * - `tag-board` -- column-per-tag board (`TagBoard`).
    * - `inbox`  -- keyboard-driven triage queue of untriaged items
    *               (`TrackerInboxView`).
@@ -209,11 +283,13 @@ export interface TrackerModeLayout {
    * Legacy persisted state used `'table'` for the list view and `'grid'` for
    * the RevoGrid table; `migrateViewMode` rewrites both on load.
    */
-  viewMode: 'list' | 'table' | 'kanban' | 'tag-board' | 'inbox';
+  viewMode: TrackerViewMode;
   /** Currently selected tracker item ID (opens detail panel when non-null) */
   selectedItemId: string | null;
   /** Sidebar width in pixels */
   sidebarWidth: number;
+  /** Whether the user has collapsed the tracker sidebar (Cmd+T / gutter re-click). */
+  sidebarCollapsed: boolean;
   /** Detail panel width in pixels */
   detailPanelWidth: number;
   /** Per-type column configuration (keyed by tracker type, 'all' for the all-types view) */
@@ -224,11 +300,32 @@ export interface TrackerModeLayout {
    * `activeFilters` chips.
    */
   typeColumnFilters: Record<string, TrackerFilterSet>;
-  /** Active grouping for grouped renderings (NIM-788). Defaults to 'none'. */
+  /**
+   * Display Settings remembered per type, keyed the same way as
+   * {@link TrackerModeLayout.typeColumnConfigs}. A missing key -- or a missing
+   * field within a key -- reads through to the root-level field below, so a
+   * workspace upgrading into this build opens every type on exactly the view it
+   * had before. Read through {@link resolveTrackerViewSettings}, never directly.
+   */
+  typeViewSettings: Record<string, Partial<TrackerTypeViewSettings>>;
+  /**
+   * Fallback grouping for a type with no entry in `typeViewSettings` (NIM-788).
+   * Writes go to the per-type slot, so this holds whatever the workspace was
+   * last set to before per-type settings existed.
+   */
   groupBy: TrackerGroupBy;
+  /** Fallback manual kanban ordering, or a sortable schema field id. */
+  ordering: TrackerOrdering;
   sortBy: SortColumn;
   sortDirection: SortDirection;
   recentlyViewedDays: 7 | 30 | 90 | null;
+  /**
+   * Which slice of the lifecycle the view shows. Defaults to `open`, so closed
+   * work stays out of the way without anyone having to build a filter for it —
+   * the reason this is layout state rather than a filter chip is that chips are
+   * additive and always start off, and this has to start ON.
+   */
+  statusScope: TrackerStatusScope;
   /** Whether the triage inbox spans every type or only the selected one. */
   inboxScope: InboxScope;
   /**
@@ -257,6 +354,10 @@ export interface TrackerModeLayout {
    * same way as {@link TrackerModeLayout.itemViews}.
    */
   documentChatSessions: Record<string, string>;
+  /** Sidebar ownership groups the user has collapsed. */
+  collapsedOwnershipSections: TrackerOwnership[];
+  /** Sidebar navigation folders the user has expanded. */
+  expandedNavFolders: string[];
   /**
    * Set to `true` once the one-shot `'table' -> 'list'` rewrite has run for
    * this workspace. Future loads pass `viewMode` through untouched so users
@@ -271,13 +372,17 @@ const DEFAULT_MODE_LAYOUT: TrackerModeLayout = {
   viewMode: 'list',
   selectedItemId: null,
   sidebarWidth: 220,
+  sidebarCollapsed: false,
   detailPanelWidth: 400,
   typeColumnConfigs: {},
   typeColumnFilters: {},
+  typeViewSettings: {},
   groupBy: 'none',
+  ordering: 'manual',
   sortBy: 'lastIndexed',
   sortDirection: 'desc',
   recentlyViewedDays: 30,
+  statusScope: 'open',
   inboxScope: 'global',
   itemViews: {},
   documentListPaneVisible: true,
@@ -286,8 +391,118 @@ const DEFAULT_MODE_LAYOUT: TrackerModeLayout = {
   documentRightPanelWidth: 380,
   documentRightPanelMode: 'chat',
   documentChatSessions: {},
+  collapsedOwnershipSections: [],
+  expandedNavFolders: [],
   viewModeMigrated: true,
 };
+
+function normalizeTypeColumnConfigs(raw: unknown): Record<string, TypeColumnConfig> {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  const normalized: Record<string, TypeColumnConfig> = {};
+  for (const [type, value] of Object.entries(raw)) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
+    const config = value as { visibleColumns?: unknown; columnWidths?: unknown; typeColumnDisplay?: unknown };
+    if (!Array.isArray(config.visibleColumns)) continue;
+    normalized[type] = {
+      visibleColumns: config.visibleColumns.filter((column): column is string => typeof column === 'string'),
+      columnWidths: config.columnWidths && typeof config.columnWidths === 'object' && !Array.isArray(config.columnWidths)
+        ? config.columnWidths as Record<string, number>
+        : {},
+      // Absent (or unrecognized) stays absent so the Type column resolves to its icon default.
+      ...(config.typeColumnDisplay === 'label' || config.typeColumnDisplay === 'icon'
+        ? { typeColumnDisplay: config.typeColumnDisplay }
+        : {}),
+    };
+  }
+  return normalized;
+}
+
+/**
+ * Each reader below answers "did the persisted value mean something?" rather
+ * than "what should this be?" -- an unrecognized value returns `undefined` so
+ * the slot stays absent and {@link resolveTrackerViewSettings} falls through to
+ * the root field, instead of pinning the type to a hardcoded default.
+ */
+function readTypeViewMode(value: unknown): TrackerViewMode | undefined {
+  if (value === undefined) return undefined;
+  // `normalizeViewMode` folds the retired 'grid' literal into 'table' and
+  // silently falls back for anything else, so 'grid' has to be kept by name.
+  if (value === 'grid') return 'table';
+  const normalized = normalizeViewMode(value, DEFAULT_MODE_LAYOUT.viewMode);
+  return normalized === value ? normalized : undefined;
+}
+
+function readTypeGroupBy(value: unknown): TrackerGroupBy | undefined {
+  if (value === undefined) return undefined;
+  const normalized = normalizeTrackerGroupBy(value);
+  // 'none' is both a real axis and the normalizer's failure answer.
+  return normalized !== 'none' || value === 'none' ? normalized : undefined;
+}
+
+function readTypeOrdering(value: unknown): TrackerOrdering | undefined {
+  return typeof value === 'string' && value.trim() ? normalizeTrackerOrdering(value) : undefined;
+}
+
+function readTypeSortDirection(value: unknown): SortDirection | undefined {
+  return value === 'asc' || value === 'desc' ? value : undefined;
+}
+
+/**
+ * Per-type Display Settings, normalized field by field. Types whose every field
+ * is unusable are dropped rather than stored empty, so the persisted blob only
+ * carries settings a user actually chose.
+ */
+function normalizeTypeViewSettings(raw: unknown): Record<string, Partial<TrackerTypeViewSettings>> {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  const normalized: Record<string, Partial<TrackerTypeViewSettings>> = {};
+  for (const [type, value] of Object.entries(raw)) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
+    const saved = value as Partial<Record<keyof TrackerTypeViewSettings, unknown>>;
+    const settings: Partial<TrackerTypeViewSettings> = {};
+
+    const viewMode = readTypeViewMode(saved.viewMode);
+    if (viewMode !== undefined) settings.viewMode = viewMode;
+    const groupBy = readTypeGroupBy(saved.groupBy);
+    if (groupBy !== undefined) settings.groupBy = groupBy;
+    const ordering = readTypeOrdering(saved.ordering);
+    if (ordering !== undefined) settings.ordering = ordering;
+    if (typeof saved.sortBy === 'string' && saved.sortBy) settings.sortBy = saved.sortBy;
+    const sortDirection = readTypeSortDirection(saved.sortDirection);
+    if (sortDirection !== undefined) settings.sortDirection = sortDirection;
+
+    if (Object.keys(settings).length > 0) normalized[type] = settings;
+  }
+  return normalized;
+}
+
+/**
+ * The Display Settings actually in force for one tracker type: its own choices
+ * where it has made them, the workspace-wide values everywhere else.
+ *
+ * This two-level read is the whole fix for #1412. It also means an upgrading
+ * workspace -- which has no `typeViewSettings` at all -- opens every type on
+ * exactly the view it was last left in, with nothing to migrate.
+ */
+export function resolveTrackerViewSettings(
+  layout: TrackerModeLayout,
+  typeKey: string,
+): TrackerTypeViewSettings {
+  const settings = layout.typeViewSettings[typeKey];
+  return {
+    viewMode: settings?.viewMode ?? layout.viewMode,
+    groupBy: settings?.groupBy ?? layout.groupBy,
+    ordering: settings?.ordering ?? layout.ordering,
+    sortBy: settings?.sortBy ?? layout.sortBy,
+    sortDirection: settings?.sortDirection ?? layout.sortDirection,
+  };
+}
+
+function readLegacyTypeGroupBy(raw: unknown, selectedType: string): unknown {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const config = (raw as Record<string, unknown>)[selectedType];
+  if (!config || typeof config !== 'object' || Array.isArray(config)) return undefined;
+  return (config as { groupBy?: unknown }).groupBy;
+}
 
 /** Presentation of a single tracker item inside Tracker Mode. */
 export type TrackerItemView = 'item' | 'document';
@@ -373,14 +588,24 @@ export const trackerModeActiveFiltersAtom = atom(
   (get) => get(trackerModeLayoutAtom).activeFilters
 );
 
-/** View mode (`list` row-list, `table` grid, or `kanban` board) in tracker mode. */
-export const trackerModeViewModeAtom = atom(
-  (get) => get(trackerModeLayoutAtom).viewMode
-);
-
 /** Currently selected item ID in tracker mode (opens detail panel). */
 export const trackerModeSelectedItemIdAtom = atom(
   (get) => get(trackerModeLayoutAtom).selectedItemId
+);
+
+/** Whether the tracker sidebar is collapsed by user preference. */
+export const trackerSidebarCollapsedAtom = atom(
+  (get) => get(trackerModeLayoutAtom).sidebarCollapsed
+);
+
+/** Sidebar ownership groups the user has collapsed. */
+export const trackerSidebarCollapsedSectionsAtom = atom(
+  (get) => get(trackerModeLayoutAtom).collapsedOwnershipSections
+);
+
+/** Sidebar navigation folders the user has expanded. */
+export const trackerSidebarExpandedFoldersAtom = atom(
+  (get) => get(trackerModeLayoutAtom).expandedNavFolders
 );
 
 let modeLayoutPersistTimer: ReturnType<typeof setTimeout> | null = null;
@@ -412,9 +637,72 @@ export const setTrackerModeLayoutAtom = atom(
   }
 );
 
-/** Active grouping in tracker mode. */
-export const trackerModeGroupByAtom = atom(
-  (get) => get(trackerModeLayoutAtom).groupBy
+/**
+ * Toggle the tracker sidebar's collapsed state. Writes the preference even
+ * while document view is force-collapsing the sidebar, so the toggle takes
+ * effect the moment the user leaves the document layout.
+ */
+export const toggleTrackerSidebarCollapsedAtom = atom(
+  null,
+  (get, set) => {
+    set(setTrackerModeLayoutAtom, { sidebarCollapsed: !get(trackerModeLayoutAtom).sidebarCollapsed });
+  }
+);
+
+/**
+ * Display Settings in force for the selected type -- view mode, grouping,
+ * ordering, and sort. Every consumer reads this rather than the root layout
+ * fields, so the on-screen view and the per-type store cannot drift apart.
+ *
+ * The previous value is returned whenever all five fields are unchanged. Every
+ * write to the layout re-runs this read, and the layout carries high-churn
+ * state like `selectedItemId`; a fresh object each time would re-render both
+ * tracker components and rebuild the view definition on every item click.
+ */
+let lastActiveViewSettings = resolveTrackerViewSettings(
+  DEFAULT_MODE_LAYOUT,
+  DEFAULT_MODE_LAYOUT.selectedType,
+);
+
+export const trackerActiveViewSettingsAtom = atom(
+  (get) => {
+    const layout = get(trackerModeLayoutAtom);
+    const next = resolveTrackerViewSettings(layout, layout.selectedType);
+    const previous = lastActiveViewSettings;
+    const unchanged = next.viewMode === previous.viewMode
+      && next.groupBy === previous.groupBy
+      && next.ordering === previous.ordering
+      && next.sortBy === previous.sortBy
+      && next.sortDirection === previous.sortDirection;
+    if (unchanged) return previous;
+    lastActiveViewSettings = next;
+    return next;
+  }
+);
+
+/**
+ * Write Display Settings for one tracker type, leaving every other type -- and
+ * the root fallback -- alone. Writing the fallback too would let a type nobody
+ * has configured drift as a side effect of configuring a different one, which
+ * is the bug this replaced (#1412).
+ */
+export const setTrackerTypeViewSettingsAtom = atom(
+  null,
+  (get, set, updates: { typeKey: string } & Partial<TrackerTypeViewSettings>) => {
+    const { typeKey, ...settings } = updates;
+    const current = get(trackerModeLayoutAtom);
+    set(setTrackerModeLayoutAtom, {
+      typeViewSettings: {
+        ...current.typeViewSettings,
+        [typeKey]: { ...current.typeViewSettings[typeKey], ...settings },
+      },
+    });
+  }
+);
+
+/** Active lifecycle scope in tracker mode. */
+export const trackerModeStatusScopeAtom = atom(
+  (get) => get(trackerModeLayoutAtom).statusScope
 );
 
 /**
@@ -557,7 +845,15 @@ export const deleteTrackerViewAtom = atom(
  * and it round-trips through the tracker room's saved-view lane.
  */
 export const sharedTrackerSavedViewsAtom = atom<SavedView[]>([]);
-let sharedViewsLoadVersion = 0;
+const trackerDataSourceAtom = atom<TrackerDataSource | null>(null);
+
+/** Bind the active host data source without exposing its transport to tracker atoms. */
+export const setTrackerDataSourceAtom = atom(
+  null,
+  (_get, set, dataSource: TrackerDataSource | null) => {
+    set(trackerDataSourceAtom, dataSource);
+  },
+);
 
 /** Local + shared views, as the sidebar renders them. */
 export const allTrackerSavedViewsAtom = atom<SavedView[]>((get) =>
@@ -572,13 +868,9 @@ function applySharedViewRecords(set: Setter, records: unknown): void {
   );
 }
 
-export const loadSharedTrackerViewsAtom = atom(
+export const replaceSharedTrackerViewsAtom = atom(
   null,
-  async (_get, set, workspacePath: string) => {
-    const loadVersion = ++sharedViewsLoadVersion;
-    set(sharedTrackerSavedViewsAtom, []);
-    const records = await window.electronAPI.invoke('tracker-saved-views:list', workspacePath);
-    if (loadVersion !== sharedViewsLoadVersion) return;
+  (_get, set, records: unknown) => {
     applySharedViewRecords(set, records);
   },
 );
@@ -591,11 +883,12 @@ export const shareTrackerViewAtom = atom(
   null,
   async (get, set, view: SavedView) => {
     if (!currentWorkspacePath) return;
-    const records = await window.electronAPI.invoke(
-      'tracker-saved-views:share',
-      currentWorkspacePath,
-      { viewId: view.id, payload: serializeSharedSavedView(view) },
-    );
+    const dataSource = get(trackerDataSourceAtom);
+    if (!dataSource) return;
+    const { savedViews: records = [] } = await dataSource.command({
+      type: 'share-saved-view',
+      savedView: { viewId: view.id, payload: serializeSharedSavedView(view) },
+    });
     applySharedViewRecords(set, records);
     const localRemainder = get(trackerSavedViewsAtom).filter((v) => v.id !== view.id);
     if (localRemainder.length !== get(trackerSavedViewsAtom).length) {
@@ -610,11 +903,12 @@ export const unshareTrackerViewAtom = atom(
   null,
   async (get, set, view: SavedView) => {
     if (!currentWorkspacePath) return;
-    const records = await window.electronAPI.invoke(
-      'tracker-saved-views:unshare',
-      currentWorkspacePath,
-      view.id,
-    );
+    const dataSource = get(trackerDataSourceAtom);
+    if (!dataSource) return;
+    const { savedViews: records = [] } = await dataSource.command({
+      type: 'unshare-saved-view',
+      viewId: view.id,
+    });
     applySharedViewRecords(set, records);
     const current = get(trackerSavedViewsAtom);
     if (!current.some((v) => v.id === view.id)) {
@@ -633,11 +927,12 @@ export const removeTrackerViewAtom = atom(
   null,
   async (get, set, view: SavedView) => {
     if (view.shared && currentWorkspacePath) {
-      const records = await window.electronAPI.invoke(
-        'tracker-saved-views:unshare',
-        currentWorkspacePath,
-        view.id,
-      );
+      const dataSource = get(trackerDataSourceAtom);
+      if (!dataSource) return;
+      const { savedViews: records = [] } = await dataSource.command({
+        type: 'unshare-saved-view',
+        viewId: view.id,
+      });
       applySharedViewRecords(set, records);
       return;
     }

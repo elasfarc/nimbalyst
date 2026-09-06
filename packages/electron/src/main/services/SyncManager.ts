@@ -16,6 +16,7 @@
 import WebSocketNode from 'ws';
 import type { SessionStore } from '@nimbalyst/runtime';
 import { asPersonalMemberId } from '@nimbalyst/runtime';
+import type { PersonalJwt, PersonalMemberId } from '@nimbalyst/runtime/auth/jwtScopes';
 import type { DeviceInfo } from '@nimbalyst/runtime/sync';
 import * as syncModule from '@nimbalyst/runtime/sync';
 import { getSessionSyncConfig, setSessionSyncConfig, getReleaseChannel, getDefaultAIModel, getAlphaFeatures, getPreferredAgentLanguage, getAttachmentStagingConfig, isControllerMode, store, type SessionSyncConfig } from '../utils/store';
@@ -29,7 +30,7 @@ import * as os from 'os';
 import { getProjectFileSyncService } from './ProjectFileSyncService';
 import { startProjectFileSync, stopAllProjectFileSync } from '../file/WorkspaceWatcher';
 import { windowStates } from '../window/WindowManager';
-import { getNormalizedGitRemote } from '../utils/gitUtils';
+import { getGitRemoteIdentities } from '../utils/gitUtils';
 import { resolveProjectPath } from '../utils/workspaceDetection';
 import { createHash } from 'crypto';
 import { setSleepPreventionMode, setSyncConnected, shutdownSleepPrevention, type PreventSleepMode } from './PowerSaveService';
@@ -185,9 +186,6 @@ let isScreenLocked = false;
 /** Timestamp when the desktop first connected */
 let connectionTime = Date.now();
 
-/** Cached user ID for device info */
-let cachedUserId: string | null = null;
-
 /** Configurable idle threshold - default 5 minutes, can be set lower for testing */
 let idleThresholdMs = 5 * 60 * 1000; // 5 minutes default
 
@@ -273,7 +271,7 @@ export function deriveDeviceStatus(): 'active' | 'idle' | 'away' {
  * Get or generate a stable device ID.
  * Uses the user ID + a hash of machine identifiers for stability.
  */
-function getDeviceId(userId: string): string {
+function getDeviceId(personalMemberId: PersonalMemberId): string {
   if (cachedDeviceId) {
     return cachedDeviceId;
   }
@@ -287,7 +285,7 @@ function getDeviceId(userId: string): string {
   const machineId = `${os.hostname()}-${process.platform}${isControllerMode() ? '-controller' : ''}`;
   const crypto = require('crypto');
   const hash = crypto.createHash('sha256')
-    .update(`${userId}:${machineId}`)
+    .update(`${personalMemberId}:${machineId}`)
     .digest('hex')
     .substring(0, 16);
 
@@ -299,7 +297,7 @@ function getDeviceId(userId: string): string {
  * Get device info for sync presence awareness.
  * Returns current presence state (focus, activity, status).
  */
-function getDeviceInfo(userId: string): DeviceInfo {
+function getDeviceInfo(personalMemberId: PersonalMemberId): DeviceInfo {
   const platform = process.platform === 'darwin' ? 'macos'
     : process.platform === 'win32' ? 'windows'
     : process.platform === 'linux' ? 'linux'
@@ -314,7 +312,7 @@ function getDeviceInfo(userId: string): DeviceInfo {
     .replace(/\b\w/g, c => c.toUpperCase());
 
   return {
-    deviceId: getDeviceId(userId),
+    deviceId: getDeviceId(personalMemberId),
     name: (friendlyName || 'Desktop') + (isControllerMode() ? ' (Controller)' : ''),
     // Controller mode masquerades as a mobile device so an unmodified host
     // treats this machine like a phone: it receives settings/model-list pushes
@@ -389,19 +387,13 @@ export async function initializeSync(baseStore: SessionStore): Promise<SessionSt
       personalUserId = getPersonalUserId();
     }
     if (!personalUserId) {
-      // Last-resort fallback: the active/team member id is NOT a personal member
-      // id (see jwtScopes / NIM-859) -- using it for the personal index room is
-      // wrong for multi-org users, but better than not syncing at all. The
-      // explicit cast records that we KNOW this is a personal-scope violation.
-      logger.main.warn('[SyncManager] Could not resolve personalUserId, falling back to stytchUserId (NOT personal-scoped):', stytchUserId);
-      // stytchUserId is guaranteed non-null (guarded above). The cast records
-      // that we KNOWINGLY use the active/team member id for the personal room.
-      personalUserId = asPersonalMemberId(stytchUserId);
+      logger.main.warn('[SyncManager] Could not resolve a personal member id; personal session sync remains disabled');
+      return baseStore;
     }
 
     logger.main.info('[SyncManager] Initializing session sync...', {
       serverUrl,
-      userId: stytchUserId,
+      activeMemberId: stytchUserId,
       personalUserId,
     });
 
@@ -416,8 +408,6 @@ export async function initializeSync(baseStore: SessionStore): Promise<SessionSt
     const encryptionKey = await deriveEncryptionKey(credentials.encryptionKeySeed, `nimbalyst:${personalUserId}`);
     state.encryptionKey = encryptionKey;
 
-    // Cache user ID for dynamic device info callback
-    cachedUserId = stytchUserId;
     connectionTime = Date.now(); // Reset connection time on init
 
     // Apply idle timeout from config (default 5 minutes)
@@ -426,7 +416,7 @@ export async function initializeSync(baseStore: SessionStore): Promise<SessionSt
     }
 
     // Get initial device info for logging
-    const initialDeviceInfo = getDeviceInfo(stytchUserId);
+    const initialDeviceInfo = getDeviceInfo(personalUserId);
     logger.main.info('[SyncManager] Initial device info:', JSON.stringify(initialDeviceInfo));
 
     // Refresh the personal JWT when its `exp` claim is within this window.
@@ -450,7 +440,7 @@ export async function initializeSync(baseStore: SessionStore): Promise<SessionSt
      * can't be decoded. JWT signatures are verified by the server; we only
      * read `exp` to decide if a refresh is needed before reconnect.
      */
-    function getJwtExpiryMs(jwt: string | null): number | null {
+    function getJwtExpiryMs(jwt: PersonalJwt | null): number | null {
       if (!jwt) return null;
       const parts = jwt.split('.');
       if (parts.length !== 3) return null;
@@ -518,7 +508,7 @@ export async function initializeSync(baseStore: SessionStore): Promise<SessionSt
     const provider = createCollabV3Sync({
       serverUrl,
       orgId: personalOrgId,
-      userId: personalUserId,
+      personalMemberId: personalUserId,
       // Electron main's global WebSocket flakily drops the first connection to
       // a host (1006); inject the `ws` package like TrackerSyncManager does.
       createWebSocket: ((url: string) => new WebSocketNode(url)) as unknown as (url: string) => WebSocket,
@@ -590,7 +580,7 @@ export async function initializeSync(baseStore: SessionStore): Promise<SessionSt
       },
       encryptionKey,
       // Use callback for dynamic presence updates (called every 30s)
-      getDeviceInfo: () => getDeviceInfo(stytchUserId),
+      getDeviceInfo: () => getDeviceInfo(personalUserId),
     });
     logger.main.info('[SyncManager] Created CollabV3 sync provider with device:', initialDeviceInfo.name);
 
@@ -1007,21 +997,23 @@ export function getEffectiveSyncServerUrl(): string {
 export function getPersonalDocSyncConfig(): {
   serverUrl: string;
   orgId: string;
-  userId: string;
+  personalMemberId: PersonalMemberId;
   encryptionKeyRaw: CryptoKey;
 } | null {
   if (!isSyncEnabled() || !state.encryptionKey || !state.config) return null;
 
   const personalOrgId = state.config.personalOrgId || getPersonalOrgId();
-  const personalUserId = state.config.personalUserId || getPersonalUserId() || getStytchUserId();
-  if (!personalOrgId || !personalUserId) return null;
+  const personalMemberId = state.config.personalUserId
+    ? asPersonalMemberId(state.config.personalUserId)
+    : getPersonalUserId();
+  if (!personalOrgId || !personalMemberId) return null;
 
   const serverUrl = getEffectiveSyncServerUrl();
 
   return {
     serverUrl,
     orgId: personalOrgId,
-    userId: personalUserId,
+    personalMemberId,
     encryptionKeyRaw: state.encryptionKey,
   };
 }
@@ -1292,7 +1284,9 @@ async function getAvailableModelsForMobile(): Promise<{ models: Array<{ id: stri
       ...apiKeys,
       lmstudio_url: providerSettings['lmstudio']?.baseUrl || 'http://127.0.0.1:8234'
     };
-    const allModels = await ModelRegistry.getAllModels(modelsConfig, enabledSet as Set<any>);
+    // Mobile syncs one account-wide model list, not a per-project one, and
+    // `enabledSet` above never includes opencode -- the only project-scoped lane.
+    const allModels = await ModelRegistry.getAllModels(modelsConfig, undefined, enabledSet as Set<any>);
     // Filter to enabled models (model-level filtering for specific model selection)
     const enabledModels = allModels.filter(model => {
       const ps = providerSettings[model.provider] as { enabled?: boolean; models?: string[]; hiddenModels?: string[] } | undefined;
@@ -1394,11 +1388,12 @@ export async function syncProjectCommandsToMobile(
   }
 
   try {
-    // Compute gitRemoteHash from the workspace's git remote URL
+    // Compute gitRemoteHash from the workspace's git remote URL. This is a
+    // freshly written identity, so it uses the canonical (credential-free) form.
     let gitRemoteHash: string | undefined;
-    const gitRemote = await getNormalizedGitRemote(workspacePath);
+    const gitRemote = await getGitRemoteIdentities(workspacePath);
     if (gitRemote) {
-      gitRemoteHash = createHash('sha256').update(gitRemote).digest('hex');
+      gitRemoteHash = createHash('sha256').update(gitRemote.canonical).digest('hex');
     }
 
     await provider.syncProjectConfig(workspacePath, {

@@ -1,11 +1,13 @@
 import type { TeamInboxSnapshot } from '@nimbalyst/runtime/sync';
 import { describe, expect, it } from 'vitest';
+import { asTeamMemberId } from '@nimbalyst/runtime/auth/jwtScopes';
 
 import type { ConversationDirectoryEntry } from '../../../../shared/conversationDirectory';
 import {
   ORG_ADMIN_TABS,
   buildOrgSidebar,
   dmLabel,
+  filterOrgSidebarModel,
   inboxUnreadCount,
   roomLabel,
   unreadCountsByConversation,
@@ -34,7 +36,7 @@ function delivery(
 ): TeamInboxSnapshot['deliveries'][number] {
   return {
     id: 'delivery-1',
-    recipientUserId: 'member-a',
+    teamMemberId: asTeamMemberId('member-a'),
     orgId: 'org-a',
     orgName: 'Acme',
     createdAt: 10,
@@ -102,6 +104,32 @@ describe('buildOrgSidebar', () => {
 
     expect(model.rooms.find((item) => item.conversationId === 'general')?.unreadCount).toBe(3);
     expect(model.rooms.find((item) => item.conversationId === 'design')?.unreadCount).toBe(0);
+  });
+});
+
+describe('sidebar search', () => {
+  const model = buildOrgSidebar({
+    conversations: [
+      descriptor(),
+      descriptor({ id: 'design', title: 'Design' }),
+      descriptor({ id: 'dm-1', kind: 'dm' }),
+    ],
+    dmParticipants: { 'dm-1': ['member-karl'] },
+    memberNames: { 'member-karl': 'Karl' },
+  });
+
+  it('matches labels case-insensitively across both sections', () => {
+    expect(filterOrgSidebarModel(model, 'DES').rooms.map((item) => item.conversationId))
+      .toEqual(['design']);
+    expect(filterOrgSidebarModel(model, 'kar').dms.map((item) => item.conversationId))
+      .toEqual(['dm-1']);
+    expect(filterOrgSidebarModel(model, 'kar').rooms).toEqual([]);
+  });
+
+  // The sidebar is memoized around this, so a query-free render must hand back
+  // the same object rather than an equal one.
+  it('returns the model untouched when there is nothing to search for', () => {
+    expect(filterOrgSidebarModel(model, '   ')).toBe(model);
   });
 });
 

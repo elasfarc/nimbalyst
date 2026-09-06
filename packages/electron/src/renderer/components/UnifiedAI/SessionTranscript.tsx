@@ -18,16 +18,23 @@ import React, { useCallback, useRef, useImperativeHandle, forwardRef, useEffect,
 import { useAtom, useSetAtom, useAtomValue } from 'jotai';
 import { store, registerInteractiveWidgetHost, unregisterInteractiveWidgetHost } from '@nimbalyst/runtime/store';
 import type { SessionData, ChatAttachment, TranscriptViewMessage } from '@nimbalyst/runtime/ai/server/types';
+import { agentCapabilitiesForProviderType } from '@nimbalyst/runtime/ai/server/agentCapabilities';
+import type { ToolCallDiffLoadResult } from '@nimbalyst/runtime/ai/server/transcript';
 import { AgentTranscriptPanel } from '@nimbalyst/runtime/ui/AgentTranscript/components/AgentTranscriptPanel';
+import type { TranscriptFileLocation } from '@nimbalyst/runtime/ui/AgentTranscript/components/MarkdownRenderer';
 import { ClaudeCliTerminalStrip } from './ClaudeCliTerminalStrip';
 import { ClaudeCliNotInstalledNotice } from './ClaudeCliNotInstalledNotice';
-import type { InteractiveWidgetHost, PermissionScope } from '@nimbalyst/runtime/ui/AgentTranscript/components/CustomToolWidgets/InteractiveWidgetHost';
+import type { HunkSelection, InteractiveWidgetHost, PermissionScope } from '@nimbalyst/runtime/ui/AgentTranscript/components/CustomToolWidgets/InteractiveWidgetHost';
 import type { TodoItem } from '@nimbalyst/runtime/ui/AgentTranscript/types';
 import { isToolLikeMessage } from '@nimbalyst/runtime/ui/AgentTranscript/utils/messageTypeHelpers';
 import { AIInput, AIInputRef } from './AIInput';
 import { PromptQueueList } from './PromptQueueList';
 import { TranscriptEmbeddedFileCard } from './TranscriptEmbeddedFileCard';
 import { getDiffPeekSizeForInteractiveWidgetHost } from './interactiveWidgetHostProxy';
+import { createFeedbackComposeHost } from '../FeedbackRequest/createFeedbackComposeHost';
+import { askFeedbackDestination } from '../FeedbackRequest/askFeedbackDestination';
+import { renderComposeArtifactPreview } from '../FeedbackRequest/lazyFeedbackOptionPreview';
+import { renderComposeArtifactPopover } from '../FeedbackRequest/composeArtifactPopover';
 import { customEditorRegistry } from '../CustomEditors/registry';
 import { useDialog } from '../../contexts/DialogContext';
 import { FileGutter } from '../AIChat/FileGutter';
@@ -65,6 +72,7 @@ import {
   sessionDocumentContextAtom,
   sessionEffortLevelRawAtom,
   sessionThinkingModeRawAtom,
+  sessionOpenCodeRoleAtom,
   sessionLoadingAtom,
   sessionModeAtom,
   sessionModelAtom,
@@ -109,6 +117,13 @@ import {
 } from '../../store/atoms/terminals';
 import { scrollToTeammateAtom, scrollToMessageAtom, requestOpenSessionAtom } from '../../store/atoms/agentMode';
 import { usePostHog } from 'posthog-js/react';
+import { trackSendWallEvent } from '../../utils/sendWallAnalytics';
+import {
+  bucketPromptLength,
+  toStableAnalyticsCategory,
+  type ComposerDisabledReason,
+  type SendBlockedReason,
+} from '../../../shared/analytics/sendOutcomes';
 import { setAgentModeSettingsAtom, showPromptAdditionsAtom, hasExternalEditorAtom, externalEditorNameAtom, openInExternalEditorAtom, defaultAgentModelAtom, defaultEffortLevelAtom, defaultThinkingModeAtom, chatShowToolCallsAtom, developerModeAtom } from '../../store/atoms/appSettings';
 import { supportsEffortLevel, supportsThinkingToggle, parseEffortLevel, resolveThinkingMode, type EffortLevel, type ThinkingMode } from '../../utils/modelUtils';
 import { buildPlanImplementationPrompt, resolvePlanFilePath } from '../../utils/pathUtils';
@@ -216,7 +231,8 @@ export interface SessionTranscriptProps {
   collapseTranscript?: boolean;
 
   // Click handlers
-  onFileClick?: (filePath: string) => void;
+  /** `location` is set when the clicked link carried a `:line[:col]` suffix. */
+  onFileClick?: (filePath: string, location?: TranscriptFileLocation) => void;
   onTodoClick?: (todo: TodoItem) => void;
 
   // Archive callbacks
@@ -415,6 +431,17 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
   const posthog = usePostHog();
   const inputRef = useRef<AIInputRef>(null);
   const transcriptPanelRef = useRef<{ scrollToMessage: (index: number) => void; scrollToTop: () => void }>(null);
+  const loadToolCallDiffs = useCallback(
+    (toolCallItemId: string, toolCallTimestamp?: number): Promise<ToolCallDiffLoadResult> =>
+      window.electronAPI.invoke(
+        'session-files:get-tool-call-diffs',
+        workspacePath,
+        sessionId,
+        toolCallItemId,
+        toolCallTimestamp,
+      ),
+    [sessionId, workspacePath],
+  );
 
   // Get effective document context - prefer getter for fresh data (reads from disk at call time)
   const getEffectiveDocumentContext = useCallback(async () => {
@@ -431,6 +458,9 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
   // ============================================================
   const messages = useAtomValue(sessionMessagesAtom(sessionId));
   const provider = useAtomValue(sessionProviderAtom(sessionId));
+  // Declared, not guessed: 'unsupported' hides the Compact affordance instead
+  // of offering a button that silently does nothing (#1252).
+  const compactionSupport = agentCapabilitiesForProviderType(provider).compaction;
   const tokenUsage = useAtomValue(sessionTokenUsageAtom(sessionId));
   const isDataLoading = useAtomValue(sessionLoadingAtom(sessionId));
   const chatShowToolCalls = useAtomValue(chatShowToolCallsAtom);
@@ -453,6 +483,7 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
   const sessionDocumentContext = useAtomValue(sessionDocumentContextAtom(sessionId));
   const rawEffortLevel = useAtomValue(sessionEffortLevelRawAtom(sessionId));
   const rawThinkingMode = useAtomValue(sessionThinkingModeRawAtom(sessionId));
+  const openCodeRole = useAtomValue(sessionOpenCodeRoleAtom(sessionId));
   const loadSessionData = useSetAtom(loadSessionDataAtom);
   const reloadSessionData = useSetAtom(reloadSessionDataAtom);
   const updateSessionStore = useSetAtom(updateSessionStoreAtom);
@@ -1117,11 +1148,63 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
     }
   }, [sessionId, getEffectiveDocumentContext, setDraftInput, setDraftAttachments, setLastSubmitAt, isQueueing, queuedPrompts, clearAIInputHistory]);
 
+  // What the composer looked like when this session opened. Once per session,
+  // not per render: we are trying to explain why people do not act on a screen,
+  // and today we do not record what the screen offered them.
+  const composerStateReportedFor = useRef<string | null>(null);
+  useEffect(() => {
+    if (composerStateReportedFor.current === sessionId) return;
+    composerStateReportedFor.current = sessionId;
+    const providerSelected = !!provider;
+    const modelSelected = !!currentModel;
+    const disabledReason: ComposerDisabledReason = !providerSelected
+      ? 'no_provider_selected'
+      : !modelSelected
+        ? 'no_models_available'
+        : 'none';
+    trackSendWallEvent('composer_state_reported', {
+      surface: 'transcript',
+      sendEnabled: disabledReason === 'none',
+      disabledReason,
+      providerSelected,
+      modelSelected,
+      provider: toStableAnalyticsCategory(provider),
+    });
+  }, [sessionId, provider, currentModel]);
+
   const handleSend = useCallback(async () => {
     // Read draft state imperatively — we deliberately don't subscribe to
     // these atoms in SessionTranscript (see SessionAIInput).
     const currentDraftInput = store.get(sessionDraftInputAtom(sessionId)) ?? '';
-    if (!currentDraftInput.trim() || !sessionData) return;
+
+    // The send wall: this event is the denominator, so it fires before every
+    // guard below, including the CLI branch that returns without ever reaching
+    // `ai:sendMessage`. Every path out of this function that is not a send must
+    // emit `ai_send_blocked` with a reason, or the funnel silently loses the
+    // attempt — which is the exact ambiguity this instrumentation removes.
+    const blocked = (reason: SendBlockedReason) =>
+      trackSendWallEvent('ai_send_blocked', {
+        surface: 'transcript',
+        reason,
+        provider: toStableAnalyticsCategory(provider),
+      });
+
+    trackSendWallEvent('ai_message_submit_attempted', {
+      surface: 'transcript',
+      provider: toStableAnalyticsCategory(provider),
+      promptLengthBucket: bucketPromptLength(currentDraftInput.trim().length),
+      isFirstMessageInSession: !sessionHasMessages,
+      sessionMode: toStableAnalyticsCategory(aiMode),
+    });
+
+    if (!currentDraftInput.trim()) {
+      blocked('empty_draft');
+      return;
+    }
+    if (!sessionData) {
+      blocked('no_session_data');
+      return;
+    }
 
     // claude-code-cli (subscription, NIM-806): the genuine `claude` CLI runs in
     // the terminal strip and is driven by its PTY, not the Agent SDK loop. The
@@ -1146,6 +1229,7 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
       // that already has a prior turn writes keystrokes directly.
       if (!sessionHasMessages || isLoading) {
         handleQueue(cliMessage);
+        blocked('queued_cli_not_ready');
         return;
       }
       const attachments = store.get(sessionDraftAttachmentsAtom(sessionId)) ?? [];
@@ -1176,12 +1260,14 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
         recordClaudeActivity();
       } catch (error) {
         console.error('[SessionTranscript] Failed to submit claude-cli prompt:', error);
+        blocked('cli_submit_failed');
       }
       return;
     }
 
     if (isLoading) {
       handleQueue(currentDraftInput.trim());
+      blocked('queued_while_loading');
       return;
     }
 
@@ -1214,6 +1300,7 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
             messages: [...messages, errorMessage],
           },
         });
+        blocked('mode_switch_failed');
         return;
       }
 
@@ -1222,6 +1309,7 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
         setDraftInput('');
         setDraftAttachments([]);
         clearAIInputHistory(sessionId);
+        blocked('slash_command_only');
         return;
       }
     }
@@ -1258,6 +1346,7 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
         // (handles worktree sessions, workstreams, and single sessions properly)
         onClearAgentSession?.();
       }
+      blocked('slash_command_clear');
       return; // Don't send the /clear message to the AI
     }
 
@@ -1390,9 +1479,9 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
     }
   }, [provider, sessionId, setIsProcessing, recordClaudeActivity]);
 
-  const handleFileClick = useCallback((filePath: string) => {
+  const handleFileClick = useCallback((filePath: string, location?: TranscriptFileLocation) => {
     const baseDir = sessionWorktreePath ?? workspacePath;
-    onFileClick?.(resolveTranscriptClickPath(filePath, baseDir));
+    onFileClick?.(resolveTranscriptClickPath(filePath, baseDir), location);
   }, [onFileClick, sessionWorktreePath, workspacePath]);
 
   const setRequestOpenSession = useSetAtom(requestOpenSessionAtom);
@@ -1422,6 +1511,26 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
   const handleCompact = useCallback(async () => {
     if (!sessionData) return;
 
+    // Phase 4: the provider's declared capability chooses the mechanism. This
+    // used to read `provider === 'openai-codex'`, which is fine until the next
+    // provider grows a compaction RPC and nobody remembers this line exists.
+    if (compactionSupport === 'rpc') {
+      try {
+        const result = await window.electronAPI.invoke('ai:compactSession', sessionId) as
+          { success: boolean; error?: string };
+        if (!result?.success) {
+          console.error('[SessionTranscript] Compaction failed:', result?.error);
+        }
+      } catch (error) {
+        console.error('[SessionTranscript] Compaction failed:', error);
+      }
+      return;
+    }
+
+    // #1252: sending "/compact" as a user turn only compacts anything when the
+    // agent itself interprets slash commands. For every other provider it
+    // reaches the model as literal prompt text and does nothing, which is why
+    // the affordance is hidden entirely rather than offered as a no-op.
     const message = '/compact';
     const userMessage = makeOptimisticUserMessage(
       message,
@@ -1447,7 +1556,7 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
     } catch (error) {
       console.error('[SessionTranscript] Failed to send /compact command:', error);
     }
-  }, [sessionId, sessionData, messages, getEffectiveDocumentContext, aiMode, workspacePath, updateSessionStore]);
+  }, [sessionId, sessionData, messages, getEffectiveDocumentContext, aiMode, workspacePath, updateSessionStore, compactionSupport]);
 
   const handleTodoClick = useCallback((todo: TodoItem) => {
     onTodoClick?.(todo);
@@ -1570,6 +1679,12 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
       model: currentModel,
     });
   }, [sessionId, updateSessionStore, thinkingMode, currentModel, posthog]);
+
+  // OpenCode session role. Persisted per session under the metadata key PR #624
+  // introduced, so a session that already carries one keeps it.
+  const handleOpenCodeRoleChange = useCallback(async (role: string | null) => {
+    await updateSessionMetadataField(sessionId, 'opencodeAgent', role, null, updateSessionStore);
+  }, [sessionId, updateSessionStore]);
 
   const handleCommandSelect = useCallback((command: string) => {
     setDraftInput(command);
@@ -1852,6 +1967,33 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
         refreshPendingPrompts(sessionId);
       },
 
+      // Feedback request operations. Fire-and-forget: send publishes the
+      // subjects the author confirmed, creates the request, and returns. The
+      // turn does not wait for a recipient.
+      feedbackRequestSend: async (payload) =>
+        createFeedbackComposeHost({
+          workspacePath: workspacePath || '',
+          sessionId,
+        }).send(payload),
+      feedbackRequestCancel: async (draftId: string) =>
+        createFeedbackComposeHost({
+          workspacePath: workspacePath || '',
+          sessionId,
+        }).cancel(draftId),
+
+      // The folder every confirmed file subject lands in, chosen before the
+      // author commits to sending rather than in a modal afterwards.
+      pickFeedbackDestination: (current) => askFeedbackDestination(current),
+
+      // Lets the author see the mockups they are about to send. A draft's
+      // artifacts are always unpublished `file` refs -- nothing leaves the
+      // machine before approval -- so this is the local-file path, not the
+      // collaborative one.
+      renderFeedbackArtifactPreview: (entry, artifact) =>
+        renderComposeArtifactPreview(entry, artifact, workspacePath || null),
+      renderFeedbackArtifactPopover: (popoverProps) =>
+        renderComposeArtifactPopover(popoverProps, workspacePath || null),
+
       // Auto-commit
       autoCommitEnabled,
       setAutoCommitEnabled: (enabled: boolean) => {
@@ -1859,7 +2001,12 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
       },
 
       // Git commit operations
-      gitCommit: async (proposalId: string, files: string[], message: string) => {
+      gitCommit: async (
+        proposalId: string,
+        files: string[],
+        message: string,
+        hunkSelections?: HunkSelection[]
+      ) => {
         try {
           // Execute the git commit via IPC
           // Use worktree path for git operations when in a worktree session
@@ -1868,8 +2015,18 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
             'git:commit',
             gitWorkspacePath,
             message,
-            files
-          ) as { success: boolean; commitHash?: string; commitDate?: string; error?: string };
+            files,
+            sessionId,
+            hunkSelections
+          ) as {
+            success: boolean;
+            commitHash?: string;
+            commitDate?: string;
+            error?: string;
+            committedFiles?: string[];
+            uncommittableFiles?: string[];
+            repoResults?: Array<{ repoPath: string; success: boolean; commitHash?: string; error?: string }>;
+          };
 
           // Send response via unified IPC channel for the durable prompt.
           // A real failure (success=false with an error) maps to action='error',
@@ -1885,7 +2042,15 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
               commitHash: result.commitHash,
               commitDate: result.commitDate,
               error: result.error,
-              filesCommitted: result.success ? files : undefined,
+              // `committedFiles` is what actually landed. Reporting the full
+              // input instead tells the agent that a file belonging to no repo
+              // -- never staged anywhere -- is committed.
+              filesCommitted: result.success ? (result.committedFiles ?? files) : undefined,
+              uncommittableFiles: result.uncommittableFiles,
+              // A selection spanning repos makes one commit per repo, and
+              // `commitHash` is only the first. Without this the rest are
+              // invisible to both the widget and the agent.
+              repoResults: result.repoResults,
               commitMessage: result.success ? message : undefined,
             },
             respondedBy: 'desktop' as const,
@@ -1939,6 +2104,24 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
         } catch (err) {
           console.error('[SessionTranscript] gitFileDiff failed:', err);
           throw err;
+        }
+      },
+
+      sessionFileDiff: async (filePath: string) => {
+        try {
+          const gitWorkspacePath = sessionWorktreePath || workspacePath;
+          const result = await window.electronAPI.invoke(
+            'session:file-diff',
+            gitWorkspacePath,
+            sessionId,
+            filePath
+          ) as { unifiedDiff: string; source: string };
+          // `source: 'none'` means no pre-edit baseline for this session, so
+          // there is nothing to attribute and every hunk stays checked.
+          return result?.unifiedDiff ? { unifiedDiff: result.unifiedDiff } : null;
+        } catch (err) {
+          console.error('[SessionTranscript] sessionFileDiff failed:', err);
+          return null;
         }
       },
 
@@ -2086,6 +2269,11 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
       exitPlanModeCancel: (...args) => liveHostRef.current!.exitPlanModeCancel(...args),
       toolPermissionSubmit: (...args) => liveHostRef.current!.toolPermissionSubmit(...args),
       toolPermissionCancel: (...args) => liveHostRef.current!.toolPermissionCancel(...args),
+      feedbackRequestSend: (...args) => liveHostRef.current!.feedbackRequestSend!(...args),
+      feedbackRequestCancel: (...args) => liveHostRef.current!.feedbackRequestCancel!(...args),
+      pickFeedbackDestination: (...args) => liveHostRef.current!.pickFeedbackDestination!(...args),
+      renderFeedbackArtifactPreview: (...args) => liveHostRef.current!.renderFeedbackArtifactPreview!(...args),
+      renderFeedbackArtifactPopover: (...args) => liveHostRef.current!.renderFeedbackArtifactPopover!(...args),
       setAutoCommitEnabled: (...args) => liveHostRef.current!.setAutoCommitEnabled(...args),
       gitCommit: (...args) => liveHostRef.current!.gitCommit(...args),
       gitCommitCancel: (...args) => liveHostRef.current!.gitCommitCancel(...args),
@@ -2455,13 +2643,14 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
             onGroupByDirectoryChange={setGroupByDirectory}
             onOpenInExternalEditor={hasExternalEditor ? handleOpenInExternalEditor : undefined}
             externalEditorName={externalEditorName}
-            onCompact={handleCompact}
+            onCompact={compactionSupport === 'unsupported' ? undefined : handleCompact}
             promptAdditions={showPromptAdditions ? promptAdditions : null}
             currentTeammates={transcriptTeammates}
             waitingForNoun={waitingForNoun}
             appStartTime={appStartTime ?? undefined}
             renderEmbeddedFile={renderEmbeddedFile}
             canEmbedFile={canEmbedFile}
+            loadToolCallDiffs={loadToolCallDiffs}
             currentPhase={currentPhase}
             phaseColumns={SESSION_PHASE_COLUMNS}
             onSetPhase={handleSetPhase}
@@ -2658,6 +2847,8 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
         thinkingMode={thinkingMode}
         onThinkingModeChange={handleThinkingModeChange}
         showThinkingToggle={isClaudeCliTerminalSession(provider) && cliSessionCommitted ? false : showThinkingToggle}
+        openCodeRole={openCodeRole}
+        onOpenCodeRoleChange={provider === 'opencode' ? handleOpenCodeRoleChange : undefined}
         tokenUsage={tokenUsage}
         provider={provider}
         onQueue={handleQueue}

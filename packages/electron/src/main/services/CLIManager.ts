@@ -9,145 +9,10 @@ import { promisify } from 'util';
 import { simpleGit } from 'simple-git';
 import {AnalyticsService} from "./analytics/AnalyticsService.ts";
 import { getAppSetting } from '../utils/store';
-import { findExecutableInWindowsPath, getEnhancedWindowsPath } from './WindowsPathResolver';
+import { findExecutableInWindowsPath } from './WindowsPathResolver';
+import { getEnhancedPath } from './shellEnvironment';
 
 const execAsync = promisify(exec);
-
-// Cache for dynamically detected paths (populated asynchronously at startup)
-interface DetectedPaths {
-  homebrewPrefix?: string;
-  homebrewNodePath?: string;
-  nvmBinPath?: string;
-  shellPath?: string;
-  npmPrefix?: string;
-  yarnBin?: string;
-}
-
-let cachedDetectedPaths: DetectedPaths | null = null;
-let pathDetectionPromise: Promise<DetectedPaths> | null = null;
-
-// Cache for the full shell environment (populated alongside path detection)
-// Contains all env vars from the user's login shell EXCEPT PATH (which has special handling)
-let cachedShellEnvironment: Record<string, string> | null = null;
-
-function getPotentialNodeModulesDirs(): string[] {
-  const dirs: string[] = [];
-
-  // Start from cwd and walk up to find hoisted node_modules directories.
-  let currentDir = process.cwd();
-  for (let i = 0; i < 8; i++) {
-    dirs.push(path.join(currentDir, 'node_modules'));
-    const parent = path.dirname(currentDir);
-    if (parent === currentDir) break;
-    currentDir = parent;
-  }
-
-  // Packaged app locations.
-  if (process.resourcesPath) {
-    dirs.push(path.join(process.resourcesPath, 'app.asar.unpacked', 'node_modules'));
-    dirs.push(path.join(process.resourcesPath, 'node_modules'));
-  }
-
-  return [...new Set(dirs)];
-}
-
-function resolveAnthropicRipgrepDir(): string | null {
-  const platform = process.platform;
-  const arch = process.arch;
-
-  let binaryDir: string | null = null;
-  if (platform === 'darwin') {
-    binaryDir = arch === 'arm64' ? 'arm64-darwin' : 'x64-darwin';
-  } else if (platform === 'linux') {
-    binaryDir = arch === 'arm64' ? 'arm64-linux' : 'x64-linux';
-  } else if (platform === 'win32') {
-    binaryDir = arch === 'arm64' ? 'arm64-win32' : 'x64-win32';
-  }
-
-  if (!binaryDir) return null;
-
-  const binaryName = platform === 'win32' ? 'rg.exe' : 'rg';
-  for (const nodeModulesDir of getPotentialNodeModulesDirs()) {
-    const binaryPath = path.join(
-      nodeModulesDir,
-      '@anthropic-ai',
-      'claude-agent-sdk',
-      'vendor',
-      'ripgrep',
-      binaryDir,
-      binaryName
-    );
-    if (fsSync.existsSync(binaryPath)) {
-      return path.dirname(binaryPath);
-    }
-  }
-
-  return null;
-}
-
-function resolveOpenAICodexRipgrepDir(): string | null {
-  const platform = process.platform;
-  const arch = process.arch;
-
-  let packageName: string | null = null;
-  let targetTriple: string | null = null;
-
-  if (platform === 'darwin' && arch === 'arm64') {
-    packageName = 'codex-darwin-arm64';
-    targetTriple = 'aarch64-apple-darwin';
-  } else if (platform === 'darwin' && arch === 'x64') {
-    packageName = 'codex-darwin-x64';
-    targetTriple = 'x86_64-apple-darwin';
-  } else if (platform === 'linux' && arch === 'arm64') {
-    packageName = 'codex-linux-arm64';
-    targetTriple = 'aarch64-unknown-linux-musl';
-  } else if (platform === 'linux' && arch === 'x64') {
-    packageName = 'codex-linux-x64';
-    targetTriple = 'x86_64-unknown-linux-musl';
-  } else if (platform === 'win32' && arch === 'arm64') {
-    packageName = 'codex-win32-arm64';
-    targetTriple = 'aarch64-pc-windows-msvc';
-  } else if (platform === 'win32' && arch === 'x64') {
-    packageName = 'codex-win32-x64';
-    targetTriple = 'x86_64-pc-windows-msvc';
-  }
-
-  if (!packageName || !targetTriple) return null;
-
-  const binaryName = platform === 'win32' ? 'rg.exe' : 'rg';
-  for (const nodeModulesDir of getPotentialNodeModulesDirs()) {
-    const binaryPath = path.join(
-      nodeModulesDir,
-      '@openai',
-      packageName,
-      'vendor',
-      targetTriple,
-      'path',
-      binaryName
-    );
-    if (fsSync.existsSync(binaryPath)) {
-      return path.dirname(binaryPath);
-    }
-  }
-
-  return null;
-}
-
-function getVendoredRipgrepDirs(): string[] {
-  const dirs: string[] = [];
-
-  const openAIRipgrepDir = resolveOpenAICodexRipgrepDir();
-  if (openAIRipgrepDir) {
-    dirs.push(openAIRipgrepDir);
-  }
-
-  const anthropicRipgrepDir = resolveAnthropicRipgrepDir();
-  if (anthropicRipgrepDir) {
-    dirs.push(anthropicRipgrepDir);
-  }
-
-  return dirs;
-}
 
 function findExecutableInPathEntries(
   executableNames: string[],
@@ -195,21 +60,75 @@ interface InstallOptions {
   localInstall?: boolean;
 }
 
-type CLITool = 'claude-code' | 'openai-codex' | 'opencode' | 'copilot-cli';
+type CLITool =
+  | 'claude-code'
+  | 'openai-codex'
+  | 'opencode'
+  | 'copilot-cli'
+  | 'grok-build'
+  | 'cursor-agent';
 
-// CLI commands and their npm packages
-const CLI_PACKAGES: Record<CLITool, string> = {
-  'claude-code': '@anthropic-ai/claude-agent-sdk',  // Claude Agent SDK (renamed from claude-code)
-  'openai-codex': '@openai/codex',                   // OpenAI Codex package (actual on npm!)
-  'opencode': 'opencode-ai',                           // OpenCode open source agent (npm: opencode-ai, binary: opencode)
-  'copilot-cli': '@github/copilot',                       // GitHub Copilot CLI (npm: @github/copilot, binary: copilot)
+/**
+ * How a CLI gets onto the machine.
+ *
+ * `'npm'` tools are ones Nimbalyst installs, upgrades and uninstalls itself.
+ * `'script'` tools ship only as a vendor install script; Nimbalyst does not
+ * pipe a remote script to a shell, so the strategy is display-only — the
+ * settings panel shows `command` and links `docsUrl`, and install/upgrade/
+ * uninstall refuse. Detection is deliberately independent of all this: a tool
+ * we cannot install is still a tool we must find.
+ */
+type CLIInstallStrategy =
+  | { kind: 'npm'; package: string }
+  | { kind: 'script'; command: string; docsUrl: string };
+
+const CLI_INSTALL_STRATEGIES: Record<CLITool, CLIInstallStrategy> = {
+  'claude-code': { kind: 'npm', package: '@anthropic-ai/claude-agent-sdk' },  // renamed from claude-code
+  'openai-codex': { kind: 'npm', package: '@openai/codex' },
+  'opencode': { kind: 'npm', package: 'opencode-ai' },      // npm: opencode-ai, binary: opencode
+  'copilot-cli': { kind: 'npm', package: '@github/copilot' },  // npm: @github/copilot, binary: copilot
+  'grok-build': {
+    kind: 'script',
+    command: 'curl -fsSL https://x.ai/cli/install.sh | bash',
+    docsUrl: 'https://docs.x.ai/build/cli/headless-scripting',
+  },
+  'cursor-agent': {
+    kind: 'script',
+    command: 'curl -fsSL https://cursor.com/install | bash',
+    docsUrl: 'https://cursor.com/docs/cli/using',
+  },
 };
 
+function npmPackageFor(tool: CLITool): string {
+  const strategy = CLI_INSTALL_STRATEGIES[tool];
+  if (strategy.kind !== 'npm') {
+    throw new Error(
+      `${tool} is not an npm package. Install it with: ${strategy.command}`
+    );
+  }
+  return strategy.package;
+}
+
 const CLI_COMMANDS: Record<CLITool, string> = {
-  'claude-code': 'claude',     // The actual command once installed
-  'openai-codex': 'codex',     // The actual command once installed
-  'opencode': 'opencode',      // The actual command once installed
-  'copilot-cli': 'copilot',    // The actual command once installed
+  'claude-code': 'claude',        // The actual command once installed
+  'openai-codex': 'codex',
+  'opencode': 'opencode',
+  'copilot-cli': 'copilot',
+  'grok-build': 'grok',
+  'cursor-agent': 'cursor-agent',  // NOT `agent`: both vendors symlink that name
+};
+
+/**
+ * Where a script-installed CLI lands, beyond whatever is on the enhanced PATH.
+ *
+ * GUI-launched Electron does not inherit a login shell, so `~/.local/bin` and
+ * friends are frequently absent from PATH even when the tool is installed and
+ * working in the user's terminal. Probing the known locations directly is what
+ * makes detection independent of install.
+ */
+const CLI_EXTRA_INSTALL_LOCATIONS: Partial<Record<CLITool, readonly string[]>> = {
+  'grok-build': ['.grok/bin/grok', '.local/bin/grok'],
+  'cursor-agent': ['.local/bin/cursor-agent'],
 };
 
 export class CLIManager {
@@ -223,6 +142,12 @@ export class CLIManager {
   private setupIPCHandlers() {
     safeHandle('cli:checkInstallation', async (_event, tool: CLITool) => {
       return this.checkInstallation(tool);
+    });
+
+    // Lets a settings panel render the vendor's install command for a tool
+    // Nimbalyst cannot install itself, instead of offering a button that fails.
+    safeHandle('cli:getInstallStrategy', async (_event, tool: CLITool) => {
+      return CLI_INSTALL_STRATEGIES[tool] ?? null;
     });
 
     safeHandle('cli:install', async (_event, tool: CLITool, options: InstallOptions) => {
@@ -481,6 +406,32 @@ export class CLIManager {
     return Array.from(candidates);
   }
 
+  /**
+   * Candidates for a CLI that Nimbalyst does not install: the enhanced PATH
+   * first, then the vendor's known install locations, then the bare command as
+   * a last resort (shell resolution may still find it).
+   */
+  private getScriptInstalledExecutableCandidates(
+    tool: CLITool,
+    enhancedPath: string
+  ): string[] {
+    const command = CLI_COMMANDS[tool];
+    const candidates = new Set<string>();
+
+    const fromPath = process.platform === 'win32'
+      ? findExecutableInWindowsPath([`${command}.cmd`, `${command}.exe`], enhancedPath) || undefined
+      : findExecutableInPathEntries([command], enhancedPath);
+    if (fromPath) candidates.add(fromPath);
+
+    for (const relativePath of CLI_EXTRA_INSTALL_LOCATIONS[tool] ?? []) {
+      const absolute = path.join(os.homedir(), ...relativePath.split('/'));
+      if (fsSync.existsSync(absolute)) candidates.add(absolute);
+    }
+
+    candidates.add(command);
+    return Array.from(candidates);
+  }
+
   private async checkVersionedExecutableInstallation(
     tool: CLITool,
     executableCandidates: string[],
@@ -644,6 +595,16 @@ export class CLIManager {
       );
     }
 
+    // Script-installed tools: probe known locations directly, because a
+    // GUI-launched Electron often has no `~/.local/bin` on PATH.
+    if (CLI_INSTALL_STRATEGIES[tool].kind === 'script') {
+      return this.checkVersionedExecutableInstallation(
+        tool,
+        this.getScriptInstalledExecutableCandidates(tool, this.getEnhancedPath()),
+        this.getEnhancedPath()
+      );
+    }
+
     // Default check for other tools
     return new Promise((resolve) => {
       const checkProcess = spawn(command, ['--version'], {
@@ -697,7 +658,7 @@ export class CLIManager {
       throw new Error(npmCheck.error || 'npm is not available');
     }
 
-    const packageName = CLI_PACKAGES[tool];
+    const packageName = npmPackageFor(tool);
     const isLocal = options.localInstall;
 
     // Check if already installing
@@ -837,7 +798,7 @@ export class CLIManager {
       throw new Error(npmCheck.error || 'npm is not available');
     }
 
-    const packageName = CLI_PACKAGES[tool];
+    const packageName = npmPackageFor(tool);
 
     return new Promise((resolve, reject) => {
       try {
@@ -902,7 +863,11 @@ export class CLIManager {
   }
 
   private async getLatestVersion(tool: CLITool): Promise<string | null> {
-    const packageName = CLI_PACKAGES[tool];
+    // Script-installed tools have their own updaters and no registry to query;
+    // "no known latest" is the honest answer rather than a thrown error in the
+    // middle of a detection pass.
+    if (CLI_INSTALL_STRATEGIES[tool].kind !== 'npm') return null;
+    const packageName = npmPackageFor(tool);
 
     try {
       const { stdout } = await execAsync(`npm view ${packageName} version`);
@@ -939,7 +904,7 @@ export class CLIManager {
       throw new Error(npmCheck.error || 'npm is not available');
     }
 
-    const packageName = CLI_PACKAGES[tool];
+    const packageName = npmPackageFor(tool);
 
     return new Promise((resolve, reject) => {
       try {
@@ -1134,373 +1099,6 @@ export class CLIManager {
     });
     this.installingTools.clear();
   }
-}
-
-/**
- * Parse null-byte separated environment output from `env -0`.
- * Each entry is KEY=VALUE separated by \0.
- * Handles multiline values safely since \0 is the only delimiter.
- */
-function parseNullSeparatedEnv(output: string): Record<string, string> {
-  const env: Record<string, string> = {};
-  const entries = output.split('\0');
-
-  for (const entry of entries) {
-    if (!entry) continue;
-
-    const eqIndex = entry.indexOf('=');
-    if (eqIndex <= 0) continue;
-
-    const key = entry.substring(0, eqIndex);
-    const value = entry.substring(eqIndex + 1);
-
-    // Only accept valid env var names
-    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
-
-    env[key] = value;
-  }
-
-  return env;
-}
-
-/**
- * Asynchronously detect paths for Homebrew, nvm, npm, yarn, and shell environment.
- * This runs the expensive shell commands once and caches the results.
- */
-async function detectPaths(): Promise<DetectedPaths> {
-  const detected: DetectedPaths = {};
-  const homeDir = os.homedir();
-
-  if (process.platform === 'darwin' || process.platform === 'linux') {
-    // Detect full shell environment (PATH + credentials, certificates, etc.)
-    // Uses `env -0` for null-separated output to safely handle multiline values
-    try {
-      const shell = process.env.SHELL || '/bin/zsh';
-      const shellName = path.basename(shell);
-
-      let command: string;
-      if (shellName === 'zsh') {
-        const sourceCommand =
-          `source /etc/zprofile 2>/dev/null || true; ` +
-          `source ${homeDir}/.zprofile 2>/dev/null || true; ` +
-          `source /etc/zshrc 2>/dev/null || true; ` +
-          `source ${homeDir}/.zshrc 2>/dev/null || true; `;
-        command = `${shell} -c '${sourceCommand}env -0'`;
-      } else if (shellName === 'bash') {
-        const sourceCommand =
-          `source /etc/profile 2>/dev/null || true; ` +
-          `source ${homeDir}/.bash_profile 2>/dev/null || true; ` +
-          `source ${homeDir}/.bashrc 2>/dev/null || true; `;
-        command = `${shell} -c '${sourceCommand}env -0'`;
-      } else {
-        command = `${shell} -ilc 'env -0' 2>/dev/null`;
-      }
-
-      const { stdout } = await execAsync(command, {
-        timeout: 5000,
-        env: { HOME: homeDir },
-        maxBuffer: 1024 * 1024,
-      });
-
-      const shellEnv = parseNullSeparatedEnv(stdout);
-
-      if (shellEnv && Object.keys(shellEnv).length > 0) {
-        // Extract PATH for the existing path detection system
-        if (shellEnv.PATH) {
-          console.log(`[detectPaths] Got PATH from ${shellName}: ${shellEnv.PATH.substring(0, 200)}...`);
-          detected.shellPath = shellEnv.PATH;
-        }
-
-        // Cache full environment (excluding PATH which has its own enhanced handling)
-        const { PATH: _path, ...envWithoutPath } = shellEnv;
-        cachedShellEnvironment = envWithoutPath;
-        console.log(`[detectPaths] Captured ${Object.keys(envWithoutPath).length} shell environment variables`);
-      }
-    } catch (e: any) {
-      console.warn('[detectPaths] Could not get environment from shell:', e.message || e);
-    }
-
-    // Detect Homebrew (macOS only)
-    if (process.platform === 'darwin') {
-      const brewLocations = [
-        '/opt/homebrew/bin/brew',      // Apple Silicon default
-        '/usr/local/bin/brew',          // Intel Mac default
-        path.join(homeDir, '.brew/bin/brew')  // Custom install
-      ];
-
-      for (const brewPath of brewLocations) {
-        if (fsSync.existsSync(brewPath)) {
-          try {
-            const { stdout } = await execAsync(`${brewPath} --prefix`, { timeout: 2000 });
-            const brewPrefix = stdout.trim();
-            if (brewPrefix) {
-              console.log(`[detectPaths] Found homebrew at: ${brewPrefix}`);
-              detected.homebrewPrefix = brewPrefix;
-
-              // Check for node-specific paths from homebrew
-              const nodeBrewPath = path.join(brewPrefix, 'opt', 'node', 'bin');
-              if (fsSync.existsSync(nodeBrewPath)) {
-                detected.homebrewNodePath = nodeBrewPath;
-              }
-              break;
-            }
-          } catch (e) {
-            // Continue to next location
-          }
-        }
-      }
-    }
-
-    // Detect nvm
-    const nvmDir = process.env.NVM_DIR || path.join(homeDir, '.nvm');
-    const nvmCurrentPath = path.join(nvmDir, 'current', 'bin');
-
-    if (fsSync.existsSync(nvmCurrentPath)) {
-      detected.nvmBinPath = nvmCurrentPath;
-    } else {
-      // Try to run nvm to get the current version
-      try {
-        const shell = process.env.SHELL || '/bin/zsh';
-        const nvmCommand = `${shell} -c 'source ${nvmDir}/nvm.sh 2>/dev/null && nvm which current 2>/dev/null'`;
-
-        const { stdout } = await execAsync(nvmCommand, { timeout: 2000 });
-        const nvmWhich = stdout.trim();
-
-        if (nvmWhich && !nvmWhich.includes('command not found')) {
-          const nvmBinPath = path.dirname(nvmWhich);
-          console.log(`[detectPaths] Found active nvm node at: ${nvmBinPath}`);
-          detected.nvmBinPath = nvmBinPath;
-        }
-      } catch (e) {
-        // Try to find the latest installed version
-        const versionsPath = path.join(nvmDir, 'versions', 'node');
-        if (fsSync.existsSync(versionsPath)) {
-          try {
-            const versions = fsSync.readdirSync(versionsPath);
-            if (versions.length > 0) {
-              // Sort versions properly (handle semver)
-              versions.sort((a, b) => {
-                const parseVersion = (v: string) => {
-                  const match = v.match(/v?(\d+)\.(\d+)\.(\d+)/);
-                  return match ? [parseInt(match[1]), parseInt(match[2]), parseInt(match[3])] : [0, 0, 0];
-                };
-                const [aMajor, aMinor, aPatch] = parseVersion(a);
-                const [bMajor, bMinor, bPatch] = parseVersion(b);
-                if (aMajor !== bMajor) return bMajor - aMajor;
-                if (aMinor !== bMinor) return bMinor - aMinor;
-                return bPatch - aPatch;
-              });
-              const latestVersion = versions[0];
-              const latestBinPath = path.join(versionsPath, latestVersion, 'bin');
-              console.log(`[detectPaths] Using latest nvm version: ${latestVersion}`);
-              detected.nvmBinPath = latestBinPath;
-            }
-          } catch (e) {
-            console.warn('[detectPaths] Could not read nvm versions directory:', e);
-          }
-        }
-      }
-    }
-
-    // Detect npm global bin
-    try {
-      const { stdout } = await execAsync('npm config get prefix', { timeout: 2000, shell: '/bin/sh' });
-      const npmPrefix = stdout.trim();
-      if (npmPrefix && npmPrefix !== 'undefined') {
-        detected.npmPrefix = npmPrefix;
-      }
-    } catch (e) {
-      // Ignore if npm is not available
-    }
-
-    // Detect yarn global bin
-    try {
-      const { stdout } = await execAsync('yarn global bin', { timeout: 2000, shell: '/bin/sh' });
-      const yarnBin = stdout.trim();
-      if (yarnBin && yarnBin.length > 0) {
-        detected.yarnBin = yarnBin;
-      }
-    } catch (e) {
-      // Ignore if yarn is not available
-    }
-  }
-
-  return detected;
-}
-
-/**
- * Initialize the enhanced PATH detection asynchronously.
- * Call this at app startup to pre-populate the cache.
- * The detection runs in the background and doesn't block startup.
- */
-export async function initEnhancedPath(): Promise<void> {
-  if (pathDetectionPromise) {
-    await pathDetectionPromise;
-    return;
-  }
-
-  console.log('[initEnhancedPath] Starting async path detection...');
-  const startTime = Date.now();
-
-  pathDetectionPromise = detectPaths();
-
-  try {
-    cachedDetectedPaths = await pathDetectionPromise;
-    const duration = Date.now() - startTime;
-    console.log(`[initEnhancedPath] Path detection completed in ${duration}ms`);
-  } catch (e: any) {
-    console.error('[initEnhancedPath] Path detection failed:', e.message || e);
-    cachedDetectedPaths = {};
-  }
-}
-
-/**
- * Get the cached shell environment variables detected at startup.
- * Returns all env vars from the user's login shell EXCEPT PATH
- * (PATH has its own enhanced handling via getEnhancedPath()).
- *
- * This ensures env vars like AWS credentials, NODE_EXTRA_CA_CERTS, etc.
- * are available even when Nimbalyst is launched from Dock/Finder.
- *
- * Returns null if detection hasn't completed or failed.
- */
-export function getShellEnvironment(): Record<string, string> | null {
-  return cachedShellEnvironment;
-}
-
-/**
- * Get an enhanced PATH that includes common CLI installation locations.
- * This is needed because GUI apps on macOS don't inherit the shell's PATH
- * when launched from Finder/dock, so commands like npx, node, uvx etc.
- * installed via Homebrew, nvm, or other tools won't be found.
- *
- * Uses cached values from async detection when available, with fallback
- * to hardcoded defaults if detection hasn't completed.
- *
- * Used by:
- * - CLIManager for CLI tool installation/detection
- * - MCPConfigService for spawning MCP servers
- */
-export function getEnhancedPath(): string {
-  const detected = cachedDetectedPaths || {};
-  // Add custom user-configured paths first (highest priority)
-  const paths: string[] = [];
-
-  // Get custom PATH directories from app settings
-  const customPathDirs = getAppSetting('customPathDirs');
-  if (customPathDirs && typeof customPathDirs === 'string' && customPathDirs.trim()) {
-    // Split by platform separator and add to paths
-    const separator = process.platform === 'win32' ? ';' : ':';
-    const customPaths = customPathDirs.split(separator).map(p => p.trim()).filter(Boolean);
-    paths.push(...customPaths);
-  }
-
-  // Ensure vendored ripgrep is available even when rg is not system-installed.
-  paths.push(...getVendoredRipgrepDirs());
-
-  // Start with existing PATH
-  if (process.env.PATH) {
-    paths.push(process.env.PATH);
-  }
-
-  if (process.platform === 'darwin' || process.platform === 'linux') {
-    // Use cached shell PATH if available (populated asynchronously at startup)
-    if (detected.shellPath) {
-      paths.push(detected.shellPath);
-    }
-
-    // Common Unix paths
-    paths.push('/usr/local/bin');
-    paths.push('/usr/bin');
-    paths.push('/bin');
-    paths.push(path.join(os.homedir(), '.npm-global', 'bin'));
-    paths.push(path.join(os.homedir(), '.local', 'bin'));
-    paths.push(path.join(os.homedir(), 'bin'));
-
-    // Add Homebrew paths for macOS
-    if (process.platform === 'darwin') {
-      // Use cached homebrew prefix if available
-      if (detected.homebrewPrefix) {
-        paths.push(path.join(detected.homebrewPrefix, 'bin'));
-        paths.push(path.join(detected.homebrewPrefix, 'sbin'));
-        if (detected.homebrewNodePath) {
-          paths.push(detected.homebrewNodePath);
-        }
-      } else {
-        // Fall back to common hardcoded paths
-        paths.push('/opt/homebrew/bin');
-        paths.push('/opt/homebrew/sbin');
-        paths.push('/usr/local/bin');
-        paths.push('/usr/local/sbin');
-      }
-
-      // Add common node version paths from homebrew
-      paths.push('/usr/local/opt/node/bin');
-      paths.push('/usr/local/opt/node@20/bin');
-      paths.push('/usr/local/opt/node@18/bin');
-
-      // MacPorts
-      paths.push('/opt/local/bin');
-      paths.push('/opt/local/sbin');
-    }
-
-    // Linux specific
-    if (process.platform === 'linux') {
-      paths.push('/usr/local/sbin');
-      paths.push('/usr/sbin');
-      paths.push('/sbin');
-      // Snap packages
-      paths.push('/snap/bin');
-    }
-
-    // Node.js version manager paths
-    const homeDir = os.homedir();
-
-    // NVM (Node Version Manager) - use cached path if available
-    const nvmDir = process.env.NVM_DIR || path.join(homeDir, '.nvm');
-    if (detected.nvmBinPath) {
-      paths.push(detected.nvmBinPath);
-    } else {
-      // Fall back to trying the 'current' symlink
-      paths.push(path.join(nvmDir, 'current', 'bin'));
-    }
-
-    // Volta
-    paths.push(path.join(homeDir, '.volta', 'bin'));
-
-    // fnm (Fast Node Manager)
-    if (process.env.FNM_DIR) {
-      paths.push(path.join(process.env.FNM_DIR, 'bin'));
-    }
-
-    // asdf (version manager)
-    paths.push(path.join(homeDir, '.asdf', 'shims'));
-
-    // npm global bin directory (use cached value if available)
-    if (detected.npmPrefix) {
-      paths.push(path.join(detected.npmPrefix, 'bin'));
-    }
-
-    // yarn global bin directory (use cached value if available)
-    if (detected.yarnBin) {
-      paths.push(detected.yarnBin);
-    }
-
-    // Yarn global paths (fallback if yarn command not available)
-    paths.push(path.join(homeDir, '.yarn', 'bin'));
-    paths.push(path.join(homeDir, '.config', 'yarn', 'global', 'node_modules', '.bin'));
-  } else if (process.platform === 'win32') {
-    const windowsPaths = [
-      ...getVendoredRipgrepDirs(),
-      ...getEnhancedWindowsPath().split(';').map(p => p.trim()).filter(Boolean),
-    ];
-    return [...new Set(windowsPaths)].join(';');
-  }
-
-  const uniquePaths = [...new Set(paths.filter(Boolean))];
-  const pathString = uniquePaths.join(':');
-
-  return pathString;
 }
 
 // Export singleton

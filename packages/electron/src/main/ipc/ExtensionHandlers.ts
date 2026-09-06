@@ -240,6 +240,21 @@ export async function initializeExtensionFileTypes(): Promise<void> {
  * In Playwright tests, uses a temp directory to avoid touching production extensions.
  */
 export async function getUserExtensionsDirectory(): Promise<string> {
+  // Per-run extension dir for E2E fixtures. Never honoured in a packaged
+  // build, so a stray environment variable cannot redirect a user's
+  // extensions directory.
+  const playwrightExtensionDir = process.env.PLAYWRIGHT === '1' && !app.isPackaged
+    ? process.env.NIMBALYST_E2E_EXTENSIONS_DIR
+    : undefined;
+  if (playwrightExtensionDir) {
+    const resolved = path.resolve(playwrightExtensionDir);
+    const tempRoot = path.resolve(app.getPath('temp'));
+    if (resolved === tempRoot || !resolved.startsWith(`${tempRoot}${path.sep}`)) {
+      throw new Error('NIMBALYST_E2E_EXTENSIONS_DIR must be inside the system temp directory');
+    }
+    await fs.mkdir(resolved, { recursive: true });
+    return resolved;
+  }
   // Use test-specific path for Playwright tests to avoid conflicts
   const userDataPath = process.env.PLAYWRIGHT === '1'
     ? path.join(app.getPath('temp'), 'nimbalyst-test-extensions')

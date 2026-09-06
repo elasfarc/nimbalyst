@@ -9,6 +9,13 @@ import type { TrackerRecord } from '../../core/TrackerRecord';
 import type { TrackerIdentity } from '../../core/DocumentService';
 import type { TrackerSchemaRole, FieldDefinition } from './models/TrackerDataModel';
 import { globalRegistry, getRoleField } from './models/TrackerDataModel';
+import {
+  STATUS_CATEGORIES,
+  STATUS_CATEGORY_LABELS,
+  getStatusValueForCategory,
+  getWorkflowStatusOptions,
+  isStatusCategory,
+} from './models/trackerStatusCategory';
 
 /**
  * Conventional field names for each role.
@@ -45,53 +52,51 @@ export function resolveRoleFieldName(type: string, role: TrackerSchemaRole): str
 }
 
 /**
- * Whether a tracker item is shared with the team.
- * - `shared`: item participates in team collaboration.
- * - `local`: item stays on this device / project only.
- * - `n/a`: the tracker type never syncs (sync mode `local`), so sharing
- *   doesn't apply.
+ * Whether a tracker item is published to the team.
+ * - `published`: item participates in team collaboration.
+ * - `draft`: item stays local until it is published.
+ * - `n/a`: the tracker is personal, so publication does not apply.
  */
-export type TrackerItemShareState = 'shared' | 'local' | 'n/a';
+export type TrackerItemPublicationState = 'published' | 'draft' | 'n/a';
 
 /**
- * Determine whether a tracker item is shared with the team.
+ * Determine whether a tracker item is published to the team.
  *
- * - `shared`-mode types: every item is always shared.
- * - `local`-mode types: sharing never applies (returns `n/a`).
- * - `hybrid`-mode types: per-item, driven by the explicit `share` flag
- *   (surfaced under `fields` as `{ status, body }` or the legacy
- *   `fields.shared === true`). Items pushed to a room before the explicit flag
- *   existed (syncStatus `synced`/`pending`) count as shared so they keep
+ * - Personal trackers: publication never applies (returns `n/a`).
+ * - Team trackers: the existing per-item bit is Draft/Published, with
+ *   `draftByDefault` deciding the state of items that do not yet carry an
+ *   explicit value. Items pushed to a room before that flag existed
+ *   (syncStatus `synced`/`pending`) count as published so they keep
  *   collaborating.
  *
  * Pure (no React/host deps) so the table column, the item detail view, and
  * non-React code all agree on one definition.
  */
-export function getItemShareState(record: TrackerRecord): TrackerItemShareState {
-  const mode = globalRegistry.get(record.primaryType ?? '')?.sync?.mode ?? 'local';
-  if (mode === 'shared') return 'shared';
-  if (mode === 'local') return 'n/a';
-  // hybrid: per-item
+export function getItemPublicationState(record: TrackerRecord): TrackerItemPublicationState {
+  const model = globalRegistry.get(record.primaryType ?? '');
+  if (model?.sharing !== 'team') return 'n/a';
   const f = (record.fields ?? {}) as Record<string, any>;
   const share = f.share && typeof f.share === 'object' ? f.share : null;
-  // An EXPLICIT flag is authoritative -- trust it immediately (so an unshare
-  // reads as local even before the room state propagates).
+  // This is the existing per-item bit, expressed as Draft/Published rather than
+  // adding another state alongside it.
   const hasExplicit =
-    f.shared === true ||
+    typeof f.shared === 'boolean' ||
     (share && (share.status === 'team' || share.status === 'private' || share.body === 'team' || share.body === 'private'));
   if (hasExplicit) {
-    return (f.shared === true || share?.status === 'team' || share?.body === 'team') ? 'shared' : 'local';
+    return (f.shared === true || share?.status === 'team' || share?.body === 'team') ? 'published' : 'draft';
   }
-  // No explicit flag: a legacy item already pushed to the room counts as shared.
-  return (record.syncStatus === 'synced' || record.syncStatus === 'pending') ? 'shared' : 'local';
+  // Already-synced legacy items remain published; otherwise the tracker default
+  // determines the initial state.
+  if (record.syncStatus === 'synced' || record.syncStatus === 'pending') return 'published';
+  return model.draftByDefault ? 'draft' : 'published';
 }
 
 /**
  * Convenience boolean: is this item actively shared with the team?
  * `local` and `n/a` both read as not-shared.
  */
-export function isItemSharedWithTeam(record: TrackerRecord): boolean {
-  return getItemShareState(record) === 'shared';
+export function isItemPublished(record: TrackerRecord): boolean {
+  return getItemPublicationState(record) === 'published';
 }
 
 /**
@@ -288,6 +293,78 @@ export function buildKanbanStatusColumns(
   const schemaOptions = type !== 'all' ? getStatusOptions(type) : [];
   const itemStatuses = items.map(r => getRecordStatus(r) || 'to-do');
   return orderKanbanColumns(schemaOptions, itemStatuses);
+}
+
+// ---------------------------------------------------------------------------
+// Status choices for a selection
+// ---------------------------------------------------------------------------
+
+/**
+ * One entry in a "Set Status" menu built for a specific selection.
+ *
+ * `kind` decides what the click writes. A `value` choice writes that literal
+ * status to every selected item, which is only sound when they share a type. A
+ * `category` choice writes each item the status *its own* type uses for that
+ * category, because there is no single value that means "done" across a bug
+ * (`done`), a plan (`completed`) and an idea (which cannot be done at all).
+ */
+export interface SelectionStatusChoice {
+  kind: 'value' | 'category';
+  /** The literal status, or the StatusCategory name for a category choice. */
+  value: string;
+  label: string;
+}
+
+/**
+ * The statuses a "Set Status" menu should offer for a given selection.
+ *
+ * Scoping to the selection is what keeps this menu honest. The board's *column*
+ * list is a different question — it unions every status present on the board so
+ * no item is hidden — and reusing it here offered a bug card the statuses of the
+ * `customer` and `user` types (`multiple-users`, `slowing`), writing values the
+ * bug schema does not declare. In an all-types workspace that list also ran past
+ * thirty entries.
+ *
+ * A single-type selection gets that type's declared options verbatim, in schema
+ * order. A mixed selection falls back to lifecycle categories, and offers only
+ * the categories that *every* selected type can express — a category one type
+ * cannot represent would otherwise apply to some of the selection and silently
+ * skip the rest.
+ */
+export function buildSelectionStatusChoices(items: TrackerRecord[]): SelectionStatusChoice[] {
+  const types = [...new Set(items.map(item => item.primaryType))];
+  if (types.length === 0) return [];
+
+  if (types.length === 1) {
+    return getWorkflowStatusOptions(types[0]).map(option => ({
+      kind: 'value' as const,
+      value: option.value,
+      label: option.label || titleCaseStatus(option.value),
+    }));
+  }
+
+  return STATUS_CATEGORIES
+    .filter(category => types.every(type => getStatusValueForCategory(type, category)))
+    .map(category => ({
+      kind: 'category' as const,
+      value: category,
+      label: STATUS_CATEGORY_LABELS[category],
+    }));
+}
+
+/**
+ * The status to write to one item for a chosen menu entry, or `undefined` when
+ * the item's type cannot express it (which `buildSelectionStatusChoices` already
+ * excludes, but callers should skip rather than write a bogus value).
+ */
+export function resolveSelectionStatusValue(
+  choice: SelectionStatusChoice,
+  type: string,
+): string | undefined {
+  if (choice.kind === 'value') return choice.value;
+  return isStatusCategory(choice.value)
+    ? getStatusValueForCategory(type, choice.value)
+    : undefined;
 }
 
 // ---------------------------------------------------------------------------

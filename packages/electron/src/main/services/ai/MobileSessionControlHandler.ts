@@ -35,6 +35,7 @@ import { handleRemotePromptCompactControl } from '../RemotePromptCompactService'
 import { handleRemoteSpeechDigestControl } from '../RemoteSpeechDigestService';
 import { handleRemoteSummarizeReplyControl } from '../RemoteReplySummaryService';
 import { getGitSubprocessEnv } from '../gitEnv';
+import { SessionCommitService } from '../SessionCommitService';
 import { findWindowByWorkspace } from '../../window/WindowManager';
 import { getDatabase } from '../../database/initialize';
 import { createWorktreeStore } from '../WorktreeStore';
@@ -783,6 +784,15 @@ async function handleGitCommitResponse(
       });
     });
 
+    // Record the sha -> session link for the Git Log panel (idempotent; the
+    // MCP settle path records the same row when the tool is still waiting)
+    if (result.action === 'committed' && result.commitHash) {
+      void SessionCommitService.getInstance().recordCommit({
+        commitSha: result.commitHash,
+        sessionId,
+      });
+    }
+
     // Notify renderer to clear the pending interactive prompt indicator
     notifyAllWindows('ai:gitCommitProposalResolved', { sessionId, proposalId: canonicalPromptId });
     TrayManager.getInstance().onPromptResolved(sessionId);
@@ -835,13 +845,21 @@ async function handleGitCommitResponse(
 
     const {
       createGitCommitProposalResponse,
-      executeGitCommit,
+      executeGitCommitAcrossRepos,
     } = await import('../../services/GitCommitService');
-    const commitResult = await executeGitCommit(
+    const { resolveExtraCommitRoots } = await import('../../services/workspaceRepos');
+    // Across-repos, not `executeGitCommit`: the single-repo path makes any file
+    // outside `workspacePath` throw 'File is outside the repository', which
+    // failed the WHOLE commit -- including the files that were committable.
+    const commitResult = await executeGitCommitAcrossRepos(
       workspacePath,
       response.message,
       response.files,
-      { logContext: '[GitCommit mobile]', env: getGitSubprocessEnv() }
+      {
+        logContext: '[GitCommit mobile]',
+        env: getGitSubprocessEnv(),
+        extraRoots: resolveExtraCommitRoots(workspacePath, session.workspacePath),
+      }
     );
     await emitProposalResponse(
       createGitCommitProposalResponse(commitResult, response.files, response.message)

@@ -1,7 +1,9 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { MaterialSymbol } from '@nimbalyst/runtime/ui/icons/MaterialSymbol';
+import { useAtom, useStore } from 'jotai';
 
 import { InboxContextPane } from './InboxContextPane';
+import { InboxContextSlot } from './InboxContextSlot';
 import { InboxEmptyState, InboxOfflineWithoutCache } from './InboxEmptyState';
 import { InboxFilterBar } from './InboxFilterBar';
 import { InboxRow } from './InboxRow';
@@ -11,19 +13,29 @@ import { InboxStatusBanner } from './InboxStatusBanner';
 import { InboxStatePicker } from './InboxStatePicker';
 import { DEFAULT_INBOX_PREFERENCES, persistInboxPreferences, readInboxPreferences } from './inboxPreferences';
 import {
+  consumeInboxRowSelectionRequest,
   consumeInboxSearchFocusRequest,
+  subscribeInboxRowSelection,
   subscribeInboxSearchFocus,
+  type InboxRowSelectionRequest,
 } from '../orgWindowCommandBus';
+import {
+  ORG_WINDOW_SURFACE_ID,
+  isUntouchedOrgWindowRoute,
+  orgWindowInboxFilterAtomFamily,
+  orgWindowRouteAtomFamily,
+} from '../orgWindowState';
 import { useInboxProvider, type InboxProvider } from './inboxProvider';
 import {
-  INBOX_FILTERS,
   deriveScopeOptions,
   groupRows,
+  inboxFilterLabel,
   isScopeActive,
   openRow,
+  scopeWithinOrg,
   selectRows,
 } from './inboxViewModel';
-import { EMPTY_INBOX_SCOPE, type InboxFilterId, type InboxRowView, type InboxScope, type InboxSubscriptionState } from './inboxTypes';
+import { DEFAULT_INBOX_FILTER, EMPTY_INBOX_SCOPE, type InboxRowView, type InboxScope, type InboxSubscriptionState } from './inboxTypes';
 
 /** How often relative timestamps re-render in the absence of any data change. */
 const RELATIVE_LABEL_TICK_MS = 60_000;
@@ -36,18 +48,36 @@ const RELATIVE_LABEL_TICK_MS = 60_000;
  * leaking its former source. With no provider mounted above it, the surface
  * shows an empty inbox — fixtures only arrive when a caller injects them.
  *
- * Layout: list plus a right-hand context pane. The pane is a container query
- * away — below `inbox-surface` 900px it collapses and the list takes the full
- * width, which is what the org window's default size produces today.
+ * Layout: list plus a right-hand context pane the user sizes by dragging its
+ * divider (width persisted per user). The pane collapses only once the surface
+ * is too narrow to hold both it and a readable list.
  */
 export function InboxSection({
+  surfaceId = ORG_WINDOW_SURFACE_ID,
   provider: providerProp,
+  workspacePath,
+  restrictToOrgId,
   now: nowProp,
   onBrowseRooms,
   onNewMessage,
   composeUnavailableLabel = 'Compose is available in the organization window',
 }: {
+  /** Mounted surface whose imperative command latches this Inbox consumes. */
+  surfaceId?: string;
   provider?: InboxProvider;
+  /** Workspace whose team JWT and local feedback projection back this inbox. */
+  workspacePath?: string;
+  /**
+   * Show only this organization's deliveries.
+   *
+   * Set by a surface that belongs to exactly one organization — Org mode inside
+   * a project window, which renders under that organization's header and whose
+   * rows open into that project's context. Deliberately absent in the
+   * standalone organization window, which is the cross-org surface: the two
+   * behave differently, and the difference is stated here at the call site
+   * rather than inferred from the chrome further down.
+   */
+  restrictToOrgId?: string;
   /** Deterministic clock seam for grouping and relative-label tests. */
   now?: number;
   /**
@@ -72,30 +102,51 @@ export function InboxSection({
 
   const snapshot = useSyncExternalStore(provider.subscribe, provider.getSnapshot, provider.getSnapshot);
 
-  const [filter, setFilter] = useState<InboxFilterId>(DEFAULT_INBOX_PREFERENCES.filter);
+  // The reason axis is the sidebar's Inbox rows, and one navigation moves both:
+  // there is no second copy of the filter here to fall out of step with them.
+  const [filter, setFilter] = useAtom(orgWindowInboxFilterAtomFamily(surfaceId));
+  const store = useStore();
   const [unreadOnly, setUnreadOnly] = useState<boolean>(DEFAULT_INBOX_PREFERENCES.unreadOnly);
   const [scope, setScope] = useState<InboxScope>(DEFAULT_INBOX_PREFERENCES.scope);
+  const [contextPaneWidth, setContextPaneWidth] = useState<number>(DEFAULT_INBOX_PREFERENCES.contextPaneWidth);
   const [query, setQuery] = useState('');
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [activationNotice, setActivationNotice] = useState<string | null>(null);
   const [tick, setTick] = useState(0);
   const preferencesLoaded = useRef(false);
   const searchInputRef = useRef<HTMLInputElement | null>(null);
+  const pendingSelectionRef = useRef<InboxRowSelectionRequest | null>(null);
+  const [selectionRequestTick, setSelectionRequestTick] = useState(0);
 
   // Messages > Search Messages. The command routes the window to the Inbox
   // first, so it may well arrive before this surface exists — hence the latched
   // request, consumed either on mount or on notification, whichever comes second.
   useEffect(() => {
     const focusSearch = () => {
-      if (!consumeInboxSearchFocusRequest()) return;
+      if (!consumeInboxSearchFocusRequest(surfaceId)) return;
       const input = searchInputRef.current;
       if (!input) return;
       input.focus();
       input.select();
     };
     focusSearch();
-    return subscribeInboxSearchFocus(focusSearch);
-  }, []);
+    return subscribeInboxSearchFocus(surfaceId, focusSearch);
+  }, [surfaceId]);
+
+  // A deep link (`nimbalyst://feedback-request/...`) names a source, not a
+  // delivery, and may arrive before this surface exists or before the inbox has
+  // synced. Latch the request here; the effect below resolves it against every
+  // snapshot until the delivery shows up.
+  useEffect(() => {
+    const latch = () => {
+      const pending = consumeInboxRowSelectionRequest(surfaceId);
+      if (!pending) return;
+      pendingSelectionRef.current = pending;
+      setSelectionRequestTick((value) => value + 1);
+    };
+    latch();
+    return subscribeInboxRowSelection(surfaceId, latch);
+  }, [surfaceId]);
 
   useEffect(() => {
     // A quiet inbox still ages: without a tick, "12m" would sit there until the
@@ -114,25 +165,34 @@ export function InboxSection({
     let cancelled = false;
     void readInboxPreferences().then((preferences) => {
       if (cancelled) return;
-      setFilter(preferences.filter);
+      // The remembered row is only restored onto a surface nothing has pointed
+      // anywhere yet. A deep link — or the user, while this read was in flight
+      // — has already chosen a row, and a stored preference must not overrule
+      // it after the fact.
+      if (isUntouchedOrgWindowRoute(store.get(orgWindowRouteAtomFamily(surfaceId)))) {
+        setFilter(preferences.filter);
+      }
       setUnreadOnly(preferences.unreadOnly);
       setScope(preferences.scope);
+      setContextPaneWidth(preferences.contextPaneWidth);
       preferencesLoaded.current = true;
     });
     return () => { cancelled = true; };
-  }, []);
+  }, [setFilter, store, surfaceId]);
 
   useEffect(() => {
     // Don't write back the defaults before the stored value has been read.
     if (!preferencesLoaded.current) return;
-    void persistInboxPreferences({ filter, unreadOnly, scope });
-  }, [filter, unreadOnly, scope]);
+    // `contextPaneWidth` only changes when a drag ends, so this stays one write
+    // per resize rather than one per pointermove.
+    void persistInboxPreferences({ filter, unreadOnly, scope, contextPaneWidth });
+  }, [filter, unreadOnly, scope, contextPaneWidth]);
 
   const loading = snapshot.status === 'loading';
   const offline = snapshot.status === 'offlineWithCache' || snapshot.status === 'offlineWithoutCache';
   const offlineWithoutCache = snapshot.status === 'offlineWithoutCache';
 
-  const { rows, scoped, counts, unreadInScope, typeCounts } = useMemo(
+  const { rows, scoped, unreadInScope, typeCounts } = useMemo(
     () => selectRows({
       deliveries: snapshot.deliveries,
       filter,
@@ -141,14 +201,26 @@ export function InboxSection({
       query,
       now,
       stalePreviews: offline,
+      restrictToOrgId,
     }),
-    [snapshot.deliveries, filter, unreadOnly, scope, query, now, offline],
+    [snapshot.deliveries, filter, unreadOnly, scope, query, now, offline, restrictToOrgId],
   );
 
-  const scopeOptions = useMemo(() => deriveScopeOptions(snapshot.deliveries), [snapshot.deliveries]);
+  // What the controls must show, which is what the list actually applied — a
+  // checkbox reading "only Acme" above a list pinned to Globex is worse than no
+  // control at all.
+  const effectiveScope = useMemo(
+    () => scopeWithinOrg(scope, restrictToOrgId, snapshot.deliveries),
+    [restrictToOrgId, scope, snapshot.deliveries],
+  );
+
+  const scopeOptions = useMemo(
+    () => deriveScopeOptions(snapshot.deliveries, restrictToOrgId),
+    [restrictToOrgId, snapshot.deliveries],
+  );
   const groups = useMemo(() => groupRows(rows, now), [rows, now]);
   const selectedRow = useMemo(() => rows.find((row) => row.id === selectedId) ?? null, [rows, selectedId]);
-  const filterLabel = INBOX_FILTERS.find((entry) => entry.id === filter)?.label ?? 'All';
+  const filterLabel = inboxFilterLabel(filter);
 
   // Selecting is free: it fills the context pane and never moves you. Every
   // navigation is an explicit second act, so a click is safe to spend on
@@ -184,12 +256,49 @@ export function InboxSection({
     void provider.setSubscriptionState?.(row.id, state).catch(() => undefined);
   }, [provider]);
 
+  /**
+   * The stored scope is one per user, not one per surface. A pinned surface
+   * never shows the org axis, so it must not silently overwrite the choice the
+   * organization window made on it either — it carries the stored value through
+   * untouched and narrows only the axes it can actually see.
+   */
+  const applyScope = useCallback((next: InboxScope) => {
+    setScope((current) => (restrictToOrgId ? { ...next, orgIds: current.orgIds } : next));
+  }, [restrictToOrgId]);
+
   const clearFilters = useCallback(() => {
-    setFilter('all');
+    // Clearing the reason axis is a navigation now — the sidebar row moves with
+    // the list, which is the whole point of the filter living in the route.
+    setFilter(DEFAULT_INBOX_FILTER);
     setUnreadOnly(false);
-    setScope(EMPTY_INBOX_SCOPE);
+    applyScope(EMPTY_INBOX_SCOPE);
     setQuery('');
-  }, []);
+  }, [applyScope, setFilter]);
+
+  useEffect(() => {
+    const pending = pendingSelectionRef.current;
+    if (!pending) return;
+    // A link into another organization is not this surface's to open: selecting
+    // it would mount the context pane on a row the list cannot show, in the
+    // wrong project's context. Dropped rather than latched forever.
+    if (restrictToOrgId && pending.orgId !== restrictToOrgId) {
+      pendingSelectionRef.current = null;
+      return;
+    }
+    const delivery = snapshot.deliveries.find((entry) =>
+      entry.source.orgId === pending.orgId
+      && entry.source.sourceKind === pending.sourceKind
+      && entry.source.sourceId === pending.sourceId);
+    if (!delivery) return;
+    pendingSelectionRef.current = null;
+    setSelectedId(delivery.id);
+    setActivationNotice(null);
+    // Landing on a row the filter in force hides would show an empty pane,
+    // which is the exact failure the link exists to avoid. Clearing writes the
+    // preferences back — deliberately: the inbox is left in the state that
+    // shows what the recipient was sent.
+    if (!rows.some((row) => row.id === delivery.id)) clearFilters();
+  }, [clearFilters, restrictToOrgId, rows, selectionRequestTick, snapshot.deliveries]);
 
   return (
     <section
@@ -245,17 +354,14 @@ export function InboxSection({
         <div className="inbox-controls org-window-no-drag mt-3 flex flex-col gap-2">
           <InboxSearchField value={query} filterLabel={filterLabel} disabled={loading} inputRef={searchInputRef} onChange={setQuery} />
           <InboxFilterBar
-            filter={filter}
-            counts={counts}
             unreadOnly={unreadOnly}
             unreadCount={unreadInScope}
             typeCounts={typeCounts}
-            scope={scope}
+            scope={effectiveScope}
             scopeOptions={scopeOptions}
             disabled={loading}
-            onFilterChange={setFilter}
             onUnreadOnlyChange={setUnreadOnly}
-            onScopeChange={setScope}
+            onScopeChange={applyScope}
           />
         </div>
       </header>
@@ -306,7 +412,7 @@ export function InboxSection({
               filter={filter}
               unreadOnly={unreadOnly}
               query={query}
-              scopeActive={isScopeActive(scope)}
+              scopeActive={isScopeActive(effectiveScope)}
               onClearFilters={clearFilters}
               onBrowse={onBrowseRooms}
             >
@@ -343,15 +449,16 @@ export function InboxSection({
           )}
         </div>
 
-        <div className="inbox-context-slot w-[340px] shrink-0" data-testid="inbox-context-slot">
+        <InboxContextSlot width={contextPaneWidth} onWidthChange={setContextPaneWidth}>
           <InboxContextPane
             row={selectedRow}
+            workspacePath={workspacePath}
             conversationTransport={provider.conversationTransport === true}
             canChangeSubscription={provider.setSubscriptionState !== undefined}
             onSubscriptionChange={handleSubscription}
             onOpenSource={(row) => { void handleOpen(row); }}
           />
-        </div>
+        </InboxContextSlot>
       </div>
 
       {provider.simulateStatus && (

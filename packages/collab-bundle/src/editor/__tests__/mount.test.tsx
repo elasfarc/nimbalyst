@@ -2,11 +2,18 @@ import { act } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
 
-import { asTeamMemberId } from '@nimbalyst/runtime/auth/jwtScopes';
+import { asTeamJwt, asTeamMemberId } from '@nimbalyst/runtime/auth/jwtScopes';
+import { collabCommentControllerRegistry } from '@nimbalyst/runtime/editor/commenting/CollabCommentControllerRegistry';
 import { MarkdownCollabContentAdapter } from '@nimbalyst/runtime/sync/MarkdownCollabContentAdapter';
 import { mountCollabEditor } from '../mount';
 import { CollabPresenceSurface } from '../presence';
-import type { CollabEditorHandle } from '../types';
+import {
+  asTeamDocumentId,
+  asTeamOrgId,
+  asTeamProjectId,
+  type CollabEditorCommentsOptions,
+  type CollabEditorHandle,
+} from '../types';
 
 const mountedHandles: CollabEditorHandle[] = [];
 
@@ -164,5 +171,217 @@ describe('in-memory collaborative editor harness', () => {
     expect(setActive).toHaveBeenLastCalledWith(true);
     visibilityState.mockRestore();
     setActive.mockRestore();
+  });
+});
+
+/**
+ * A room socket that opens and answers the initial sync, and nothing else.
+ *
+ * That is precisely the state a reader is in: the document arrived, no edit has
+ * been attempted, so the server has never acknowledged or refused a write.
+ */
+class FakeRoomSocket {
+  static readonly opened: FakeRoomSocket[] = [];
+  readyState = 0;
+  private readonly listeners = new Map<string, Set<(event: unknown) => void>>();
+
+  constructor() {
+    FakeRoomSocket.opened.push(this);
+  }
+
+  addEventListener(type: string, listener: (event: unknown) => void): void {
+    const current = this.listeners.get(type) ?? new Set<(event: unknown) => void>();
+    current.add(listener);
+    this.listeners.set(type, current);
+  }
+
+  removeEventListener(type: string, listener: (event: unknown) => void): void {
+    this.listeners.get(type)?.delete(listener);
+  }
+
+  send(): void {}
+
+  close(): void {
+    this.readyState = 3;
+  }
+
+  open(): void {
+    this.readyState = 1;
+    this.emit('open', {});
+  }
+
+  /**
+   * The server's answer to `docSyncRequest`. `canWrite` is omitted to stand in
+   * for a server that predates the verdict, which is how the client's fallback
+   * to its own host answer stays covered.
+   */
+  deliverSyncResponse(canWrite?: boolean): void {
+    this.emit('message', {
+      data: JSON.stringify({
+        type: 'docSyncResponse',
+        updates: [],
+        hasMore: false,
+        cursor: 0,
+        serverHead: 0,
+        serverHasState: true,
+        ...(canWrite === undefined ? {} : { canWrite }),
+      }),
+    });
+  }
+
+  deliverWriteAcknowledged(): void {
+    this.emit('message', {
+      data: JSON.stringify({ type: 'docUpdateAck', clientUpdateId: 'probe-access' }),
+    });
+  }
+
+  /** The server refusing a write, which is how a stale host answer is corrected. */
+  deliverReadOnlyRefusal(): void {
+    this.emit('message', {
+      data: JSON.stringify({
+        type: 'error',
+        code: 'document_read_only',
+        message: 'Your current role permits reading this document but not editing it',
+      }),
+    });
+  }
+
+  private emit(type: string, event: unknown): void {
+    for (const listener of this.listeners.get(type) ?? []) listener(event);
+  }
+}
+
+describe('comment authoring on a document that has not been written to', () => {
+  async function openTeamDocument(
+    documentId: string,
+    canComment: () => boolean,
+    serverCanWrite?: boolean,
+  ): Promise<{ handle: CollabEditorHandle; documentUri: string }> {
+    FakeRoomSocket.opened.length = 0;
+    const element = document.createElement('div');
+    document.body.append(element);
+    const documentUri = `nimbalyst://doc/${documentId}`;
+    const comments: CollabEditorCommentsOptions = {
+      currentUser: { id: 'member-reader', name: 'Reader' },
+      getMembers: () => [],
+      documentTitle: 'Shared plan',
+      documentId,
+      documentUri,
+      canComment,
+    };
+    const handle = mountCollabEditor({
+      element,
+      source: {
+        kind: 'team-room',
+        serverUrl: 'ws://collab.test',
+        room: {
+          orgId: asTeamOrgId('org-comments'),
+          projectId: asTeamProjectId('project-comments'),
+          documentId: asTeamDocumentId(documentId),
+        },
+        auth: {
+          scope: 'team',
+          memberId: asTeamMemberId('member-reader'),
+          getTeamJwt: async () => asTeamJwt('team-jwt'),
+        },
+        createWebSocket: () => new FakeRoomSocket() as unknown as WebSocket,
+      },
+      user: { memberId: asTeamMemberId('member-reader'), name: 'Reader' },
+      comments,
+    });
+    mountedHandles.push(handle);
+    await settle();
+
+    const socket = FakeRoomSocket.opened[0];
+    if (!socket) throw new Error('the editor never opened a room socket');
+    await act(async () => {
+      socket.open();
+      socket.deliverSyncResponse(serverCanWrite);
+    });
+    await settle();
+    return { handle, documentUri };
+  }
+
+  function commentCapability(documentUri: string): boolean {
+    const controller = collabCommentControllerRegistry.get(documentUri);
+    if (!controller) throw new Error('the comment plugin never registered a controller');
+    return controller.getCapabilities().comment;
+  }
+
+  function commentController(documentUri: string) {
+    const controller = collabCommentControllerRegistry.get(documentUri);
+    if (!controller) throw new Error('the comment plugin never registered a controller');
+    return controller;
+  }
+
+  it('lets a permitted host author on a document it has never written to', async () => {
+    // The server only ever acknowledges a write it was asked to make, so a
+    // document opened to be annotated stays at 'unknown' for its whole session.
+    // Authoring has to be available there or the comment panel is unusable.
+    const writer = await openTeamDocument('doc-writer', () => true);
+    expect(writer.handle.getState()).toMatchObject({
+      connection: 'connected',
+      serverAccess: 'unknown',
+    });
+    expect(commentCapability(writer.documentUri)).toBe(true);
+    // Reaching anchor resolution at all is the point: this attempt used to be
+    // turned away as COMMENT_FORBIDDEN before the anchor was ever looked at.
+    await expect(commentController(writer.documentUri).createAnchored({
+      anchor: { exact: 'not present' },
+      body: 'Authored before any edit',
+      clientMutationId: 'unknown-access-attempt',
+    }, {
+      kind: 'user',
+      userId: 'member-reader',
+      displayName: 'Reader',
+    })).rejects.toMatchObject({ code: 'ANCHOR_NOT_FOUND' });
+  });
+
+  it('takes the sync response write verdict without waiting for a write', async () => {
+    // A server that reports access on connect settles this before the user
+    // touches anything, so a downgraded member is never offered an affordance
+    // that would bounce.
+    const writer = await openTeamDocument('doc-verdict-writer', () => true, true);
+    expect(writer.handle.getState()).toMatchObject({
+      serverAccess: 'writable',
+      readOnly: false,
+    });
+    expect(commentCapability(writer.documentUri)).toBe(true);
+
+    const downgraded = await openTeamDocument('doc-verdict-reader', () => true, false);
+    expect(downgraded.handle.getState()).toMatchObject({
+      serverAccess: 'read-only',
+      readOnly: true,
+    });
+    expect(commentCapability(downgraded.documentUri)).toBe(false);
+  });
+
+  it('refuses a host that says no, and withdraws on a server write refusal', async () => {
+    const viewer = await openTeamDocument('doc-viewer', () => false);
+    expect(viewer.handle.getState()).toMatchObject({
+      connection: 'connected',
+      serverAccess: 'unknown',
+    });
+    expect(commentCapability(viewer.documentUri)).toBe(false);
+    await expect(commentController(viewer.documentUri).createAnchored({
+      anchor: { exact: 'not present' },
+      body: 'Must not be written locally',
+      clientMutationId: 'viewer-attempt',
+    }, {
+      kind: 'user',
+      userId: 'member-reader',
+      displayName: 'Reader',
+    })).rejects.toMatchObject({ code: 'COMMENT_FORBIDDEN' });
+    expect(viewer.handle.getDocument().getArray('comments')).toHaveLength(0);
+
+    // A host answer that has gone stale is corrected by the server's refusal
+    // rather than by withholding the affordance up front.
+    const stale = await openTeamDocument('doc-downgraded', () => true);
+    expect(commentCapability(stale.documentUri)).toBe(true);
+    const staleSocket = FakeRoomSocket.opened[0];
+    if (!staleSocket) throw new Error('the downgraded member never opened a room socket');
+    await act(async () => staleSocket.deliverReadOnlyRefusal());
+    expect(stale.handle.getState()).toMatchObject({ serverAccess: 'read-only' });
+    expect(commentCapability(stale.documentUri)).toBe(false);
   });
 });

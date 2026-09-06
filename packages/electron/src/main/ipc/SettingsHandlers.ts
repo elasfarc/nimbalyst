@@ -1,13 +1,14 @@
 import { BrowserWindow, safeStorage, session, dialog } from 'electron';
 import { applyAnalyticsEnabled } from '../services/analytics/applyAnalyticsEnabled';
 import { safeHandle, safeOn } from '../utils/ipcRegistry';
+import { deleteSecretFile, readSecretFile, writeSecretFile } from '../utils/fileUtils';
 import * as os from 'os';
 import * as fs from 'fs';
 import * as path from 'path';
 import { app } from 'electron';
 import {
     getWorkspaceState, updateWorkspaceState,
-    getTheme, getThemeSync, getResolvedThemeSync,
+    getTheme, getThemeSync, getResolvedThemeSync, getThemeBackgroundColor,
     isCompletionSoundEnabled, setCompletionSoundEnabled,
     getCompletionSoundType, setCompletionSoundType, CompletionSoundType,
     getCompletionSoundCustomPath, setCompletionSoundCustomPath,
@@ -43,7 +44,7 @@ import {
     getAgentWorkflowSourceSettings, getAgentWorkflowExportSettings,
     setAgentWorkflowSourceSettings, setAgentWorkflowExportSettings,
 } from '../utils/store';
-import { getEnhancedPath } from '../services/CLIManager';
+import { getEnhancedPath } from '../services/shellEnvironment';
 import { logger } from '../utils/logger';
 import { getSettingsService, isSettingKey } from '../services/SettingsService';
 import { SessionNamingService } from '../services/SessionNamingService';
@@ -73,6 +74,7 @@ import {
 } from '../services/PersonalSyncProfiles';
 import { purgeOfflineCollabAccounts } from '../services/CollabOfflineAccountLifecycle';
 import { listPersonalSyncDevices } from '../services/PersonalSyncDevicesService';
+import { recordProjectWalkOriginator } from '../services/ProjectWalkClaim';
 
 // Track if we've subscribed to sync status changes
 let syncStatusListenerSetup = false;
@@ -98,6 +100,16 @@ function ensureStytchInitialized(): void {
     });
 
     stytchInitialized = true;
+}
+
+/**
+ * Note the window a sign-in was started from, so the post-sign-in project walk
+ * comes back to it. Sign-in finishes in an external browser, so by the time the
+ * auth broadcast lands there is no focused window to infer this from.
+ */
+function rememberSignInWindow(event: Electron.IpcMainInvokeEvent): void {
+    const window = BrowserWindow.fromWebContents(event.sender);
+    if (window) recordProjectWalkOriginator(window.id, Date.now());
 }
 
 function parseAuthFlowOptions(
@@ -240,34 +252,24 @@ export function registerSettingsHandlers() {
         return secretsDir;
     }
 
-    function getSecretFilePath(key: string): string {
-        // Sanitize key to be filesystem-safe
-        const safeKey = key.replace(/[^a-zA-Z0-9_:-]/g, '_');
-        return path.join(getSecretsDir(), `${safeKey}.enc`);
-    }
-
     safeHandle('secrets:get', async (_event, key: string) => {
         if (!key) {
             throw new Error('Key is required for secrets:get');
         }
 
-        const filePath = getSecretFilePath(key);
-
-        if (!fs.existsSync(filePath)) {
-            return null;
-        }
+        const decrypt = (data: Buffer) =>
+            safeStorage.isEncryptionAvailable()
+                ? safeStorage.decryptString(data)
+                : data.toString('utf8');
 
         try {
-            const fileData = fs.readFileSync(filePath);
-
-            if (safeStorage.isEncryptionAvailable()) {
-                return safeStorage.decryptString(fileData);
-            } else {
-                // Fallback: read as plain text
-                return fileData.toString('utf8');
-            }
+            return readSecretFile(getSecretsDir(), key, decrypt);
         } catch (error) {
-            logger.main.error(`[secrets:get] Failed to read secret for key ${key}:`, error);
+            // A file exists but will not read back, which is a different
+            // situation from "no secret stored" - that path returns null
+            // without ever reaching here. Log it so a corrupt or undecryptable
+            // secret is greppable rather than silently indistinguishable.
+            logger.main.error(`[secrets:get] Failed to read existing secret for key ${key}:`, error);
             return null;
         }
     });
@@ -280,16 +282,13 @@ export function registerSettingsHandlers() {
             throw new Error('Value is required for secrets:set');
         }
 
-        const filePath = getSecretFilePath(key);
-
         try {
             if (safeStorage.isEncryptionAvailable()) {
-                const encrypted = safeStorage.encryptString(value);
-                fs.writeFileSync(filePath, encrypted);
+                writeSecretFile(getSecretsDir(), key, safeStorage.encryptString(value));
             } else {
                 // Fallback: save as plain text (with warning)
                 logger.main.warn(`[secrets:set] safeStorage not available - saving secret without encryption`);
-                fs.writeFileSync(filePath, value, 'utf8');
+                writeSecretFile(getSecretsDir(), key, value);
             }
             logger.main.info(`[secrets:set] Secret saved for key: ${key}`);
         } catch (error) {
@@ -303,13 +302,9 @@ export function registerSettingsHandlers() {
             throw new Error('Key is required for secrets:delete');
         }
 
-        const filePath = getSecretFilePath(key);
-
         try {
-            if (fs.existsSync(filePath)) {
-                fs.unlinkSync(filePath);
-                logger.main.info(`[secrets:delete] Secret deleted for key: ${key}`);
-            }
+            deleteSecretFile(getSecretsDir(), key);
+            logger.main.info(`[secrets:delete] Secret deleted for key: ${key}`);
         } catch (error) {
             logger.main.error(`[secrets:delete] Failed to delete secret for key ${key}:`, error);
             throw error;
@@ -355,6 +350,14 @@ export function registerSettingsHandlers() {
     safeOn('get-resolved-theme-sync', (event) => {
         const theme = getResolvedThemeSync();
         event.returnValue = theme;
+    });
+
+    // The active theme's resolved --nim-bg, for the same flash-prevention
+    // script. The base theme classes only carry base colours, so an extension
+    // or file-based theme would still paint light/dark white until React
+    // resolves it; this seeds the variable before the first stylesheet applies.
+    safeOn('get-theme-background-color-sync', (event) => {
+        event.returnValue = getThemeBackgroundColor() ?? null;
     });
 
     // Get app version (from app.getVersion)
@@ -681,6 +684,12 @@ export function registerSettingsHandlers() {
     });
 
     safeHandle('developer-mode:set', async (_event, enabled: boolean) => {
+        // Logged because this write was previously silent, which left no way to
+        // tell a spurious flip back to Standard Mode from a deliberate one.
+        const before = isDeveloperMode();
+        if (before !== enabled) {
+            logger.main.info(`[SettingsHandlers] developer-mode:set ${before} -> ${enabled}`);
+        }
         setDeveloperMode(enabled);
     });
 
@@ -1449,8 +1458,9 @@ export function registerSettingsHandlers() {
     });
 
     // Sign in with Google OAuth
-    safeHandle('stytch:sign-in-google', async (_event, rawOptions?: unknown) => {
+    safeHandle('stytch:sign-in-google', async (event, rawOptions?: unknown) => {
         ensureStytchInitialized();
+        rememberSignInWindow(event);
         const options = parseAuthFlowOptions(rawOptions, 'sign-in');
         // Get the sync server URL from settings
         const syncConfig = getSessionSyncConfig();
@@ -1475,11 +1485,12 @@ export function registerSettingsHandlers() {
     });
 
     // Send magic link for passwordless authentication
-    safeHandle('stytch:send-magic-link', async (_event, email: string, rawOptions?: unknown) => {
+    safeHandle('stytch:send-magic-link', async (event, email: string, rawOptions?: unknown) => {
         ensureStytchInitialized();
         if (!email) {
             return { success: false, error: 'Email is required' };
         }
+        rememberSignInWindow(event);
         const options = parseAuthFlowOptions(rawOptions, 'sign-in');
         // Get the sync server URL from settings
         const syncConfig = getSessionSyncConfig();

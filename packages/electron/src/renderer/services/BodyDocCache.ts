@@ -68,11 +68,13 @@ import {
   setCollabConnectionDiagnosticContext,
 } from '@nimbalyst/runtime/sync/collabConnectionDiagnostics';
 import { CollabLexicalProvider } from '@nimbalyst/runtime/collab-lexical';
+import { MarkdownCollabContentAdapter } from '@nimbalyst/runtime/sync/MarkdownCollabContentAdapter';
 import type {
   AwarenessState,
   DocumentSyncConfig,
   DocumentSyncStatus,
 } from '@nimbalyst/runtime/sync';
+import type { TeamMemberId } from '@nimbalyst/runtime/auth/jwtScopes';
 
 // ============================================================================
 // Tunables
@@ -81,6 +83,12 @@ import type {
 const DEFAULT_LRU_CAP = 100;
 const DEFAULT_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 const DEFAULT_PREWARM_CONCURRENCY = 5;
+/**
+ * How long an agent body write waits for the server's `docUpdateAck`. Paired
+ * with `SERVER_ACK_TIMEOUT_MS` in the main process, whose own deadline is sized
+ * to outlast this one.
+ */
+const DEFAULT_SERVER_ACK_TIMEOUT_MS = 5_000;
 
 // ============================================================================
 // Types
@@ -95,12 +103,31 @@ const DEFAULT_PREWARM_CONCURRENCY = 5;
  * subscribers via the entry's event bus. Callers should pass `undefined`
  * (or stub no-ops) for these fields.
  */
-export interface BodyDocConfig extends DocumentSyncConfig {
+type TeamDocumentSyncConfig = Extract<DocumentSyncConfig, { teamMemberId: TeamMemberId }>;
+
+export type BodyDocConfig = TeamDocumentSyncConfig & {
   userName?: string;
   userEmail?: string;
-}
+  /**
+   * Workspace this entry was created for. The cache is keyed on itemId alone
+   * but one window can hold several projects open, and not every tracker id is
+   * globally unique -- frontmatter-backed ids (`fm:plan:<relative path>`) are
+   * unique only within a workspace. Anything writing into an entry from outside
+   * the owning surface must check this first.
+   */
+  workspacePath?: string;
+};
 
 export type BodyDocConfigFactory = (itemId: string) => Promise<BodyDocConfig | null>;
+
+/** Result of an agent body write routed through a warm editor provider. */
+export type WarmBodyApplyOutcome =
+  /** This window holds no warm entry for the item; the caller may fall back. */
+  | 'no-entry'
+  /** The server persisted the write. The only outcome that is durable. */
+  | 'acknowledged'
+  /** The replica was mutated but no `docUpdateAck` arrived. Nobody may retry. */
+  | 'unacknowledged';
 
 export interface BodyDocEntryListener {
   onStatusChange?: (status: DocumentSyncStatus) => void;
@@ -286,6 +313,56 @@ export class BodyDocCache {
     this.prewarmInFlight = 0;
   }
 
+  /**
+   * Replace a tracker body through the provider an open editor is already
+   * bound to, and wait for the server to acknowledge persisting it.
+   *
+   * `'no-entry'` means this window has no warm entry for the item in
+   * `workspacePath`, so the main process can fall back to its headless room
+   * peer. `'unacknowledged'` means the opposite: this window's replica has
+   * ALREADY been mutated, so nobody may retry the write -- a second
+   * `clear + insert` computed against a different view of the room merges into
+   * two copies of the body. The provider keeps the update queued and replays it
+   * on reconnect.
+   *
+   * The acknowledgment is not decoration. The caller of this write deletes the
+   * plan's markdown file from disk on the strength of it, so "the local Y.Doc
+   * now holds the body" is not a result worth reporting as success.
+   *
+   * The entry -- not the window's active project -- is the authority on whether
+   * we can serve the write. A window can hold several projects open and the
+   * editor for this item may belong to any of them; equally, an entry for a
+   * same-named item in a different project must never absorb the write (see
+   * `BodyDocConfig.workspacePath`). An entry created without a workspacePath
+   * is refused for the same reason.
+   */
+  async applyMarkdownToWarmEntry(
+    itemId: string,
+    markdown: string,
+    workspacePath: string,
+    ackTimeoutMs = DEFAULT_SERVER_ACK_TIMEOUT_MS,
+  ): Promise<WarmBodyApplyOutcome> {
+    const entry = this.entries.get(itemId);
+    if (!entry) return 'no-entry';
+    if (!entry.config.workspacePath || entry.config.workspacePath !== workspacePath) return 'no-entry';
+    try {
+      MarkdownCollabContentAdapter.applyFromFile(entry.syncProvider.getYDoc(), markdown);
+    } catch (err) {
+      // A failed conversion may still have partially mutated the replica, so
+      // this is not the same as having no entry: reporting it as such would
+      // invite a headless retry on top of the partial write.
+      console.error('[BodyDocCache] agent body write failed to convert for', itemId, err);
+      return 'unacknowledged';
+    }
+    entry.lastTouchedAt = Date.now();
+    try {
+      return (await entry.syncProvider.flushWithAck(ackTimeoutMs)) ? 'acknowledged' : 'unacknowledged';
+    } catch (err) {
+      console.error('[BodyDocCache] agent body write was never acknowledged for', itemId, err);
+      return 'unacknowledged';
+    }
+  }
+
   // --------------------------------------------------------------------------
   // Internals
   // --------------------------------------------------------------------------
@@ -365,6 +442,14 @@ export class BodyDocCache {
     // cache is the sole owner of the provider's lifecycle signals.
     const cacheConfig: DocumentSyncConfig = {
       ...config,
+      // Explicit even though the spread above already carries it: the
+      // renderer-sync-sockets checker (scripts/check-renderer-sync-sockets.mjs)
+      // only resolves one level of `{ ...other }` spread within the same file,
+      // and `config` arrives as a parameter from a factory defined elsewhere --
+      // so it can't see this field through the spread. Behavior-neutral
+      // (config.createWebSocket is always the same value at runtime); this
+      // just makes the invariant visible to the checker and to readers.
+      createWebSocket: config.createWebSocket,
       onStatusChange: (status) => {
         entry.lastStatus = status;
         for (const l of entry.listeners) {

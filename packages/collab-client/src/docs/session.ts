@@ -137,6 +137,23 @@ export const trashedSharedDocumentsAtom = atom((get) =>
     .filter((document) => document.trashedAt != null)
     .sort((left, right) => (right.trashedAt ?? 0) - (left.trashedAt ?? 0)),
 );
+
+/**
+ * The readable documents of one scope, whether or not it is the active one.
+ *
+ * `sharedDocumentsAtom` answers for the scope the window is *browsing*, which
+ * a window that never mounts a Shared Docs surface never sets -- the
+ * organization window is exactly that, so the active list is permanently empty
+ * there. A window that holds a scope key of its own and needs the list for
+ * something other than browsing it, such as resolving a document reference
+ * inside a message, addresses the scope directly through this.
+ *
+ * Reactive, unlike `getSharedDocumentsForScopeKey`, so a document shared after
+ * a reference was rendered still reaches the reference.
+ */
+export const sharedDocumentsForScopeAtom = atomFamily((scopeKey: string) =>
+  atom((get) => get(documentsByScope(scopeKey)).filter((document) => document.trashedAt == null)),
+);
 export const sharedFoldersAtom = activeListAtom(foldersByScope);
 export const teamSyncStatusAtom = atom<CollabDocsUIStatus, [CollabDocsUIStatus], void>(
   (get) => {
@@ -923,7 +940,7 @@ class CollabDocsSessionImpl implements CollabDocsSession {
         unread: isEntityUnread(
           docSnapshot(document),
           receipt,
-          this.scope.indexConfig.userId ?? null,
+          this.scope.indexConfig.teamMemberId ?? null,
         ),
         hasReceipt: receipt !== null,
       };
@@ -956,7 +973,7 @@ class CollabDocsSessionImpl implements CollabDocsSession {
     if (this.disposed) throw new Error('Collab docs session has been disposed');
     store.set(hasTeamByScope(this.scope.scopeKey), true);
     store.set(orgIdByScope(this.scope.scopeKey), this.scope.orgId);
-    store.set(userIdByScope(this.scope.scopeKey), this.scope.indexConfig.userId ?? null);
+    store.set(userIdByScope(this.scope.scopeKey), this.scope.indexConfig.teamMemberId ?? null);
     this.dataUnsubscribe = this.dataSource.subscribe((change) => this.applyDataChange(change));
     const receiptCapability = this.host.documents.readReceipts.status === 'available'
       ? this.host.documents.readReceipts.capability
@@ -1079,7 +1096,7 @@ class CollabDocsSessionImpl implements CollabDocsSession {
       scopeKey: this.scope.scopeKey,
       docs: this.getDocuments(),
       receipts: store.get(receiptsByScope(this.scope.scopeKey)),
-      currentUserId: this.scope.indexConfig.userId ?? null,
+      currentUserId: this.scope.indexConfig.teamMemberId ?? null,
     });
   }
 
@@ -1102,7 +1119,7 @@ class CollabDocsSessionImpl implements CollabDocsSession {
     const rows = buildMigratedFolderRows(
       folderPaths,
       idByPath,
-      this.scope.indexConfig.userId ?? '',
+      this.scope.indexConfig.teamMemberId ?? '',
       Date.now(),
     );
     store.set(foldersByScope(this.scope.scopeKey), (current) => {

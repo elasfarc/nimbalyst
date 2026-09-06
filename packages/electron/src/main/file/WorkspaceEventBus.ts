@@ -3,6 +3,7 @@ import * as fsPromises from 'fs/promises';
 import * as path from 'path';
 import chokidar, { FSWatcher as ChokidarFSWatcher } from 'chokidar';
 import ignore, { Ignore } from 'ignore';
+import { ATOMIC_WRITE_TEMP_SUFFIX, RECOVERY_SNAPSHOT_INFIX } from './safeFileWrite';
 import { logger } from '../utils/logger';
 import { shouldExcludeDir } from '../utils/fileFilters';
 import { isPathInWorkspace } from '../utils/workspaceDetection';
@@ -282,6 +283,19 @@ function shouldIgnoreHardcoded(relativePath: string): boolean {
   }
 
   const basename = segments[segments.length - 1];
+
+  // Scratch files from an atomic save. They exist for microseconds inside the
+  // workspace, and surfacing them would emit an add/unlink pair per autosave.
+  if (basename.endsWith(ATOMIC_WRITE_TEMP_SUFFIX)) {
+    return true;
+  }
+
+  // Snapshots of content an unconditional overwrite was about to destroy
+  // (#3684). They sit beside the file so the user can find them, but they are
+  // recovery artifacts, not documents -- keep them out of the tree.
+  if (basename.includes(RECOVERY_SNAPSHOT_INFIX)) {
+    return true;
+  }
 
   // Ignore OS junk files
   if (IGNORED_BASENAMES.has(basename)) {
@@ -564,6 +578,23 @@ export function getSubscriberIds(workspacePath: string): string[] {
   const entry = busEntries.get(path.resolve(workspacePath));
   if (!entry) return [];
   return [...entry.listeners.keys()];
+}
+
+/**
+ * Whether a session is subscribed to any workspace, i.e. an AI turn could still
+ * be in flight for it.
+ *
+ * Used as a liveness guard before retiring that session's pending-review
+ * baselines (#1403): `AgentToolHooks.tagFileBeforeEdit` records a baseline
+ * equal to current disk content BEFORE the tool writes, so a tag belonging to a
+ * live session can look already-landed for as long as a permission prompt sits
+ * unanswered.
+ */
+export function isSessionSubscribedAnywhere(sessionId: string): boolean {
+  for (const entry of busEntries.values()) {
+    if (entry.listeners.has(sessionId)) return true;
+  }
+  return false;
 }
 
 /** Number of active bus entries. Visible for testing/diagnostics. */

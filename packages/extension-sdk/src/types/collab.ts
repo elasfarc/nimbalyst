@@ -30,6 +30,7 @@
  * @see CollabContentAdapter -- the former name, kept as a deprecated alias.
  */
 import type { Doc } from 'yjs';
+import type { CommentAnchor } from './comments';
 
 export type CollabContentFileSource = string | Uint8Array;
 
@@ -55,6 +56,18 @@ export interface CollabCodecMigration {
   from: number;
   to: number;
   run(yDoc: Doc): void;
+}
+
+/**
+ * Structured-comment anchor support for headless hosts. Hosts invoke these
+ * reads against a detached, disposable Y.Doc snapshot rather than the live
+ * collaborative document, so an accidental mutation cannot alter or sync the
+ * real document. Codecs should still treat the snapshot as read-only.
+ */
+export interface CollabCommentAnchorCodec {
+  handles(anchor: CommentAnchor): boolean;
+  getState(snapshot: Doc, anchor: CommentAnchor): 'attached' | 'orphaned';
+  describe(snapshot: Doc, anchor: CommentAnchor): string;
 }
 
 /** @deprecated Renamed to {@link CollabCodecMigration}. */
@@ -112,9 +125,27 @@ export interface CollabCodec<TStructured = unknown> {
   toStructured?(yDoc: Doc): TStructured;
 
   /** Optional: write structured edits back. Paired with
-   *  `toStructured`. AI-write surface is gated on the presence of
-   *  both this and `toStructured`. */
+   *  `toStructured`. The PREFERRED AI-write surface: implementing
+   *  both lets an agent edit this document type structurally.
+   *
+   *  It is NOT a gate. When an adapter does not implement the pair,
+   *  an agent edit falls back to `exportToFile` -> text replacement
+   *  -> `applyFromFile`, so every adapter is AI-writable whether or
+   *  not it opted in. Two consequences an adapter author must know:
+   *
+   *   - `applyFromFile` is called with agent-authored content, not
+   *     just on-disk content, so it must be safe to call on a
+   *     populated Y.Doc (it already must be) AND must be able to
+   *     consume its own `exportToFile` output unchanged. That
+   *     round-trip is asserted for every registered adapter in
+   *     `codecOnlyHeadlessEdit.test.ts`.
+   *   - The fallback rewrites the whole document, so a concurrent
+   *     human edit can interleave. Implement the structured pair to
+   *     get minimal deltas instead. */
   applyStructuredPatch?(yDoc: Doc, patch: unknown): void;
+
+  /** Optional snapshot-isolated resolver for structured comment anchors. */
+  commentAnchors?: CollabCommentAnchorCodec;
 
   /** Optional: produce a snapshot for revision history. Defaults to
    *  `Y.encodeStateAsUpdateV2(yDoc)`. Override if you need a denser
@@ -137,7 +168,8 @@ export interface CollabCodec<TStructured = unknown> {
  * `file bytes <-> Y.Doc shape` contract. Kept so existing extensions and the
  * host-internal `@nimbalyst/collab-adapters` registry keep compiling.
  */
-export type CollabContentAdapter<TStructured = unknown> = CollabCodec<TStructured>;
+export type CollabContentAdapter<TStructured = unknown> =
+  CollabCodec<TStructured>;
 
 /**
  * The collab surface on the extension context. Extensions call into

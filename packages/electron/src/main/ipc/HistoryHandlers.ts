@@ -5,8 +5,11 @@ import { safeHandle, safeOn } from '../utils/ipcRegistry';
 import { getAppSetting } from '../utils/store';
 import { BrowserWindow, type IpcMainInvokeEvent } from 'electron';
 import { getWindowId, windowStates } from '../window/WindowManager';
+import { resolveSenderWorkspacePath } from '../window/captureWindowWorkspace';
 import { dirtyEditorRegistry } from '../services/DirtyEditorRegistry';
 import { ProjectFileService } from '../services/ProjectFileService';
+import { jsonKeyAccessor } from '../database/jsonKeyExpr';
+import { reconcilePendingTagsForFile } from '../history/pendingTagReconciler';
 import type { ProjectFileEdit, ProjectFileWriteReceipt } from '@nimbalyst/runtime';
 
 // Initialize history manager
@@ -16,11 +19,27 @@ const projectFiles = new ProjectFileService(
     (filePath) => dirtyEditorRegistry.isDirty(filePath),
 );
 
+/**
+ * The workspace this sender is allowed to read and write inside.
+ *
+ * Resolved in main from what main itself knows, never from an argument the
+ * renderer supplies -- that is the whole point of the check.
+ *
+ * The hidden screenshot capture window is created by `OffscreenEditorManager`
+ * rather than `WindowManager`, so it has no `WindowState` and used to fail this
+ * outright: an animation whose parts reference sibling `htmlFile` partials
+ * rendered as empty boxes under `capture_editor_screenshot` while looking
+ * correct in a tab. `resolveSenderWorkspacePath` falls back to the workspace of
+ * the file main most recently mounted in that window, which is main's own
+ * record and just as trustworthy as a `WindowState`.
+ */
 function getAuthorizedWorkspaceRoot(event: IpcMainInvokeEvent): string {
     const window = BrowserWindow.fromWebContents(event.sender);
     if (!window) throw new Error('Project file access requires a workspace window.');
-    const windowId = getWindowId(window);
-    const workspaceRoot = windowId === null ? undefined : windowStates.get(windowId)?.workspacePath;
+    const workspaceRoot = resolveSenderWorkspacePath({
+        windowId: getWindowId(window),
+        webContentsId: event.sender.id,
+    });
     if (!workspaceRoot) throw new Error('Project file access is unavailable outside a workspace.');
     return workspaceRoot;
 }
@@ -80,9 +99,18 @@ export async function registerHistoryHandlers() {
         await historyManager.deleteSnapshot(filePath, timestamp);
     });
 
-    // PHASE 4/5: Get pending AI edit tags
+    // PHASE 4/5: Get pending AI edit tags.
+    //
+    // Per-file reads reconcile first (#1403): a pending tag whose edit has
+    // since landed in git, or whose file is gone, would otherwise keep claiming
+    // the diff bar and the pending-review dots forever. The workspace-wide read
+    // (no filePath) deliberately does not — it backs a count and must stay a
+    // single query; it picks up the corrected state on the next per-file read.
     safeHandle('history:get-pending-tags', async (event, filePath?: string) => {
-        return await historyManager.getPendingTags(filePath);
+        if (filePath) {
+            return await reconcilePendingTagsForFile(historyManager, filePath);
+        }
+        return await historyManager.getPendingTags();
     });
 
     // PHASE 5: Create tag (for testing)
@@ -117,6 +145,11 @@ export async function registerHistoryHandlers() {
     });
 
     safeHandle('history:get-diff-baseline', async (event, filePath: string) => {
+        // Reconcile before answering: TabEditor falls back to the raw tag
+        // content when the baseline is null, so returning null alone would not
+        // stop a retired tag from rendering (#1403).
+        const surviving = await reconcilePendingTagsForFile(historyManager, filePath);
+        if (surviving.length === 0) return null;
         return await historyManager.getDiffBaseline(filePath);
     });
 
@@ -170,6 +203,7 @@ export async function registerHistoryHandlers() {
     safeHandle('history:mark-incremental-tags-reviewed', async (event, filePath: string, sessionId: string) => {
         const { database } = await import('../database/PGLiteDatabaseWorker');
         const now = Date.now();
+        const md = jsonKeyAccessor(database.getEngine(), 'metadata');
 
         await database.query(`
             UPDATE document_history
@@ -178,8 +212,8 @@ export async function registerHistoryHandlers() {
                   '{updatedAt}', to_jsonb($1::bigint)
                 )
             WHERE file_path = $2
-              AND metadata->>'type' = 'incremental-approval'
-              AND metadata->>'sessionId' = $3
+              AND ${md('type')} = 'incremental-approval'
+              AND ${md('sessionId')} = $3
         `, [now, filePath, sessionId]);
     });
 

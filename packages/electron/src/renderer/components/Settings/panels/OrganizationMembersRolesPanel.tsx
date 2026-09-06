@@ -2,8 +2,9 @@ import React, { useCallback, useEffect, useState } from 'react';
 import { MaterialSymbol } from '@nimbalyst/runtime/ui/icons/MaterialSymbol';
 import { useAtomValue } from 'jotai';
 import { ActionGuard } from './ActionGuard';
+import { OrganizationOnboardingChoices } from './OrganizationOnboardingChoices';
 import { AlphaBadge } from '../../common/AlphaBadge';
-import { TEAM_BETA_TOOLTIP, TeamBetaNotice } from '../../common/TeamBetaNotice';
+import { TEAM_BETA_TOOLTIP } from '../../common/TeamBetaNotice';
 import {
   bucketMemberCount,
   categorizeTeamAnalyticsError,
@@ -12,11 +13,10 @@ import {
 import { trackTeamAnalyticsEvent } from '../../../utils/teamAnalytics';
 import { organizationCreationEnabled } from '../../../store/atoms/settingsDomains';
 import { teamPresenceAtomFamily } from '../../../store/atoms/teamPresence';
-// Narrow imports: the `dialogs` barrel would drag every dialog component into
-// this panel's module graph.
-import { DIALOG_IDS } from '../../../dialogs/registry';
-import { dialogRef } from '../../../contexts/DialogContext';
-import { queueOrgWindowGeneralRoute } from '../../TeamMode/onboarding/orgOnboardingStorage';
+import { activeWorkspacePathAtom } from '../../../store/atoms/openProjects';
+import { requestConfirmation } from '../../../dialogs/requestConfirmation';
+import { InviteToTeamDialog } from '../../InviteToTeamDialog/InviteToTeamDialog';
+import type { InviteProjectOption } from '../../InviteToTeamDialog/inviteToTeamModel';
 
 interface Member {
   memberId: string;
@@ -47,8 +47,10 @@ export function OrganizationMembersRolesPanel({
   const [organizations, setOrganizations] = useState<OrganizationSummary[]>([]);
   const [members, setMembers] = useState<Member[]>([]);
   const [callerRole, setCallerRole] = useState('member');
-  const [inviteEmail, setInviteEmail] = useState('');
   const [error, setError] = useState<string | null>(null);
+  const [inviteOpen, setInviteOpen] = useState(false);
+  const [inviteProjects, setInviteProjects] = useState<InviteProjectOption[]>([]);
+  const workspacePath = useAtomValue(activeWorkspacePathAtom);
   const refresh = useCallback(async () => {
     const directory = await window.electronAPI.organization.list();
     const teams = directory?.success && Array.isArray(directory.teams) ? directory.teams : [];
@@ -61,11 +63,72 @@ export function OrganizationMembersRolesPanel({
     }
   }, [orgId]);
 
+  // The invite dialog needs the org's projects to offer any beyond the primary
+  // one. A failure here leaves the dialog offering only the automatic grant,
+  // which is the correct degraded state rather than a blocked invitation.
+  useEffect(() => {
+    if (!orgId) return;
+    let active = true;
+    void (async () => {
+      try {
+        const listing = await window.electronAPI.organization.listProjects(orgId);
+        const projects = listing?.success && Array.isArray(listing.projects) ? listing.projects : [];
+        if (!active) return;
+        setInviteProjects(projects.map((project: {
+          teamProjectId: string; name?: string | null; isPrimary?: boolean; primary?: boolean;
+        }, index: number) => ({
+          teamProjectId: project.teamProjectId,
+          name: project.name ?? null,
+          isPrimary: project.isPrimary ?? project.primary ?? index === 0,
+        })));
+      } catch (reason) {
+        console.warn('[OrganizationMembersRolesPanel] could not list projects for the invite dialog', reason);
+      }
+    })();
+    return () => { active = false; };
+  }, [orgId]);
+
   useEffect(() => { void refresh().catch((reason) => setError(String(reason))); }, [refresh]);
   const canAdminister = callerRole === 'owner' || callerRole === 'admin';
   const analyticsCallerRole = normalizeTeamAnalyticsCallerRole(callerRole);
+
+  const removeMember = useCallback(async (member: Member) => {
+    if (!orgId) return;
+    const label = member.name || member.email || 'this member';
+    const isPending = member.status === 'pending';
+    const confirmed = await requestConfirmation({
+      title: isPending ? 'Revoke invitation' : 'Remove member',
+      message: isPending
+        ? `Revoke the pending invitation for ${label}?`
+        : `Remove ${label} from this organization? They lose access to its shared documents and trackers, and would have to be invited again.`,
+      confirmLabel: isPending ? 'Revoke' : 'Remove',
+      destructive: true,
+    });
+    if (!confirmed) return;
+
+    setError(null);
+    try {
+      const result = await window.electronAPI.organization.removeMember(orgId, member.memberId);
+      if (result?.success === false) throw new Error(result.error ?? 'Could not remove member');
+      trackTeamAnalyticsEvent('team_member_removed', {
+        surface: 'desktop',
+        callerRole: analyticsCallerRole,
+        memberState: isPending ? 'pending' : 'active',
+      });
+      await refresh();
+    } catch (reason) {
+      trackTeamAnalyticsEvent('team_operation_failed', {
+        surface: 'desktop',
+        operation: 'remove_member',
+        entryPoint: 'organization_manager',
+        callerRole: analyticsCallerRole,
+        errorCategory: categorizeTeamAnalyticsError('organization', reason),
+      });
+      setError(String(reason));
+    }
+  }, [orgId, analyticsCallerRole, refresh]);
+
   const selected = organizations.find((organization) => organization.orgId === orgId);
-  const pending = organizations.filter((organization) => organization.membershipType && organization.membershipType !== 'active_member');
 
   return (
     <section className="organization-members-roles-panel" data-testid="organization-members-roles-panel" data-component="OrganizationMembersRolesPanel">
@@ -79,84 +142,12 @@ export function OrganizationMembersRolesPanel({
         </p>
       </header>
 
-      {pending.length > 0 && (
-        <div className="organization-invitation-inbox mb-5" data-testid="organization-invitation-inbox">
-          <h3 className="m-0 mb-2 text-sm font-semibold">Pending invitations</h3>
-          <div className="flex flex-col gap-2">
-            {pending.map((invitation) => (
-              <article key={`${invitation.orgId}:${invitation.sourceEmail ?? ''}`} className="pending-invitation-card flex items-center gap-3 rounded-lg border border-[var(--nim-border)] bg-[var(--nim-bg-secondary)] p-3" data-testid="pending-invitation-card">
-                <MaterialSymbol icon="mail" size={18} />
-                <div className="min-w-0 flex-1">
-                  <div className="text-sm font-medium">{invitation.name}</div>
-                  <div className="text-xs text-[var(--nim-text-muted)]">Invited account: {invitation.sourceEmail ?? 'signed-in account'}</div>
-                </div>
-                <button
-                  type="button"
-                  className="pending-invitation-accept rounded-md bg-[var(--nim-primary)] px-3 py-1.5 text-xs font-semibold text-[var(--nim-on-primary)]"
-                  data-testid="pending-invitation-accept"
-                  onClick={() => void window.electronAPI.organization.acceptInvitation(invitation.orgId)
-                    .then(async (result) => {
-                      if (result?.success === false) throw new Error(result.error ?? 'Could not accept invitation');
-                      trackTeamAnalyticsEvent('team_invitation_accepted', {
-                        surface: 'desktop',
-                        entryPoint: 'organization_manager',
-                        projectMatched: false,
-                      });
-                      // Land the new member in the organization on #general
-                      // rather than leaving them looking at a settings list.
-                      if (!(await queueOrgWindowGeneralRoute(invitation.orgId))) {
-                        throw new Error(
-                          'Invitation accepted, but the organization destination could not be saved. Try again.',
-                        );
-                      }
-                      // Deliberately still the window: #general is a
-                      // conversation, and conversations are what
-                      // `openManagementWindow` opens since NIM-2322 moved
-                      // administration into the ORG_MANAGEMENT dialog. This
-                      // panel is itself one of that dialog's tabs.
-                      void window.electronAPI?.team?.openManagementWindow?.({ orgId: invitation.orgId });
-                      return refresh();
-                    })
-                    .catch((reason) => {
-                      trackTeamAnalyticsEvent('team_operation_failed', {
-                        surface: 'desktop',
-                        operation: 'accept_invitation',
-                        entryPoint: 'organization_manager',
-                        callerRole: analyticsCallerRole,
-                        errorCategory: categorizeTeamAnalyticsError('organization', reason),
-                      });
-                      setError(String(reason));
-                    })}
-                >
-                  Accept
-                </button>
-              </article>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {allowOrganizationCreation && (
-        <div className="new-organization-card mb-5 rounded-lg border border-[var(--nim-border)] bg-[var(--nim-bg-secondary)] p-3" data-testid="new-organization-card">
-          <div className="flex items-center gap-2">
-            <div className="min-w-0 flex-1">
-              <div className="text-sm font-semibold">New organization</div>
-              <div className="mt-0.5 text-xs text-[var(--nim-text-muted)]">Name it, invite your team, and pick starting rooms.</div>
-            </div>
-            <button
-              type="button"
-              className="new-organization-launch rounded bg-[var(--nim-primary)] px-3 py-2 text-sm font-semibold text-[var(--nim-on-primary)]"
-              data-testid="new-organization-launch"
-              onClick={() => dialogRef.current?.open(DIALOG_IDS.ORG_CREATION_WIZARD, {
-                onOrganizationCreated: () => { void refresh(); },
-              })}
-            >
-              Create organization
-            </button>
-          </div>
-          <TeamBetaNotice className="mt-3" />
-        </div>
-      )}
+      <OrganizationOnboardingChoices
+        organizations={organizations}
+        onChanged={() => { void refresh(); }}
+        onError={setError}
+        allowOrganizationCreation={allowOrganizationCreation}
+      />
 
       {orgId && (
         <>
@@ -207,48 +198,74 @@ export function OrganizationMembersRolesPanel({
                   <option value="admin">Admin</option>
                   <option value="owner">Owner</option>
                 </select>}
+                {canAdminister && (
+                  <button
+                    type="button"
+                    className="member-remove-button rounded border border-[var(--nim-border)] bg-transparent p-1.5 text-[var(--nim-text-muted)] hover:border-[var(--nim-error)] hover:text-[var(--nim-error)]"
+                    data-testid="organization-member-remove"
+                    title={member.status === 'pending' ? 'Revoke invitation' : 'Remove from organization'}
+                    aria-label={member.status === 'pending'
+                      ? `Revoke invitation for ${member.name || member.email}`
+                      : `Remove ${member.name || member.email} from this organization`}
+                    onClick={() => { void removeMember(member); }}
+                  >
+                    <MaterialSymbol icon="person_remove" size={16} />
+                  </button>
+                )}
               </div>
             ))}
           </div>
 
           <ActionGuard allowed={canAdminister} reason="An organization owner or admin is required to invite members.">
-            <form
-              className="organization-invite-form mt-4 flex gap-2"
-              data-testid="organization-invite-form"
-              onSubmit={(event) => {
-                event.preventDefault();
-                if (!inviteEmail.trim()) return;
-                void window.electronAPI.organization.inviteMember(orgId, inviteEmail.trim())
-                  .then((result) => {
-                    if (result?.success === false) throw new Error(result.error ?? 'Could not send invitation');
-                    trackTeamAnalyticsEvent('team_invitation_sent', {
-                      surface: 'desktop',
-                      entryPoint: 'organization_manager',
-                      callerRole: analyticsCallerRole,
-                      memberCountBucket: bucketMemberCount(members.length + 1),
-                    });
-                    setInviteEmail('');
-                    return refresh();
-                  })
-                  .catch((reason) => {
-                    trackTeamAnalyticsEvent('team_operation_failed', {
-                      surface: 'desktop',
-                      operation: 'send_invitation',
-                      entryPoint: 'organization_manager',
-                      callerRole: analyticsCallerRole,
-                      errorCategory: categorizeTeamAnalyticsError('organization', reason),
-                    });
-                    setError(String(reason));
-                  });
-              }}
+            <button
+              className="organization-invite-open mt-4 rounded bg-[var(--nim-primary)] px-3 py-2 text-sm font-semibold text-[var(--nim-on-primary)]"
+              data-testid="organization-invite-open"
+              type="button"
+              onClick={() => setInviteOpen(true)}
             >
-              <input className="min-w-0 flex-1 rounded border border-[var(--nim-border)] bg-[var(--nim-bg)] px-3 py-2 text-sm" type="email" value={inviteEmail} onChange={(event) => setInviteEmail(event.target.value)} placeholder="teammate@example.com" />
-              <button className="rounded bg-[var(--nim-primary)] px-3 py-2 text-sm font-semibold text-[var(--nim-on-primary)]" type="submit">Invite</button>
-            </form>
+              Invite people
+            </button>
           </ActionGuard>
         </>
       )}
-      {error && <p className="select-text text-sm text-[var(--nim-error)]">{error}</p>}
+      {orgId && (
+        <InviteToTeamDialog
+          isOpen={inviteOpen}
+          orgId={orgId}
+          orgName={organizations.find(team => team.orgId === orgId)?.name ?? 'your team'}
+          projects={inviteProjects}
+          workspacePath={workspacePath}
+          onClose={() => setInviteOpen(false)}
+          onInvited={(result) => {
+            trackTeamAnalyticsEvent('team_invitation_sent', {
+              surface: 'desktop',
+              entryPoint: 'organization_manager',
+              callerRole: analyticsCallerRole,
+              memberCountBucket: bucketMemberCount(members.length + result.invited.length),
+            });
+            // Partial outcomes are surfaced rather than folded into success:
+            // an inviter who is told nothing believes every address went out
+            // and every folder landed.
+            const problems = [
+              ...result.failed.map(failure => `${failure.email}: ${failure.error}`),
+              ...result.projectGrantsFailed.map(id => `Project access could not be granted (${id})`),
+              ...result.folderFailures,
+            ];
+            setError(problems.length > 0 ? problems.join('\n') : null);
+            if (result.failed.length > 0) {
+              trackTeamAnalyticsEvent('team_operation_failed', {
+                surface: 'desktop',
+                operation: 'send_invitation',
+                entryPoint: 'organization_manager',
+                callerRole: analyticsCallerRole,
+                errorCategory: categorizeTeamAnalyticsError('organization', result.failed[0]?.error),
+              });
+            }
+            void refresh();
+          }}
+        />
+      )}
+      {error && <p className="select-text whitespace-pre-line text-sm text-[var(--nim-error)]">{error}</p>}
     </section>
   );
 }

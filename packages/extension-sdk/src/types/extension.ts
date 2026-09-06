@@ -136,6 +136,33 @@ export interface AiAgentProviderContribution {
    */
   supportsAttachments?: boolean;
 
+  /**
+   * Whether the provider can enumerate slash commands it will genuinely
+   * service. Defaults to `false`.
+   *
+   * These three default to "no" on purpose. An extension that says nothing
+   * gets the affordance hidden, not offered-and-silently-broken: a command the
+   * agent never interprets reaches its model as literal prompt text and does
+   * nothing, which the user cannot tell apart from "ran and did nothing".
+   */
+  supportsSlashCommands?: boolean;
+
+  /**
+   * Whether the provider can enumerate skills it can resolve.
+   * Defaults to `false`.
+   */
+  supportsSkills?: boolean;
+
+  /**
+   * How the provider compacts a session's context, if at all.
+   *
+   * - `'rpc'`: the backend module implements `AgentProtocol.compactSession`.
+   * - `'slash-command'`: the agent itself interprets a `/compact` user turn.
+   *
+   * Defaults to `'unsupported'`.
+   */
+  compaction?: 'rpc' | 'slash-command' | 'unsupported';
+
   /** How model discovery is performed. */
   modelDiscovery: AiAgentProviderModelDiscovery;
 
@@ -665,6 +692,33 @@ export interface CustomEditorContribution {
   collaboration?: {
     supported: boolean;
     awarenessFields?: string[];
+
+    /**
+     * The `documentType` this editor's collab codec registers, when it is not
+     * simply the primary file suffix.
+     *
+     * A host that has only the manifest -- the browser console, which declares
+     * every pinned extension up front but imports a bundle only when someone
+     * opens one of its documents -- has to name the document type before any
+     * codec exists to ask. It falls back to the suffix, which is right for
+     * `.csv` -> `csv` and `.excalidraw` -> `excalidraw`, and wrong for
+     * `.prisma` -> `datamodel`. Declare it here whenever the two differ, or a
+     * shared document of this type reads as unsupported until the bundle that
+     * would have opened it happens to be loaded for some other reason.
+     *
+     * Must match the codec's own `documentType` exactly.
+     */
+    documentType?: string;
+
+    /**
+     * User-facing explanation shown in place of the generic "does not declare a
+     * collaborative editor binding" text when `supported` is false.
+     *
+     * Use it when an editor *has* a binding but sharing is known to lose data,
+     * so the disabled reason names the actual defect rather than implying the
+     * work was never started. Ignored when `supported` is true.
+     */
+    unsupportedReason?: string;
   };
 }
 

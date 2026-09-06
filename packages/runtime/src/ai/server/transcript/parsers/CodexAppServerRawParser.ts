@@ -25,6 +25,58 @@ import type {
   CanonicalEventDescriptor,
 } from './IRawMessageParser';
 
+/**
+ * Item types that are NOT treated as "generic tool-like". Each either has its
+ * own explicit branch in the parser or renders nothing at all.
+ */
+const NON_GENERIC_TOOL_ITEM_TYPES = new Set([
+  'userMessage',
+  'agentMessage',
+  'reasoning',
+  'todoList',
+  'todo_list',
+  'error',
+  'fileChange',
+  'mcpToolCall',
+  'commandExecution',
+  'collabAgentToolCall',
+]);
+
+/**
+ * Item types whose `item/started` notification yields no descriptor, so
+ * persisting that row buys nothing -- the subsequent `item/completed` carries
+ * the same item id plus the actual content.
+ *
+ * This is the exact complement of what `parseItemStarted` handles: it emits a
+ * `tool_call_started` only for `mcpToolCall`, `collabAgentToolCall`, and
+ * generic tool-like items. Those three MUST keep persisting `item/started` --
+ * MCP tools that block on the user (commit proposal, AskUserQuestion) render
+ * their widget off that event, and `item/completed` does not fire until after
+ * the user has clicked through. Dropping it strands them on "Thinking...".
+ *
+ * KEEP IN SYNC with `parseItemStarted`. `OpenAICodexProvider` imports this to
+ * decide what to persist, so a parser change that is not reflected here
+ * silently deletes rows the transcript needs.
+ */
+const ITEM_STARTED_NON_RENDERING_TYPES = new Set([
+  'userMessage',
+  'agentMessage',
+  'reasoning',
+  'todoList',
+  'todo_list',
+  'error',
+  'fileChange',
+  'commandExecution',
+]);
+
+/**
+ * True when an `item/started` notification for this item type produces no
+ * canonical descriptor and is therefore safe not to persist.
+ */
+export function isNonRenderingAppServerItemStarted(itemType: unknown): boolean {
+  return typeof itemType === 'string' && ITEM_STARTED_NON_RENDERING_TYPES.has(itemType);
+}
+
 interface AppServerEnvelope {
   method?: string;
   params?: {
@@ -225,7 +277,7 @@ export class CodexAppServerRawParser implements IRawMessageParser {
     }
 
     if (this.isGenericToolLikeItem(item)) {
-      return this.parseGenericToolLikeItem(msg, item, context);
+      return this.parseGenericToolLikeItem(msg, item, context, false);
     }
 
     return [];
@@ -271,7 +323,7 @@ export class CodexAppServerRawParser implements IRawMessageParser {
       }
       default: {
         if (this.isGenericToolLikeItem(item)) {
-          descriptors.push(...await this.parseGenericToolLikeItem(msg, item, context));
+          descriptors.push(...await this.parseGenericToolLikeItem(msg, item, context, true));
         }
         break;
       }
@@ -420,6 +472,7 @@ export class CodexAppServerRawParser implements IRawMessageParser {
     msg: RawMessage,
     item: AppServerItem,
     context: ParseContext,
+    completedNotification: boolean,
   ): Promise<CanonicalEventDescriptor[]> {
     if (!item.id || !item.type) return [];
 
@@ -443,8 +496,12 @@ export class CodexAppServerRawParser implements IRawMessageParser {
       });
     }
 
-    if (item.status === 'completed' || item.status === 'failed') {
-      const isError = item.status !== 'completed';
+    // `item/completed` is the lifecycle authority. Generic Codex items such
+    // as webSearch may omit `status` entirely even on their terminal
+    // notification, so requiring a duplicated payload status leaves the
+    // started tool call unresolved forever after live render or reparse.
+    if (completedNotification) {
+      const isError = item.status === 'failed' || !!item.error;
       descriptors.push({
         type: 'tool_call_completed',
         providerToolCallId: editGroupId,
@@ -679,25 +736,17 @@ export class CodexAppServerRawParser implements IRawMessageParser {
 
   private isGenericToolLikeItem(item: AppServerItem): boolean {
     if (!item.id || !item.type) return false;
-    return !new Set([
-      'userMessage',
-      'agentMessage',
-      'reasoning',
-      'todoList',
-      'todo_list',
-      'error',
-      'fileChange',
-      'mcpToolCall',
-      'commandExecution',
-      'collabAgentToolCall',
-    ]).has(item.type);
+    return !NON_GENERIC_TOOL_ITEM_TYPES.has(item.type);
   }
 
   private buildGenericToolLikeArguments(item: AppServerItem): Record<string, unknown> {
     const record = item as Record<string, unknown>;
     const args: Record<string, unknown> = {};
     for (const [key, value] of Object.entries(record)) {
-      if (value === undefined) continue;
+      // App-server started notifications include null/empty output
+      // placeholders (`action`, `results`, and an empty `query`) for some
+      // generic tools. They are lifecycle state, not call arguments.
+      if (value == null || value === '') continue;
       if (['id', 'type', 'status', 'result', 'error', 'aggregated_output', 'aggregatedOutput', 'exit_code', 'exitCode', 'text', 'content', 'items'].includes(key)) {
         continue;
       }

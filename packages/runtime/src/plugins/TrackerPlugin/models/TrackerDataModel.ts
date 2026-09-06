@@ -2,6 +2,11 @@
  * Core types and interfaces for the unified tracker system
  */
 
+// Type-only, so the mutual reference with trackerStatusCategory.ts (which reads
+// the registry defined here) is erased at compile time rather than becoming a
+// runtime import cycle.
+import type { StatusCategory } from './trackerStatusCategory';
+
 export type FieldType =
   | 'string'
   | 'text'
@@ -34,6 +39,13 @@ export interface FieldOption {
   label: string;
   icon?: string;
   color?: string;
+  /**
+   * Lifecycle position, on the field carrying the `workflowStatus` role.
+   * Declared rather than inferred from the value's name — see
+   * `trackerStatusCategory.ts` for why, and for what an absent category
+   * resolves to. Ignored on every other select field.
+   */
+  category?: StatusCategory;
 }
 
 export interface FieldDefinition {
@@ -119,11 +131,14 @@ export interface TableViewConfig {
   exportable: boolean;
 }
 
-/**
- * Sync policy for a tracker type.
- * Controls whether tracked items of this type participate in collaborative sync.
- */
-export type TrackerSyncMode = 'local' | 'shared' | 'hybrid';
+/** A tracker owns its schema and items together: personally or as a team artifact. */
+export type TrackerSharing = 'personal' | 'team';
+
+export interface TrackerSharingPolicy {
+  sharing: TrackerSharing;
+  /** Team trackers can create private drafts while reusing the existing per-item published bit. */
+  draftByDefault: boolean;
+}
 
 /**
  * Semantic roles that map product concepts to schema-defined field names.
@@ -154,13 +169,6 @@ export type TrackerSchemaRole =
    */
   | 'prMergedStatus';
 
-export interface TrackerSyncPolicy {
-  /** How items sync: local (never), shared (always), hybrid (per-item choice) */
-  mode: TrackerSyncMode;
-  /** Scope of sync: project (git remote) or workspace (local path) */
-  scope: 'project' | 'workspace';
-}
-
 export interface TrackerDataModel {
   type: string;
   displayName: string;
@@ -174,8 +182,18 @@ export interface TrackerDataModel {
   statusBarLayout?: StatusBarLayoutRow[];
   inlineTemplate?: string;
   tableView?: TableViewConfig;
-  /** Sync policy for collaborative tracking. Defaults to local if omitted. */
-  sync?: TrackerSyncPolicy;
+  /** Whether the tracker schema and its items are personal or team-owned. Defaults to personal. */
+  sharing?: TrackerSharing;
+  /** Whether new items in a team tracker begin as private drafts. Defaults to false. */
+  draftByDefault?: boolean;
+  /**
+   * Retired: the tracker is no longer used, but every item is kept, stays
+   * visible and searchable, and keeps its issue key. Archiving is the answer to
+   * "we should stop using this tracker" — it is deliberately NOT a demotion
+   * back to personal, which would strand teammates' items, and NOT a delete.
+   * Read-only is the only behavioral consequence.
+   */
+  archived?: boolean;
   /** If false, items of this type cannot be created via tracker_create. Defaults to true. */
   creatable?: boolean;
   /** Whether this type can be used as a primary type. Defaults to true. */
@@ -379,6 +397,42 @@ export class TrackerDataModelRegistry {
     // Fall back to the built-in seed, never to the active workspace's
     // override — that override belongs to a different project.
     return layer.get(type) ?? this.builtinModels.get(type);
+  }
+
+  /** True when a cached layer exists for a non-active workspace. */
+  hasWorkspaceLayer(workspacePath: string): boolean {
+    return this.workspaceLayers.has(workspacePath);
+  }
+
+  /**
+   * Resolve a type on behalf of an EXPLICIT workspace, with no dependence on
+   * ambient async context (#1359 / NIM-3702).
+   *
+   * `get()` reaches the right answer only when a scope provider is installed on
+   * the current async context, which is true for exactly one consumer — the MCP
+   * HTTP server, which wraps a whole request. The tracker sync lane is driven
+   * from a WebSocket `onStatusChange` callback that has no such relationship to
+   * whoever opened the workspace, so it lost the scope and read the *other*
+   * project's schemas. Callers that already hold a workspace path use this.
+   *
+   * Note the builtin fallback: `get()`'s unscoped branch does not have one, so
+   * a miss there returned `undefined` even for `bug`/`task`/`plan`/`decision`,
+   * all of which ship `sharing: team`. Both branches fall back here.
+   */
+  getForWorkspace(workspacePath: string | null | undefined, type: string): TrackerDataModel | undefined {
+    // The live view is authoritative for the active workspace, and no layer is
+    // cached for it — `setActiveWorkspace` drops one if it exists. Exactly one
+    // of the two answers for any workspace.
+    //
+    // An absent path means the caller could not say which workspace it is
+    // acting for (a row with no `workspace` column). Answer from the live view,
+    // which is what an unscoped `get()` did before this method existed —
+    // resolving such a caller against an empty layer would silently demote
+    // every custom type to "unknown".
+    if (!workspacePath || !this.activeWorkspace || workspacePath === this.activeWorkspace) {
+      return this.models.get(type) ?? this.builtinModels.get(type);
+    }
+    return this.workspaceLayers.get(workspacePath)?.get(type) ?? this.builtinModels.get(type);
   }
 
   getAll(): TrackerDataModel[] {

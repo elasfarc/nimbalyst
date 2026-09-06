@@ -1,8 +1,13 @@
-export const TEAM_ANALYTICS_CONTRACT_VERSION = 1 as const;
+import {
+  booleanRule,
+  categoryRule,
+  enumRule,
+  validateAgainstSchemas,
+  type PropertiesFor,
+  type PropertyRule,
+} from './eventContract';
 
-const booleanRule = { type: 'boolean' } as const;
-const categoryRule = { type: 'category' } as const;
-const enumRule = <const T extends readonly string[]>(...values: T) => ({ type: 'enum', values } as const);
+export const TEAM_ANALYTICS_CONTRACT_VERSION = 1 as const;
 
 const surface = enumRule('desktop', 'web_console', 'ios');
 const actorType = enumRule('user', 'agent');
@@ -14,6 +19,7 @@ const outcome = enumRule('success', 'partial', 'failed', 'cancelled', 'offline_r
 const durationCategory = enumRule('fast', 'medium', 'slow');
 const memberCountBucket = enumRule('1', '2-3', '4-10', '11-25', '26+');
 const projectCountBucket = enumRule('1', '2-3', '4-10', '11+');
+const organizationCountBucket = enumRule('1', '2-3', '4-10', '11+');
 const itemCountBucket = enumRule('0', '1', '2-5', '6-20', '21+');
 const retryCountBucket = enumRule('0', '1', '2-3', '4+');
 const queryLengthBucket = enumRule('1-3', '4-10', '11-30', '31+');
@@ -48,6 +54,7 @@ const documentOpenSource = enumRule(
   'agent_tool',
   'share_to_team',
   'embedded_document',
+  'feedback_request',
 );
 const teamErrorCategory = enumRule(
   'not_signed_in',
@@ -95,11 +102,6 @@ const syncErrorCategory = enumRule(
   'unknown',
 );
 
-type PropertyRule =
-  | typeof booleanRule
-  | typeof categoryRule
-  | ReturnType<typeof enumRule<readonly string[]>>;
-
 export const TEAM_ANALYTICS_EVENT_SCHEMAS = {
   team_surface_opened: {
     surface,
@@ -128,8 +130,39 @@ export const TEAM_ANALYTICS_EVENT_SCHEMAS = {
   },
   team_invitation_accepted: {
     surface,
-    entryPoint: enumRule('organization_manager', 'project_sharing'),
+    entryPoint: enumRule('organization_manager', 'project_sharing', 'deep_link'),
     projectMatched: booleanRule,
+    status: enumRule('accepted', 'already-member', 'sign-in-required', 'not-found', 'error'),
+  },
+  team_sign_in_completed: {
+    surface,
+    membershipState: enumRule('pending', 'active', 'mixed'),
+    organizationCountBucket,
+  },
+  team_project_walk_presented: {
+    surface,
+  },
+  team_project_walk_completed: {
+    surface,
+    folderSource: enumRule('clone', 'bind', 'not_applicable'),
+    skipped: booleanRule,
+  },
+  invite_landing_viewed: {
+    surface,
+  },
+  invite_handoff_shown: {
+    surface,
+    orgResolved: booleanRule,
+  },
+  invite_deep_link_followed: {
+    surface,
+    auto: booleanRule,
+  },
+  invite_download_clicked: {
+    surface,
+  },
+  invite_browser_instead_chosen: {
+    surface,
   },
   team_member_role_changed: {
     surface,
@@ -254,7 +287,7 @@ export const TEAM_ANALYTICS_EVENT_SCHEMAS = {
   collab_operation_failed: {
     surface,
     operation: enumRule('create_document', 'open_document', 'edit_document', 'share_to_team', 'folder_action', 'document_action', 'search'),
-    source: enumRule('new_document', 'share_to_team', 'embedded_document', 'sidebar', 'home', 'quick_open', 'deep_link', 'restart_restore', 'history', 'agent_tool', 'unknown'),
+    source: enumRule('new_document', 'share_to_team', 'embedded_document', 'feedback_request', 'sidebar', 'home', 'quick_open', 'deep_link', 'restart_restore', 'history', 'agent_tool', 'unknown'),
     actorType,
     documentType: categoryRule,
     errorCategory: collabErrorCategory,
@@ -346,58 +379,35 @@ export const TEAM_ANALYTICS_EVENT_SCHEMAS = {
     errorCategory: syncErrorCategory,
     connectionPath,
   },
+  /**
+   * The reconnect drain refused to run because it could not trust its sharing
+   * policy read. Team items are not syncing while this fires, so the rate is
+   * the health signal for NIM-2968 / NIM-3702 once the fix ships. Deliberately
+   * carries no tracker type NAMES -- those are workspace-defined and can be
+   * customer data.
+   */
+  tracker_drain_aborted: {
+    reason: enumRule('unresolved-policy-would-delete', 'zero-upserts-with-deletes'),
+    trackerTypeCount: itemCountBucket,
+    rowsHeldBack: itemCountBucket,
+  },
 } as const satisfies Record<string, Record<string, PropertyRule>>;
 
 type SchemaMap = typeof TEAM_ANALYTICS_EVENT_SCHEMAS;
 export type TeamAnalyticsEventName = keyof SchemaMap;
 
-type InferRule<T extends PropertyRule> =
-  T extends { type: 'boolean' }
-    ? boolean
-    : T extends { type: 'enum'; values: readonly (infer V extends string)[] }
-      ? V
-      : string;
-
-export type TeamAnalyticsProperties<E extends TeamAnalyticsEventName> = Partial<{
-  [K in keyof SchemaMap[E]]: SchemaMap[E][K] extends PropertyRule ? InferRule<SchemaMap[E][K]> : never;
-}>;
+export type TeamAnalyticsProperties<E extends TeamAnalyticsEventName> = PropertiesFor<SchemaMap, E>;
 
 export interface TeamAnalyticsEvent<E extends TeamAnalyticsEventName = TeamAnalyticsEventName> {
   event: E;
   properties: TeamAnalyticsProperties<E>;
 }
 
-const PRIVACY_SHAPE = /(?:https?:\/\/|file:\/\/|[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}|(?:^|[\\/])(?:Users|home|var|tmp|private|Volumes)(?:[\\/]|$))/i;
-const STABLE_CATEGORY = /^[a-z0-9][a-z0-9._+-]{0,63}$/;
-
-function assertPropertyValue(event: TeamAnalyticsEventName, key: string, rule: PropertyRule, value: unknown): void {
-  if (rule.type === 'boolean') {
-    if (typeof value !== 'boolean') throw new Error(`${event}.${key} must be boolean`);
-    return;
-  }
-  if (typeof value !== 'string') throw new Error(`${event}.${key} must be a string category`);
-  if (PRIVACY_SHAPE.test(value)) throw new Error(`${event}.${key} contains a forbidden identifying value`);
-  if (rule.type === 'enum') {
-    if (!rule.values.includes(value)) throw new Error(`${event}.${key} is not an allowlisted category`);
-    return;
-  }
-  if (!STABLE_CATEGORY.test(value) || value.includes('..') || value.startsWith('/')) {
-    throw new Error(`${event}.${key} must be a stable low-cardinality category`);
-  }
-}
-
 export function validateTeamAnalyticsEvent<E extends TeamAnalyticsEventName>(
   event: E,
   properties: TeamAnalyticsProperties<E>,
 ): TeamAnalyticsEvent<E> {
-  const schema = TEAM_ANALYTICS_EVENT_SCHEMAS[event];
-  if (!schema) throw new Error(`Unknown Teams analytics event: ${String(event)}`);
-  for (const [key, value] of Object.entries(properties)) {
-    const rule = (schema as Record<string, PropertyRule>)[key];
-    if (!rule) throw new Error(`${event}.${key} is not an allowlisted property`);
-    if (value !== undefined) assertPropertyValue(event, key, rule, value);
-  }
-  return { event, properties };
+  return validateAgainstSchemas(TEAM_ANALYTICS_EVENT_SCHEMAS, event, properties);
 }
 
 export function bucketMemberCount(count: number): '1' | '2-3' | '4-10' | '11-25' | '26+' {
@@ -409,6 +419,13 @@ export function bucketMemberCount(count: number): '1' | '2-3' | '4-10' | '11-25'
 }
 
 export function bucketProjectCount(count: number): '1' | '2-3' | '4-10' | '11+' {
+  if (count <= 1) return '1';
+  if (count <= 3) return '2-3';
+  if (count <= 10) return '4-10';
+  return '11+';
+}
+
+export function bucketOrganizationCount(count: number): '1' | '2-3' | '4-10' | '11+' {
   if (count <= 1) return '1';
   if (count <= 3) return '2-3';
   if (count <= 10) return '4-10';
@@ -443,13 +460,7 @@ export function bucketQueryLength(length: number): '1-3' | '4-10' | '11-30' | '3
   return '31+';
 }
 
-export function toStableAnalyticsCategory(value: string | null | undefined, fallback = 'unknown'): string {
-  const normalized = value?.trim().toLowerCase().replace(/[^a-z0-9._+-]+/g, '_') ?? '';
-  if (!normalized || !STABLE_CATEGORY.test(normalized) || normalized.includes('..')) {
-    return fallback;
-  }
-  return normalized;
-}
+export { toStableAnalyticsCategory } from './eventContract';
 
 export type TeamAnalyticsErrorArea = 'organization' | 'project' | 'document' | 'sync';
 type TeamErrorCategory = typeof teamErrorCategory.values[number] | 'network' | 'server' | 'unknown';

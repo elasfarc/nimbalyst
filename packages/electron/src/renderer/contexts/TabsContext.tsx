@@ -15,7 +15,13 @@
 
 import React, { createContext, useContext, useRef, useCallback, useSyncExternalStore, useMemo } from 'react';
 import { getFileName } from '../utils/pathUtils';
-import { isCollabUri } from '../utils/collabUri';
+import { isCollabUri } from '@nimbalyst/collab-protocol';
+// Deep path, not the FeedbackRequest barrel: that barrel exports React
+// components and this module must stay free of them.
+import {
+  FEEDBACK_REQUEST_TAB_TITLE,
+  isFeedbackRequestTab,
+} from '../components/FeedbackRequest/feedbackRequestTab';
 import { store as jotaiStore, editorDirtyAtom, makeEditorKey } from '@nimbalyst/runtime/store';
 
 export interface TabData {
@@ -59,7 +65,7 @@ export function isTrackerTabPath(filePath: string): boolean {
 }
 
 /** True when a tab represents a non-filesystem resource (virtual/collab/tracker). */
-function isNonFilesystemTab(filePath: string): boolean {
+export function isNonFilesystemTab(filePath: string): boolean {
   return (
     filePath.startsWith('virtual://') ||
     isCollabUri(filePath) ||
@@ -71,6 +77,9 @@ const UNRESOLVED_COLLAB_TAB_NAME = 'Shared document';
 
 function resolveTabDisplayName(filePath: string, displayName?: string): string {
   const requestedName = displayName?.trim();
+  // A feedback request tab's last path segment is an opaque request id, so
+  // getFileName would title the tab with a uuid on restore.
+  if (isFeedbackRequestTab(filePath)) return requestedName || FEEDBACK_REQUEST_TAB_TITLE;
   if (!isCollabUri(filePath)) return requestedName || getFileName(filePath);
 
   const transportName = getFileName(filePath);

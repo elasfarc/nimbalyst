@@ -2,6 +2,7 @@ import { app, Notification } from 'electron';
 
 import { createTeamManagementWindow, isTeamManagementWindowFocusedOn } from '../window/TeamManagementWindow';
 import { logger } from '../utils/logger';
+import { resolveNotificationIcon } from './notificationIcons';
 import { isOSNotificationsEnabled } from '../utils/store';
 import { listConversations, listMembers } from './TeamService';
 import {
@@ -42,9 +43,10 @@ function showNativeNotification(
   const notification = new Notification({
     title: options.title,
     body: options.body,
-    icon: process.platform === 'darwin' || process.platform === 'win32'
-      ? app.getPath('exe')
-      : '',
+    icon: resolveNotificationIcon('teams-message')
+      ?? (process.platform === 'darwin' || process.platform === 'win32'
+        ? app.getPath('exe')
+        : ''),
     urgency: 'normal',
     timeoutType: 'default',
   });
@@ -75,6 +77,9 @@ export function createTeamInboxNotificationService(
     showNativeNotification,
     openConversation: (orgId, conversationId) => {
       createTeamManagementWindow({ orgId, conversationId });
+    },
+    openInbox: (orgId) => {
+      createTeamManagementWindow({ orgId });
     },
     openInboxSource,
     resolveConversationTitle: async (orgId, conversationId) => {

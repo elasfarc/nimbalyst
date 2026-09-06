@@ -25,6 +25,7 @@ import {
   type SessionManager,
 } from '@nimbalyst/runtime/ai/server';
 import {
+  type AIModel,
   type Message,
   type AIProviderType,
   type SessionData,
@@ -34,57 +35,93 @@ import {
   type DocumentContext,
 } from '@nimbalyst/runtime/ai/server/types';
 import { getSessionStateManager } from '@nimbalyst/runtime/ai/server/SessionStateManager';
+import { startTurnLivenessTicker } from './turnLivenessTicker';
+import { agentCapabilitiesForProviderType } from '@nimbalyst/runtime/ai/server/agentCapabilities';
 import { isBedrockToolSearchError } from '@nimbalyst/runtime/ai/server/utils/errorDetection';
 import { resolveEffortLevel, resolveThinkingMode } from '@nimbalyst/runtime/ai/server/effortLevels';
-import type { RawDocumentContext, DocumentContextService } from '@nimbalyst/runtime';
-import { AISessionsRepository, resolveClaudeCodeParentContextWindow } from '@nimbalyst/runtime';
+import type { RawDocumentContext } from '@nimbalyst/runtime/ai/services/types';
+import type { DocumentContextService } from '@nimbalyst/runtime/ai/services/DocumentContextService';
+import { AISessionsRepository } from '@nimbalyst/runtime/storage/repositories/AISessionsRepository';
+import { resolveClaudeCodeParentContextWindow } from '@nimbalyst/runtime/ai/modelConstants';
 import {
   buildMcpSessionStatusSnapshot,
   type McpSessionStatusInput,
 } from '@nimbalyst/runtime/types/MCPServerConfig';
 import { toolRegistry } from './tools';
 import type { DriveReason } from './QueueDriveService';
-import { resolveExtensionAgentRef } from './providerResolution';
+import { resolveExtensionAgentRef, usesHostSuppliedToolLoop } from './providerResolution';
+import { resolveProviderAuthRequirement } from './providerAuthRequirement';
 import { getAgentProviderRegistry } from '../../extensions/AgentProviderRegistry';
 
 /**
- * Resolve the human-readable model name (e.g. "Gemini 3.5 Flash (High)") for an
- * extension agent provider, so the system prompt can tell the model its real
- * name instead of the raw internal id. Returns undefined for built-in providers.
+ * Resolve the human-readable model name (e.g. "Gemini 3.5 Flash (High)") for a
+ * tool-loop agent provider, so the system prompt can tell the model its real
+ * name instead of the raw internal id.
+ *
+ * Two sources because there are two kinds of tool-loop provider: an extension
+ * declares its models in its manifest, while a built-in one publishes them
+ * through `ModelRegistry`. Returns undefined for anything else — an
+ * MCP-discovering provider builds its own prompt.
  */
-function resolveExtensionModelDisplayName(
+function resolveToolLoopModelDisplayName(
   provider: string,
   model: string | null | undefined,
 ): string | undefined {
   if (!model) return undefined;
   try {
     const entry = getAgentProviderRegistry().findByContributionId(provider);
-    const match = entry?.contribution.models?.find(
-      (m) => m.id === model || m.id.endsWith(`:${model}`),
-    );
-    return match?.name;
+    if (entry) {
+      const match = entry.contribution.models?.find(
+        (m) => m.id === model || m.id.endsWith(`:${model}`),
+      );
+      return match?.name;
+    }
+    // Built-in: read the cached catalog only. A network/subprocess fetch here
+    // would sit on the hot path of every turn just to prettify a prompt line;
+    // an unpopulated cache degrades to the raw id, which is cosmetic.
+    const cached = ModelRegistry.getCachedModels(provider as AIProviderType);
+    return cached?.find((m: AIModel) => m.id === model || m.id.endsWith(`:${model}`))?.name;
   } catch {
     return undefined;
   }
 }
 
+/**
+ * Read the OpenCode session role the user picked, from session metadata.
+ *
+ * OpenCode-only: `opencodeAgent` names an `app.agents` primary agent and means
+ * nothing to any other provider, so it is never forwarded to one.
+ */
+function resolveOpenCodeAgentRole(session: { provider?: string; metadata?: unknown }): string | undefined {
+  if (session.provider !== 'opencode') return undefined;
+  const role = (session.metadata as Record<string, unknown> | undefined)?.opencodeAgent;
+  if (typeof role !== 'string') return undefined;
+  const trimmed = role.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
 import { extractFilePath } from './tools/extractFilePath';
+import { geminiUsageService } from '../GeminiUsageService';
 import { SoundNotificationService } from '../SoundNotificationService';
 import { notificationService } from '../NotificationService';
 import { composeNotificationTitle } from '../../../shared/notificationTitle';
-import { TrayManager } from '../../tray/TrayManager';
 import { logger } from '../../utils/logger';
 import { windowStates, findWindowByWorkspace } from '../../window/WindowManager';
 import { sessionFileTracker } from '../SessionFileTracker';
 import { codexEditWindowRegistry, shouldOpenCodexEditWindow } from '../CodexEditWindowRegistry';
 import { toolCallMatcher, unwrapShellCommand } from '../ToolCallMatcher';
+import { getGitOperationLogService } from '../GitOperationLogService';
+import { GitActivityBridge, bashCommandObservation } from './GitActivityBridge';
 import { FeatureUsageService, FEATURES } from '../FeatureUsageService.ts';
 import { ToolUsageService } from '../ToolUsageService';
 import { historyManager } from '../../HistoryManager';
 import { addGitignoreBypass } from '../../file/WorkspaceEventBus';
 import { getSyncProvider, isDesktopTrulyAway } from '../SyncManager';
+import { requestMobilePush } from './mobilePushRequest';
 import { setSessionPendingPrompt, normalizeSyncedQuestions } from './pendingPromptPersistence';
+import type { PromptKind } from '../../tray/fleetSnapshot';
 import { getAgentWorkflowService } from '../AgentWorkflowService';
+import { dispatchSessionMetaTool } from '../../mcp/sessionNamingServer';
 import { getMetaAgentOpenAITools } from '../../mcp/metaAgentServer';
 import { getDevAgentOpenAITools, resolveDevToolScope } from '../../mcp/devAgentTools';
 import { MetaAgentService } from '../MetaAgentService';
@@ -116,23 +153,52 @@ import {
 import { disableParentNotificationsAfterDirectTakeover } from './childSessionTakeover';
 import { installScopedProviderListener } from './providerListenerRegistry';
 import { shouldSettleUnterminatedTurn } from './sessionSettlePolicy';
+import { captureTutorialMilestone } from '../tutorial/tutorialAnalytics';
+import { trackSendBlocked } from '../analytics/sendWallAnalytics';
+import { addNimAssetRoot } from '../../protocols/nimAssetProtocol';
+import { registerSessionWorktreeAssetRoot } from '../../protocols/nimAssetWorktreeRoots';
 import type Store from 'electron-store';
 import type { AIService } from './AIService';
 import type { HooklessAgentFileWatcher } from './HooklessAgentFileWatcher';
 import type { WorkspaceFileAttributionMode } from '../WorkspaceFileAttributionPolicy';
+import {
+  attributionModeForFileChangeFidelity,
+  fileChangeFidelityForProviderType,
+  isProviderEditTool,
+  type FileChangeFidelity,
+} from '@nimbalyst/runtime/ai/server/providerFileTracking';
 
+/**
+ * Ask the provider how well it reports its own file changes, and derive the
+ * watcher's attribution mode from that.
+ *
+ * A live instance is authoritative because fidelity can depend on the active
+ * transport. When there is none yet — the policy is set before the provider is
+ * constructed — fall back to the provider type's declaration, with one
+ * exception noted below.
+ */
 function resolveWorkspaceFileAttributionMode(
   providerName: string,
   provider: AIProvider | null | undefined,
 ): WorkspaceFileAttributionMode {
-  if (providerName !== 'openai-codex') return 'fuzzy';
-
-  const codexProvider = provider as (AIProvider & {
-    getTransport?: () => 'sdk' | 'app-server';
+  const liveProvider = provider as (AIProvider & {
+    getFileChangeFidelity?: () => FileChangeFidelity;
   }) | null | undefined;
-  const activeTransport = codexProvider?.getTransport?.();
-  const configuredTransport = getAppSetting<{ transport?: 'sdk' | 'app-server' }>('openaiCodex')?.transport;
-  return (activeTransport ?? configuredTransport) === 'sdk' ? 'fuzzy' : 'disabled';
+  const live = liveProvider?.getFileChangeFidelity?.();
+  if (live) return attributionModeForFileChangeFidelity(live);
+
+  // Codex is the only provider whose fidelity is a user-selected setting: the
+  // legacy SDK transport has no `fileChange` item. Without a live instance to
+  // ask, read the setting rather than crediting it with the app-server's
+  // structured changes.
+  if (
+    providerName === 'openai-codex'
+    && getAppSetting<{ transport?: 'sdk' | 'app-server' }>('openaiCodex')?.transport === 'sdk'
+  ) {
+    return 'fuzzy';
+  }
+
+  return attributionModeForFileChangeFidelity(fileChangeFidelityForProviderType(providerName));
 }
 
 export type SendMessageHandler = (
@@ -248,6 +314,41 @@ async function getWorkspacePathForSession(sessionId: string): Promise<string | n
   return null;
 }
 
+/**
+ * Re-apply an `update_session_meta` call the agent transport announced but
+ * never completed.
+ *
+ * Measured on one install: 13 of 3856 such calls (0.34%) ended this way, and
+ * they cluster — one session dropped five consecutive calls over 22 minutes and
+ * never recovered, so its phase and tags stayed at whatever the last successful
+ * call had set. Nimbalyst's MCP server is not the cause; a stale connection
+ * answers every request with a fast 404 rather than hanging.
+ *
+ * Everything needed is in the arguments the agent already announced, so this
+ * routes them through the same dispatcher the MCP tool would have reached —
+ * deliberately not back through the transport that just dropped the call.
+ */
+async function repairOrphanedSessionMetaCall(
+  toolCall: { name?: string; arguments?: unknown },
+  sessionId: string | undefined
+): Promise<void> {
+  const tool = String(toolCall.name ?? '').replace(/^mcp__.+?__/, '');
+  if (tool !== 'update_session_meta') return;
+  if (!sessionId || !toolCall.arguments || typeof toolCall.arguments !== 'object') return;
+
+  try {
+    await dispatchSessionMetaTool(tool, toolCall.arguments as Record<string, unknown>, sessionId);
+    console.warn(
+      `[SessionMeta] re-applied a dropped update_session_meta for session ${sessionId}`
+    );
+  } catch (err) {
+    // Best effort. The agent is already gone; failing here must not disturb the
+    // stream, but it must not be silent either -- silence is what made the
+    // original drop take an hour to characterize.
+    console.error('[SessionMeta] could not re-apply a dropped update_session_meta:', err);
+  }
+}
+
 export class MessageStreamingHandler {
   private readonly svc: AIServiceInternal;
   private readonly unsubscribeBatchListener: () => void;
@@ -330,6 +431,7 @@ export class MessageStreamingHandler {
     if (queuedPromptId) {
       if (this.svc.processingQueuedPromptIds.has(queuedPromptId)) {
         logger.main.info(`[AIService] SKIPPING duplicate queued prompt: ${queuedPromptId}`);
+        trackSendBlocked('duplicate_prompt');
         return { content: '' }; // Already being processed, return empty response
       }
 
@@ -367,6 +469,7 @@ export class MessageStreamingHandler {
 
     // ALWAYS load session by ID - never use "current" session (causes cross-window issues)
     if (!sessionId) {
+      trackSendBlocked('no_session_id');
       throw new Error('No session ID provided - cannot send message');
     }
 
@@ -378,6 +481,7 @@ export class MessageStreamingHandler {
 
     // Require workspace path for AI operations
     if (!workspacePath) {
+      trackSendBlocked('no_workspace');
       throw new Error('No workspace path available - AI operations require an open workspace');
     }
 
@@ -386,6 +490,7 @@ export class MessageStreamingHandler {
     perfLog.sessionLoadTime = Date.now() - loadStartTime;
 
     if (!session) {
+      trackSendBlocked('session_not_found');
       throw new Error(`Session ${sessionId} not found`);
     }
 
@@ -393,6 +498,7 @@ export class MessageStreamingHandler {
     // Verify we got the right session
     if (session.id !== sessionId) {
       console.error(`[AIService] CRITICAL ERROR: Requested session ${sessionId} but got session ${session.id}!`);
+      trackSendBlocked('session_mismatch', session.provider);
       throw new Error(`Session mismatch: requested ${sessionId} but got ${session.id}`);
     }
 
@@ -404,6 +510,14 @@ export class MessageStreamingHandler {
     // CRITICAL: If session has a worktree, use its path instead of workspace path
     // This ensures Claude Code runs in the worktree directory
     let effectiveWorkspacePath = session.worktreePath || workspacePath;
+
+    // #1343: a worktree is a sibling of the workspace root, so it never matches
+    // the root registered at window creation and `nim-asset://` 403s every image
+    // written inside it. Register the directory this session already runs in.
+    registerSessionWorktreeAssetRoot(session, {
+      addRoot: addNimAssetRoot,
+      logWarn: (message) => logger.ai.warn(message),
+    });
 
     // For worktree sessions, use the parent project path for permission lookups
     // This is passed through documentContext to avoid changing sendMessage signature
@@ -503,47 +617,23 @@ export class MessageStreamingHandler {
         // (e.g. Antigravity rides ~/.gemini OAuth). No host-side apiKey check.
         requiresApiKey = false;
       } else {
-        switch (session.provider) {
-          case 'claude':
-            errorMessage = 'Anthropic API key not configured';
-            break;
-          case 'claude-code':
-            // Claude Code: API key is optional and uses OAuth login when not configured.
-            requiresApiKey = false;
-            break;
-          case 'claude-code-cli':
-            // Genuine `claude` CLI: uses its own login/subscription, no API key.
-            requiresApiKey = false;
-            break;
-          case 'openai':
-            errorMessage = 'OpenAI API key not configured';
-            break;
-          case 'openai-codex':
-            // Codex SDK uses its own auth (codex auth login), API key is optional
-            requiresApiKey = false;
-            break;
-          case 'openai-codex-acp':
-            // Codex ACP uses the codex-acp binary's own auth, API key is optional
-            requiresApiKey = false;
-            break;
-          case 'opencode':
-            // OpenCode uses its own config, API key is optional
-            requiresApiKey = false;
-            break;
-          case 'copilot-cli':
-            // Copilot uses its own CLI auth, no API key needed
-            requiresApiKey = false;
-            break;
-          case 'lmstudio':
-            // LMStudio doesn't need an API key, just the base URL
-            apiKey = 'not-required'; // Dummy value since LMStudio doesn't need a key
-            break;
-          default:
-            throw new Error(`Unknown provider: ${session.provider}`);
+        // Shared with the session-create auth check in AIService. Keeping the
+        // decision in one exhaustive place is what stops a newly-added
+        // provider from reaching a `default:` throw on the send path.
+        const authRequirement = resolveProviderAuthRequirement(session.provider as AIProviderType);
+        if (!authRequirement) {
+          trackSendBlocked('no_provider', session.provider);
+          throw new Error(`Unknown provider: ${session.provider}`);
+        }
+        requiresApiKey = authRequirement.requiresApiKey;
+        errorMessage = authRequirement.missingKeyMessage;
+        if (authRequirement.placeholderApiKey) {
+          apiKey = authRequirement.placeholderApiKey;
         }
       }
 
       if (!apiKey && requiresApiKey) {
+        trackSendBlocked('no_api_key', session.provider);
         throw new Error(errorMessage);
       }
 
@@ -776,7 +866,10 @@ export class MessageStreamingHandler {
     let selectedModelContextWindow: number | undefined;
     const sessionModelId = session.model || session.providerConfig?.model;
     if (sessionModelId) {
-      const models = await ModelRegistry.getModelsForProvider(session.provider as AIProviderType);
+      const models = await ModelRegistry.getModelsForProvider(
+        session.provider as AIProviderType,
+        effectiveWorkspacePath,
+      );
       selectedModelContextWindow = models.find(m => m.id === sessionModelId)?.contextWindow;
     }
 
@@ -875,20 +968,23 @@ export class MessageStreamingHandler {
     // for why we persist locally: the in-memory atom can desync from reality
     // if a resolve event is missed (renderer reload, HMR, late delivery),
     // and the only recovery is rehydrating from the DB on next list refresh.
+    // `kind` colours the menu bar strip's dot: a tap versus thinking required.
+    // `promptData` carries the full payload so a remote device (controller /
+    // mobile) can render and answer the prompt, not just know one is pending.
     const syncPendingPrompt = (
       sessionId: string,
       hasPendingPrompt: boolean,
+      kind: PromptKind = 'approval',
       promptData?: import('./pendingPromptPersistence').SyncedPendingPromptData | null,
     ) => {
-      void setSessionPendingPrompt(sessionId, hasPendingPrompt, promptData);
+      void setSessionPendingPrompt(sessionId, hasPendingPrompt, kind, promptData);
     };
 
     // Listen for ExitPlanMode confirmation requests and forward to renderer
     const onExitPlanModeConfirm = async (data: { requestId: string; sessionId: string; planSummary: string; timestamp: number }) => {
       logger.main.info('[AIService] ExitPlanMode confirmation requested:', data.requestId);
       safeSend(event, 'ai:exitPlanModeConfirm', { ...data, workspacePath: effectiveWorkspacePath });
-      syncPendingPrompt(data.sessionId, true);
-      TrayManager.getInstance().onPromptCreated(data.sessionId);
+      syncPendingPrompt(data.sessionId, true, 'decision');
 
       // Update session status so all windows show the pending indicator
       getSessionStateManager().updateActivity({
@@ -925,7 +1021,6 @@ export class MessageStreamingHandler {
     }) => {
       logger.main.info('[AIService] ExitPlanMode resolved:', data.requestId, 'approved=', data.approved);
       syncPendingPrompt(data.sessionId, false);
-      TrayManager.getInstance().onPromptResolved(data.sessionId);
 
       getSessionStateManager().updateActivity({
         sessionId: data.sessionId,
@@ -944,12 +1039,12 @@ export class MessageStreamingHandler {
       // Sync the questions themselves, not just the pending bit — SDK sessions
       // never write the question into the transcript, so this is the only way a
       // remote device (controller / mobile) can render and answer it.
-      syncPendingPrompt(data.sessionId, true, {
+      // (setSessionPendingPrompt stamps the tray for us via `kind`.)
+      syncPendingPrompt(data.sessionId, true, 'decision', {
         promptType: 'ask_user_question',
         questionId: data.questionId,
         questions: normalizeSyncedQuestions(data.questions),
       });
-      TrayManager.getInstance().onPromptCreated(data.sessionId);
 
       // Update session status to waiting_for_input so all windows show the pending indicator
       getSessionStateManager().updateActivity({
@@ -975,7 +1070,6 @@ export class MessageStreamingHandler {
       // logger.main.info('[AIService] AskUserQuestion answered:', data.questionId);
       safeSend(event, 'ai:askUserQuestionAnswered', { ...data, workspacePath: effectiveWorkspacePath });
       syncPendingPrompt(data.sessionId, false);
-      TrayManager.getInstance().onPromptResolved(data.sessionId);
 
       // Update session status back to running so all windows clear the pending indicator
       getSessionStateManager().updateActivity({
@@ -992,8 +1086,9 @@ export class MessageStreamingHandler {
       safeSend(event, 'ai:toolPermission', data);
       // Sync the full permission payload so a remote device (controller/mobile)
       // can render the approve UI and answer it — not just know a prompt is pending.
+      // (setSessionPendingPrompt stamps the tray for us via `kind`.)
       const req = data.request ?? {};
-      syncPendingPrompt(data.sessionId, true, {
+      syncPendingPrompt(data.sessionId, true, 'approval', {
         promptType: 'permission_request',
         requestId: data.requestId,
         toolName: typeof req.toolName === 'string' ? req.toolName : '',
@@ -1003,7 +1098,6 @@ export class MessageStreamingHandler {
         isDestructive: !!req.isDestructive,
         warnings: Array.isArray(req.warnings) ? req.warnings : [],
       });
-      TrayManager.getInstance().onPromptCreated(data.sessionId);
 
       // Update session status so all windows show the pending indicator
       getSessionStateManager().updateActivity({
@@ -1033,7 +1127,6 @@ export class MessageStreamingHandler {
       logger.main.info('[AIService] Tool permission resolved:', data.requestId);
       safeSend(event, 'ai:toolPermissionResolved', { ...data, workspacePath: effectiveWorkspacePath });
       syncPendingPrompt(data.sessionId, false);
-      TrayManager.getInstance().onPromptResolved(data.sessionId);
 
       // Update session status back to running so all windows clear the pending indicator
       getSessionStateManager().updateActivity({
@@ -1229,6 +1322,10 @@ export class MessageStreamingHandler {
       }),
     });
 
+    // Separates "opened the tutorial" from "actually used it". No-ops for every
+    // other workspace.
+    void captureTutorialMilestone(effectiveWorkspacePath, 'prompt_sent');
+
     // Mark session as running/active
     const stateManager = getSessionStateManager();
     await stateManager.startSession({
@@ -1245,6 +1342,37 @@ export class MessageStreamingHandler {
       });
     }
 
+    // Mirrors this turn's direct Git commands into the workspace Git journal so
+    // they appear in the menu-bar indicator and the Git Output tab. Declared
+    // outside the try so a stream that throws still terminalizes its entries --
+    // otherwise the indicator spins until the next app restart.
+    const gitActivityBridge = new GitActivityBridge(
+      getGitOperationLogService(),
+      session.id,
+      session.provider,
+    );
+    // Failure is isolated but logged: losing observability must not break the
+    // agent's command, and must not be silent either.
+    const recordGitActivity = async (toolCall: unknown, workspacePath: string): Promise<void> => {
+      const observation = bashCommandObservation(toolCall, session.provider);
+      if (!observation) return;
+      try {
+        await gitActivityBridge.observe({ ...observation, workspacePath });
+      } catch (gitActivityError) {
+        logger.main.error('[AIService] Failed to record agent Git activity:', gitActivityError);
+      }
+    };
+
+    // The turn is in flight from here. The tray's ambient surfaces call a
+    // running session "not responding" after a silence, and a turn sitting
+    // inside one long tool call emits nothing they can hear -- so the tick, not
+    // the chunk stream, is what tells them it is still working. Stopped in the
+    // `finally` below, for the same reason the git activity journal is.
+    const stopTurnLiveness = startTurnLivenessTicker({
+      sessionId: session.id,
+      markAlive: (sessionId) => stateManager.markTurnAlive(sessionId),
+    });
+
     try {
       let fullResponse = '';
       let lastTextSection = '';  // Track text after the last tool call (for notifications)
@@ -1254,6 +1382,7 @@ export class MessageStreamingHandler {
       let hasStreamingContent = false;  // Track if we used streamContent tool
       let hadError = false;  // Track if an error occurred during the stream
       let providerError: string | undefined;
+      let providerCrashed = false;  // The agent subprocess died from a native fault (#1361)
       let sawCompleteChunk = false;  // A terminal 'complete' chunk arrived
       let settledOnErrorChunk = false;  // The error branch already ended the session
       let firstChunkTime: number | undefined;
@@ -1312,6 +1441,14 @@ export class MessageStreamingHandler {
           if (modelForProvider !== null) {
             turnConfig.model = modelForProvider;
           }
+        }
+        // OpenCode session role. This is the last initialize() before the turn
+        // and OpenCode's initialize() replaces the whole config, so the role has
+        // to be re-supplied here or it is erased exactly the way the model was
+        // in #730.
+        const turnAgentRole = resolveOpenCodeAgentRole(session);
+        if (turnAgentRole) {
+          turnConfig.agentRole = turnAgentRole;
         }
         await provider.initialize(turnConfig);
       }
@@ -1453,58 +1590,52 @@ export class MessageStreamingHandler {
         }
       }
 
-      // Meta-agent tools for extension-agent providers (e.g. gemini-antigravity).
-      // Built-in providers (claude-code, openai-codex) discover these same tools
-      // over the SSE MCP server instead, so we ONLY thread JSON tool defs for the
-      // extension-agent branch. Gated on the meta-agent server being up plus a
-      // session + workspace, mirroring McpConfigService parity for built-ins.
-      // `undefined` for built-in providers, so their sendMessage call shape is
-      // unchanged.
-      // resolveExtensionAgentRef is recomputed here (the earlier binding from
-      // the provider-creation block is out of scope); it's a cheap pure lookup.
-      const isExtensionAgentSession = !!resolveExtensionAgentRef(session.provider);
-      // Only a meta-agent extension session may receive spawn tools. A standard
+      // Tools for providers whose tool loop the host feeds (Gemini, and any
+      // extension agent). MCP-discovering providers (claude-code, openai-codex)
+      // find these same tools over the SSE MCP server, so they are threaded
+      // nothing and their sendMessage call shape is unchanged. Gated on the
+      // meta-agent server being up plus a session + workspace, mirroring
+      // McpConfigService parity.
+      const isToolLoopSession = usesHostSuppliedToolLoop(session.provider);
+      // Only a meta-agent session may receive spawn tools. A standard
       // child session (created agentRole='standard' by MetaAgentService) must
       // NOT get spawn tools, otherwise it can spawn grandchildren and trigger
       // exponential recursion. This mirrors claude-code/openai-codex, where only
       // a button-created meta-agent gets the spawn tools over the SSE MCP server
       // and its standard children cannot spawn. Gate tools and persona on the
       // SAME condition so they stay in lockstep.
-      const isMetaAgentExtensionSession =
-        isExtensionAgentSession && session.agentRole === 'meta-agent';
-      // A standard (non-meta-agent) extension session gets the read-only dev
-      // toolset (read_file / list_files / search_files) so the model can
-      // investigate the workspace through the SAME simulated tool loop. This
-      // mirrors built-in providers: a standard session has file tools, only a
-      // meta-agent session has orchestration tools. The dev tools dispatch over
-      // the broker's `devToolExecutor` (gated workspace-files), not the
-      // meta-agent SSE MCP server, so they need no MetaAgentService port.
-      const isStandardExtensionSession =
-        isExtensionAgentSession && session.agentRole !== 'meta-agent';
-      const extensionAgentTools =
-        isMetaAgentExtensionSession &&
+      const isMetaAgentToolLoopSession =
+        isToolLoopSession && session.agentRole === 'meta-agent';
+      // A standard (non-meta-agent) session gets the workspace dev toolset so
+      // the model can investigate and edit through the SAME simulated tool
+      // loop. This mirrors the MCP-discovering providers: a standard session
+      // has file tools, only a meta-agent session has orchestration tools.
+      // These dispatch host-side and need no MetaAgentService port.
+      const isStandardToolLoopSession =
+        isToolLoopSession && session.agentRole !== 'meta-agent';
+      const toolLoopTools =
+        isMetaAgentToolLoopSession &&
         MetaAgentService.getInstance().getPort() !== null &&
         session.id &&
         effectiveWorkspacePath
           ? getMetaAgentOpenAITools()
-          : isStandardExtensionSession && session.id && effectiveWorkspacePath
+          : isStandardToolLoopSession && session.id && effectiveWorkspacePath
             ? getDevAgentOpenAITools(
                 resolveDevToolScope((session.metadata as Record<string, unknown> | undefined)?.toolScope),
               )
             : undefined;
 
-      // Meta-agent persona for extension-agent providers (e.g. gemini-antigravity).
-      // Built-in providers (claude-code, openai-codex) build this same persona
-      // internally over their SDK system prompt; extension agents have no
-      // equivalent, so without this they receive ONLY tool schemas and reply as
-      // a generic chat assistant ("how would you like to proceed?") instead of
-      // proactively setting session meta, surveying worktrees/sessions, and
-      // spawning child sessions. We reuse the SAME buildMetaAgentSystemPrompt
-      // source the built-in providers use (no duplicated persona text), and gate
-      // it strictly on agentRole === 'meta-agent' so a normal gemini chat session
-      // is unaffected. 'codex' tool-reference style renders plain tool names,
-      // matching how the extension's tool loop presents tools in its JSON
-      // envelope (no `mcp__` SDK prefix).
+      // Meta-agent persona for tool-loop providers. The MCP-discovering
+      // providers build this same persona internally over their SDK system
+      // prompt; a tool-loop provider has no equivalent, so without this it
+      // receives ONLY tool schemas and replies as a generic chat assistant
+      // ("how would you like to proceed?") instead of proactively setting
+      // session meta, surveying worktrees/sessions, and spawning child
+      // sessions. We reuse the SAME buildMetaAgentSystemPrompt source (no
+      // duplicated persona text), gated strictly on agentRole === 'meta-agent'
+      // so a normal Gemini chat session is unaffected. 'codex' tool-reference
+      // style renders plain tool names, matching how a tool loop presents tools
+      // in its JSON envelope (no `mcp__` SDK prefix).
       // Workflow preset for the meta-agent persona. Read from session metadata
       // (validated) with a 'default' fallback, mirroring how effortLevel is read
       // above. Behavior is byte-identical until something writes
@@ -1515,22 +1646,22 @@ export class MessageStreamingHandler {
         rawWorkflowPreset === 'research' || rawWorkflowPreset === 'implement-review-test'
           ? rawWorkflowPreset
           : 'default';
-      const extensionAgentSystemPrompt =
-        isMetaAgentExtensionSession
+      const toolLoopSystemPrompt =
+        isMetaAgentToolLoopSession
           ? buildMetaAgentSystemPrompt('codex', extensionWorkflowPreset, {
               provider: session.provider,
               model: session.model ?? undefined,
-              modelDisplayName: resolveExtensionModelDisplayName(session.provider, session.model),
+              modelDisplayName: resolveToolLoopModelDisplayName(session.provider, session.model),
             })
-          : isStandardExtensionSession && session.id && effectiveWorkspacePath
+          : isStandardToolLoopSession && session.id && effectiveWorkspacePath
             ? buildDevAgentSystemPrompt({
                 provider: session.provider,
                 model: session.model ?? undefined,
-                modelDisplayName: resolveExtensionModelDisplayName(session.provider, session.model),
+                modelDisplayName: resolveToolLoopModelDisplayName(session.provider, session.model),
               })
             : undefined;
 
-      for await (const chunk of provider.sendMessage(messageToSend, contextWithSession, session.id, sessionMessages, effectiveWorkspacePath, attachments, extensionAgentTools, extensionAgentSystemPrompt)) {
+      for await (const chunk of provider.sendMessage(messageToSend, contextWithSession, session.id, sessionMessages, effectiveWorkspacePath, attachments, toolLoopTools, toolLoopSystemPrompt)) {
         if (!chunk) continue;
         chunkCount++;
 
@@ -1767,6 +1898,15 @@ export class MessageStreamingHandler {
             if (chunk.toolCall) {
               toolCallCount++;
               toolCalls.push(chunk.toolCall);
+
+              // The agent announced this call and the turn ended without it
+              // ever settling (CodexAppServerProtocol.sweepOrphanedMcpCalls).
+              // The agent believes it is still pending and will not retry, so
+              // an update_session_meta dropped this way would silently lose the
+              // name/tags/phase it asked for. Re-apply it here.
+              if ((chunk.toolCall as { orphaned?: boolean }).orphaned) {
+                void repairOrphanedSessionMetaCall(chunk.toolCall, session.id);
+              }
               if (lastTextSection.trim()) prevTextSection = lastTextSection.trim();
               lastTextSection = '';  // Reset so notification shows text after last tool call
               console.groupEnd();
@@ -1858,6 +1998,10 @@ export class MessageStreamingHandler {
                     }
                   }
 
+                  // Recorded after worktree adoption above so the entry attaches
+                  // to the repository the command actually targeted.
+                  await recordGitActivity(chunk.toolCall, effectiveWorkspacePath);
+
                   await sessionFileTracker.trackToolExecution(
                     session.id,
                     effectiveWorkspacePath,
@@ -1868,18 +2012,17 @@ export class MessageStreamingHandler {
                     window  // Pass window to enable file watcher attachment for edited files
                   );
 
-                  // Create pre-edit tags for OpenCode file-editing tools.
-                  // OpenCode emits tool_call with status='running' BEFORE the file is modified,
-                  // so we can snapshot the current disk content as the before-state.
-                  // Tool names: edit, write, create (with filePath in arguments)
-                  // Codex ACP emits the same shape via writeTextFile pre-edit hooks plus
-                  // session/tool_call events for Edit/Write tools. The tool name list is
-                  // kept separate per provider to avoid cross-talk if vocabularies diverge.
-                  const OPENCODE_EDIT_TOOLS = ['edit', 'write', 'create'];
-                  const CODEX_ACP_EDIT_TOOLS = ['Edit', 'Write', 'ApplyPatch', 'edit', 'write', 'apply_patch'];
-                  const isOpenCodeEdit = OPENCODE_EDIT_TOOLS.includes(trackToolName) && session.provider === 'opencode';
-                  const isCodexAcpEdit = CODEX_ACP_EDIT_TOOLS.includes(trackToolName) && session.provider === 'openai-codex-acp';
-                  if (isOpenCodeEdit || isCodexAcpEdit) {
+                  // Create pre-edit tags for providers whose file-editing tools
+                  // are announced before the write lands. OpenCode emits
+                  // tool_call with status='running' BEFORE the file is
+                  // modified, so we can snapshot the current disk content as
+                  // the before-state; Codex ACP emits the same shape via
+                  // writeTextFile pre-edit hooks plus session/tool_call events.
+                  // Tool vocabularies are per-provider (see
+                  // PROVIDER_EDIT_TOOL_NAMES) so they cannot cross-talk.
+                  const isProviderEdit = isProviderEditTool(session.provider, trackToolName);
+                  const isCodexAcpEdit = isProviderEdit && session.provider === 'openai-codex-acp';
+                  if (isProviderEdit) {
                     const editFilePath = extractFilePath(trackArgs);
                     const watcherEntry = this.svc.hooklessWatcher.getEntry(session.id);
                     // Only create the pre-edit tag for paths inside the workspace —
@@ -2115,6 +2258,15 @@ export class MessageStreamingHandler {
             }
             break;
 
+          // A tool call this turn already saw as `tool_call` has finished. It is
+          // a completion signal, not a second call -- the only thing that acts on
+          // it is the Git journal, whose entry would otherwise show as running
+          // for the rest of the turn and then settle as `interrupted` even when
+          // the command succeeded.
+          case 'tool_result':
+            await recordGitActivity(chunk.toolCall, effectiveWorkspacePath);
+            break;
+
           case 'tool_error':
             if (chunk.toolError) {
               logger.ai.warn('[AIService] Tool error reported', {
@@ -2229,6 +2381,7 @@ export class MessageStreamingHandler {
             // Detect Bedrock tool search error even if runtime didn't flag it
             const errorMsg = chunk.error || 'Unknown error occurred';
             providerError = errorMsg;
+            if (chunk.isProcessCrash) providerCrashed = true;
             const isBedrockToolError = chunk.isBedrockToolError || isBedrockToolSearchError(errorMsg);
             const isServerError = chunk.isServerError || false;
 
@@ -2241,23 +2394,22 @@ export class MessageStreamingHandler {
               isCodexAuthRequired: chunk.isCodexAuthRequired || false,
             });
 
-            // An in-band 'error' chunk from an extension agent (the gemini
-            // backend's only failure-settle path) does NOT throw, so the outer
-            // catch never runs and the session would never move off 'running'.
-            // Without a terminal transition no session:error fires, a spawned
-            // child stays 'running' forever and a meta-agent waits on it
-            // indefinitely while it holds a spawn-cap slot. Settle it here,
-            // mirroring the outer catch. Scoped to extension agents; built-in
-            // providers throw or settle via their SDK terminal handling.
-            // Only DIRECT (non-queued) extension-agent sessions need settling
-            // here. A queued meta-agent child is already settled by the
-            // queued-prompt chain (onChainSettled -> endSession); adding our own
-            // terminal transition on top would emit a second, contradictory
-            // notification to the parent. A direct gemini chat that errors
-            // in-band has no other settle path (its only failure signal is this
-            // non-throwing error chunk), so without this it stays 'running'.
+            // An in-band 'error' chunk from a tool-loop agent (Gemini's only
+            // failure-settle path) does NOT throw, so the outer catch never runs
+            // and the session would never move off 'running'. Without a terminal
+            // transition no session:error fires, a spawned child stays 'running'
+            // forever and a meta-agent waits on it indefinitely while it holds a
+            // spawn-cap slot. Settle it here, mirroring the outer catch. Scoped
+            // to tool-loop agents; MCP-discovering providers throw or settle via
+            // their SDK terminal handling.
+            // Only DIRECT (non-queued) sessions need settling here. A queued
+            // meta-agent child is already settled by the queued-prompt chain
+            // (onChainSettled -> endSession); adding our own terminal transition
+            // on top would emit a second, contradictory notification to the
+            // parent. A direct Gemini chat that errors in-band has no other
+            // settle path, so without this it stays 'running'.
             if (
-              isExtensionAgentSession
+              isToolLoopSession
               && session?.id
               && !this.svc.sessionsProcessingQueue.has(session.id)
             ) {
@@ -2267,7 +2419,7 @@ export class MessageStreamingHandler {
                 await this.svc.hooklessWatcher.stopForSession(session.id);
                 settledOnErrorChunk = true;
               } catch (settleErr) {
-                logger.main.error('[AIService] Failed to settle extension-agent error chunk:', settleErr);
+                logger.main.error('[AIService] Failed to settle tool-loop agent error chunk:', settleErr);
               }
             }
             break;
@@ -2384,7 +2536,12 @@ export class MessageStreamingHandler {
                 outputTokens: currentUsage.outputTokens + newOutputTokens,
                 totalTokens: currentUsage.totalTokens + newInputTokens + newOutputTokens,
                 costUSD: (currentUsage.costUSD || 0) + newCostUSD,
-                contextWindow: contextWindowForDisplay,
+                // Both figures go, not just the fill. The meter falls back to
+                // cumulative `totalTokens` over whatever denominator survives,
+                // so clearing the fill alone turns a stale 90% into a confident
+                // 600%. With no denominator it reports plain token totals and
+                // claims nothing about context until a turn measures it.
+                contextWindow: contextCompacted ? undefined : contextWindowForDisplay,
                 // contextFillTokens = input + cacheRead + cacheCreation from last assistant message
                 // This is the actual context fill, not cumulative - updates correctly after compaction
                 // After compaction, clear stale currentContext (next real turn will set accurate value)
@@ -2434,13 +2591,19 @@ export class MessageStreamingHandler {
               const newOutputTokens = tokenUsage.output_tokens || 0;
               const newTotalTokens = newInputTokens + newOutputTokens;
               const isCodexProvider = session.provider === 'openai-codex';
+              const reportsCurrentContext = agentCapabilitiesForProviderType(
+                session.provider,
+              ).contextReporting === 'context-window';
               const codexInitData = isCodexProvider ? (provider as any).getInitData?.() : null;
               const isResumedCodexThread = codexInitData?.isResumedThread === true;
 
-              const codexContextWindow =
-                isCodexProvider
-                  ? (contextWindowFromChunk || currentUsage.contextWindow)
-                  : currentUsage.contextWindow;
+              // #914: only providers measured to report both a live fill and
+              // denominator may populate currentContext. A catalog window by
+              // itself cannot turn cumulative token spend into a percentage.
+              const reportedContextWindow = reportsCurrentContext
+                ? (contextWindowFromChunk || selectedModelContextWindow || currentUsage.contextWindow)
+                : undefined;
+              const storedContextWindow = reportedContextWindow || currentUsage.contextWindow;
 
               // Codex SDK turn.completed usage is cumulative for the provider thread.
               // Convert to per-session deltas using the last seen cumulative snapshot.
@@ -2495,11 +2658,20 @@ export class MessageStreamingHandler {
                   providerCumulativeInputTokens,
                   providerCumulativeOutputTokens,
                 } : {}),
-                contextWindow: codexContextWindow,
-                currentContext:
-                  isCodexProvider && !contextCompacted
-                    ? (contextFillTokens !== undefined && codexContextWindow
-                      ? { tokens: contextFillTokens, contextWindow: codexContextWindow }
+                // A compaction just replaced the conversation with a summary, so
+                // every fill figure in hand describes context that no longer
+                // exists -- including the one this chunk reports, which is read
+                // off the last assistant message from before the boundary. The
+                // denominator goes with it: the meter otherwise falls back to
+                // cumulative spend over the window and reports a confident,
+                // wrong percentage. Report nothing until a turn measures the new
+                // context. Codex and OpenCode reach this branch.
+                contextWindow: contextCompacted ? undefined : storedContextWindow,
+                currentContext: contextCompacted
+                  ? undefined
+                  : reportsCurrentContext
+                    ? (contextFillTokens !== undefined && reportedContextWindow
+                      ? { tokens: contextFillTokens, contextWindow: reportedContextWindow }
                       : currentUsage.currentContext)
                     : currentUsage.currentContext,
               };
@@ -2512,8 +2684,8 @@ export class MessageStreamingHandler {
                 tokenUsage: updatedUsage
               });
 
-              // Push context usage to mobile sync for Codex sessions
-              if (isCodexProvider && contextFillTokens !== undefined && codexContextWindow) {
+              // Push measured context usage to mobile sync.
+              if (reportsCurrentContext && contextFillTokens !== undefined && reportedContextWindow) {
                 const syncProvider = getSyncProvider();
                 if (syncProvider) {
                   syncProvider.pushChange(session.id, {
@@ -2521,7 +2693,7 @@ export class MessageStreamingHandler {
                     metadata: {
                       currentContext: {
                         tokens: contextFillTokens,
-                        contextWindow: codexContextWindow,
+                        contextWindow: reportedContextWindow,
                       },
                     } as any,
                   });
@@ -2718,6 +2890,7 @@ export class MessageStreamingHandler {
               await notificationService.showNotification({
                 title: composeNotificationTitle(sessionLabel, 'Response Ready'),
                 body: notificationBody,
+                kind: 'agent-complete',
                 sessionId: session.id,
                 workspacePath: workspacePath,
                 sourceLabel: sessionLabel,
@@ -2730,10 +2903,11 @@ export class MessageStreamingHandler {
               // the Electron notification above already covers it -- sending a mobile push
               // too causes duplicates via iPhone Mirroring / Continuity.
               if (syncProvider && isDesktopTrulyAway()) {
-                syncProvider.requestMobilePush?.(
+                void requestMobilePush(
                   session.id,
                   session.title || 'AI Session',
-                  notificationBody
+                  notificationBody,
+                  { reason: 'session_complete' }
                 );
               }
 
@@ -2788,11 +2962,22 @@ export class MessageStreamingHandler {
                 }
               }
 
-              // AUTO-FETCH CONTEXT USAGE: Previously used /context command to get token usage.
-              // Now context window data comes from modelUsage in the result chunk (set above),
-              // so /context is no longer needed. The SDK's /context command no longer returns
-              // parseable output as of agent-sdk 0.2.x.
-              // Kept as commented code for reference in case /context is restored in a future SDK version.
+              // AUTO-FETCH CONTEXT USAGE: disabled. Context window data comes
+              // from modelUsage in the result chunk (set above) instead.
+              //
+              // The original reason for disabling this -- "/context no longer
+              // returns parseable output as of agent-sdk 0.2.x" -- no longer
+              // holds. On 0.3.241 /context returns both a parseable markdown
+              // table and a structured `context_usage` field, and
+              // runAutoContextCommand already prefers the structured one. It is
+              // also a local command: measured at ~640ms, 0ms API time, 0 turns,
+              // no token cost.
+              //
+              // So re-enabling is a live option, not a blocked one. What it buys
+              // over modelUsage: exact token counts (the markdown path rounded to
+              // three significant figures) and a per-category breakdown. What it
+              // costs: that ~640ms on the end of every turn. Left off pending
+              // that call.
               // if (session.provider === 'claude-code' && !hadError) {
               //   autoContextPromise = this.svc.runAutoContextCommand(session, effectiveWorkspacePath, event);
               // }
@@ -2823,6 +3008,16 @@ export class MessageStreamingHandler {
         }
       }
 
+      // A Gemini turn ran, so the Antigravity language server is up. Wake the
+      // usage poller, which deliberately never starts the server itself and so
+      // otherwise shows a muted chip forever. Fire-and-forget: a usage refresh
+      // must never delay or fail a turn.
+      if (session?.provider === 'antigravity-gemini-agent') {
+        void geminiUsageService.recordActivity().catch(() => {
+          /* usage display only */
+        });
+      }
+
       // A built-in provider can yield an in-band 'error' chunk and then return
       // normally instead of throwing (the Codex app-server transport catches
       // RPC failures this way). That reaches neither the 'complete' branch nor
@@ -2834,9 +3029,12 @@ export class MessageStreamingHandler {
         providerError,
         alreadySettled: settledOnErrorChunk,
         queuedChainActive: this.svc.sessionsProcessingQueue.has(session.id),
+        providerCrashed,
       })) {
         logger.main.warn(
-          `[AIService] Provider stream for ${session.id} ended on an error chunk without completing -- settling session`
+          providerCrashed
+            ? `[AIService] Provider subprocess for ${session.id} crashed -- settling session as errored`
+            : `[AIService] Provider stream for ${session.id} ended on an error chunk without completing -- settling session`
         );
         try {
           await stateManager.updateActivity({ sessionId: session.id, status: 'error' });
@@ -2971,14 +3169,16 @@ export class MessageStreamingHandler {
             metadata: { isExecuting: false, hasPendingPrompt: false, updatedAt: Date.now() },
           });
 
-          // Request mobile push notification for agent error (only when truly away)
-          if (isDesktopTrulyAway()) {
-            syncProvider.requestMobilePush?.(
-              session.id,
-              session.title || 'AI Session',
-              'Error occurred'
-            );
-          }
+          // Forced (#1268): a session that died unattended is exactly when the
+          // user needs to hear about it, so the server -- not this process --
+          // decides whether the desktop counts as present. Gating on
+          // isDesktopTrulyAway() here would stop `force` ever being sent.
+          void requestMobilePush(
+            session.id,
+            session.title || 'AI Session',
+            'Error occurred',
+            { force: true, reason: 'agent_error' }
+          );
         }
       }
 
@@ -3004,6 +3204,20 @@ export class MessageStreamingHandler {
       }
 
       throw error;
+    } finally {
+      // First, and outside anything that can throw: a session that keeps
+      // reporting itself alive after its turn died is worse than the bug this
+      // ticker fixes, because nothing downstream will ever correct it. The
+      // parked-generator case reaches neither exit and is covered by the
+      // ticker's own expiry.
+      stopTurnLiveness();
+
+      // A cancelled turn or a provider that disconnected mid-command never sends
+      // the completion, so anything still open here will never settle on its
+      // own. In a `finally` so both exits terminalize the journal. A turn whose
+      // provider generator parks and never resumes reaches neither; that case is
+      // covered by the session-level sweep in `GitOperationLogService`.
+      await gitActivityBridge.interruptOutstanding();
     }
   };
 

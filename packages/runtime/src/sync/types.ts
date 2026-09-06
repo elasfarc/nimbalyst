@@ -5,8 +5,31 @@
  * It's designed to be completely optional - the app works without it.
  */
 
+import type { FleetActivitySnapshot, PushRejectionCause, SkipReason } from '@nimbalyst/collab-protocol';
+
 import type { AgentMessage } from '../ai/server/types';
+import type { PersonalJwt, PersonalMemberId } from '../auth/jwtScopes';
 import type { SyncedReadReceipt } from '../readReceipts/readReceipts';
+
+/** Caller-side knobs for {@link SyncProvider.requestMobilePush}. */
+export interface MobilePushOptions {
+  /**
+   * Explicit user-authorized attention request. Bypasses the server's presence
+   * suppression so the notification lands even when the user is at a desktop.
+   */
+  force?: boolean;
+  /** Short machine-readable cause, e.g. 'agent_error'. Recorded server-side. */
+  reason?: string;
+}
+
+/** The server's acknowledgement of a push request. */
+export interface MobilePushResult {
+  accepted: boolean;
+  attemptedCount: number;
+  deliveredCount: number;
+  skipped: Array<{ deviceId: string; reason: SkipReason }>;
+  rejection?: PushRejectionCause;
+}
 
 export interface SyncConfig {
   /** WebSocket server URL (e.g., ws://localhost:8787 or wss://sync.nimbalyst.com) */
@@ -17,7 +40,7 @@ export interface SyncConfig {
    * Called before each WebSocket connection to ensure the JWT isn't expired.
    * JWTs typically expire in ~5 minutes, so this must return a fresh one.
    */
-  getJwt: () => Promise<string>;
+  getJwt: () => Promise<PersonalJwt>;
 
   /** B2B organization ID for org-scoped room IDs. */
   orgId: string;
@@ -29,7 +52,7 @@ export interface SyncConfig {
    * but sync room IDs must use the personal org member ID to stay consistent
    * across devices. If provided, this takes precedence over extracting from JWT.
    */
-  userId?: string;
+  personalMemberId: PersonalMemberId;
 
   /** Optional encryption key for E2E encryption */
   encryptionKey?: CryptoKey;
@@ -64,7 +87,7 @@ export interface DeviceInfo {
   /** Human-readable device name (e.g., "MacBook Pro", "iPhone 15") */
   name: string;
   /** Device type for icon display */
-  type: 'desktop' | 'mobile' | 'tablet' | 'unknown';
+  type: 'desktop' | 'mobile' | 'tablet' | 'headless' | 'unknown';
   /** Platform (e.g., "macos", "ios", "windows", "android", "web") */
   platform: string;
   /** App version */
@@ -115,7 +138,7 @@ export interface SyncProvider {
   isConnected(sessionId: string): boolean;
 
   /**
-   * Returns true when the provider has latched a JWT/userId mismatch
+   * Returns true when the provider has latched a JWT/personal-member mismatch
    * (server-rejected, locally refused). Callers in hot paths (e.g.
    * MessageSyncHandler running on every agent message) should consult
    * this before attempting connect() to avoid log floods and CPU spin.
@@ -170,6 +193,7 @@ export interface SyncProvider {
       sessionType?: string;
       parentSessionId?: string;
       worktreeId?: string;
+      hostDeviceId?: string;
       isArchived?: boolean;
       isPinned?: boolean;
       messageCount: number;
@@ -200,6 +224,8 @@ export interface SyncProvider {
   /** Subscribe to index changes (session updates broadcast to all connected clients) */
   onIndexChange?(callback: (sessionId: string, entry: {
     sessionId: string;
+    /** Stable device ID of the host that owns this session. */
+    hostDeviceId?: string;
     title?: string;
     provider?: string;
     model?: string;
@@ -240,6 +266,8 @@ export interface SyncProvider {
    * Note: Returns decrypted values - title is always present after decryption */
   getCachedIndexEntry?(sessionId: string): {
     sessionId: string;
+    /** Stable device ID of the host that owns this session. */
+    hostDeviceId?: string;
     projectId: string;
     /** Decrypted title (always present in cache) */
     title: string;
@@ -309,13 +337,40 @@ export interface SyncProvider {
 
   /**
    * Request the sync server to send a push notification to mobile devices.
-   * Used when agent completes execution and user should be notified on mobile.
-   * The server will check device presence before sending (suppresses if mobile is active).
+   *
+   * The server decides who to notify: routine requests are suppressed when the
+   * user is demonstrably at a connected desktop, while `force` marks an explicit
+   * attention alert that bypasses that suppression (subject to a server-side
+   * rate limit). Do not gate a forced call site on local presence -- the whole
+   * point of `force` is that the server makes the call.
+   *
+   * Resolves with the server's acknowledgement, or with `rejection: 'no_ack'`
+   * if none arrives. Callers that don't care may ignore the result.
    */
-  requestMobilePush?(sessionId: string, title: string, body: string): Promise<void>;
+  requestMobilePush?(
+    sessionId: string,
+    title: string,
+    body: string,
+    options?: MobilePushOptions
+  ): Promise<MobilePushResult>;
+
+  /**
+   * Push the ambient fleet snapshot to the user's Live Activity.
+   *
+   * Fire-and-forget by design, and unlike `requestMobilePush` it is not
+   * acknowledged: this lane is ambient, it carries no alert, and the phone's own
+   * stale date is what covers a desktop that has stopped sending. Callers must
+   * coalesce -- see `FleetActivityPublisher`. Sending one of these per streaming
+   * tick would get the activity silently throttled by ActivityKit, which looks
+   * identical to the feature being broken.
+   */
+  sendFleetActivity?(activity: FleetActivitySnapshot, shownOnDesktop?: boolean): Promise<void>;
 
   /** Get list of currently connected devices */
   getConnectedDevices?(): DeviceInfo[];
+
+  /** Get this provider's current device identity for routing and attribution. */
+  getLocalDeviceInfo?(): DeviceInfo | undefined;
 
   /** Subscribe to device status changes (devices joining/leaving) */
   onDeviceStatusChange?(callback: (devices: DeviceInfo[]) => void): () => void;
@@ -405,6 +460,8 @@ export interface SessionIndexData {
   parentSessionId?: string;
   /** Worktree ID for git worktree association */
   worktreeId?: string;
+  /** Stable device ID of the host that owns this session. */
+  hostDeviceId?: string;
   /** Agent role marker (e.g. 'meta-agent', 'standard'); drives mobile meta-agent grouping. */
   agentRole?: string;
   /** Meta-agent parent session ID for spawned children; drives mobile meta-agent grouping. */
@@ -532,6 +589,8 @@ export interface SyncedSessionMetadata {
   parentSessionId?: string;
   /** Worktree association (mirrored from ai_sessions.worktree_id). */
   worktreeId?: string;
+  /** Stable device ID of the host that owns this session. */
+  hostDeviceId?: string;
   /** Agent role marker (e.g. 'meta-agent', 'standard'); drives mobile meta-agent grouping. */
   agentRole?: string;
   /** Meta-agent parent session ID for spawned children; drives mobile meta-agent grouping. */
@@ -600,6 +659,8 @@ export interface SessionIndexEntry {
   parentSessionId?: string;
   /** Worktree ID for git worktree association */
   worktreeId?: string;
+  /** Stable device ID of the host that owns this session. */
+  hostDeviceId?: string;
   /** Agent role marker (e.g. 'meta-agent', 'standard'); drives mobile meta-agent grouping. */
   agentRole?: string;
   /** Meta-agent parent session ID for spawned children; drives mobile meta-agent grouping. */
@@ -700,6 +761,8 @@ export interface CreateSessionRequest {
   model?: string;
   /** Agent role (e.g., "meta-agent", "standard"). Falls back to "standard" if omitted. */
   agentRole?: string;
+  /** Execute on this host only. Absent preserves legacy untargeted routing. */
+  targetDeviceId?: string;
   /** Timestamp when request was created */
   timestamp: number;
 }
@@ -763,6 +826,8 @@ export interface CreateWorktreeRequest {
   requestId: string;
   /** Project/workspace ID to create the worktree in */
   projectId: string;
+  /** Execute on this host only. Absent preserves legacy untargeted routing. */
+  targetDeviceId?: string;
   /** Timestamp when request was created */
   timestamp: number;
 }
@@ -801,6 +866,10 @@ export interface SessionControlMessage {
   timestamp: number;
   /** Device that sent the message */
   sentBy: 'desktop' | 'mobile';
+  /** Stable ID of the sending device. Absent on legacy clients. */
+  sentByDeviceId?: string;
+  /** Deliver to this device only. Absent preserves legacy broadcast routing. */
+  targetDeviceId?: string;
 }
 
 /**

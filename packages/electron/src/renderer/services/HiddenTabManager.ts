@@ -27,9 +27,11 @@ import {
 } from '@nimbalyst/runtime';
 import { store } from '@nimbalyst/runtime/store';
 import { DocumentModelRegistry } from './document-model/DocumentModelRegistry';
+import type { DocumentModel } from './document-model/DocumentModel';
 import type { DocumentModelEditorHandle } from './document-model/types';
 import { fileDeletedAtomFamily } from '../store/atoms/fileWatch';
 import { assertFileSaveSucceeded } from '../utils/fileSaveResult';
+import { createProjectFileSystemHost } from './projectFileSystemHost';
 
 const LOG_PREFIX = '[HiddenTabManager]';
 const TTL_MS = 30_000; // 30 seconds after last release before cleanup
@@ -221,7 +223,7 @@ class HiddenTabManager {
     this.hiddenContainer!.appendChild(container);
 
     // Acquire a DocumentModel handle for coordinated save/dirty tracking
-    const { handle: documentModelHandle } = DocumentModelRegistry.getOrCreate(filePath, {
+    const { model: documentModel, handle: documentModelHandle } = DocumentModelRegistry.getOrCreate(filePath, {
       autosaveInterval: 0, // Hidden editors save immediately on dirty (100ms debounce)
     });
 
@@ -230,9 +232,10 @@ class HiddenTabManager {
     const host = this.createEditorHost(
       filePath,
       workspacePath,
-      editorInfo.extensionId,
+      documentModel,
       documentModelHandle,
       editorAPIOwnerToken,
+      editorInfo.extensionId,
     );
 
     // Create React root and mount
@@ -342,9 +345,10 @@ class HiddenTabManager {
   private createEditorHost(
     filePath: string,
     workspacePath: string,
-    extensionId: string,
+    documentModel: DocumentModel,
     documentModelHandle: DocumentModelEditorHandle | null | undefined,
     editorAPIOwnerToken: EditorAPIOwnerToken,
+    extensionId: string,
   ): EditorHost {
     const fileName = filePath.split('/').pop() || filePath;
     const electronAPI = (window as any).electronAPI;
@@ -469,6 +473,16 @@ class HiddenTabManager {
         const content = result.content || '';
         // Establish the conflict baseline for this hidden editor.
         lastKnownContent = content;
+        // ...and the shared model's, from the same read. This is the hidden
+        // editor's half of the production hydration seam (NIM-5359, defect H):
+        // the manager takes a registry handle before anything has read a byte,
+        // so without this the shared model has no baseline at all. It does NOT
+        // make the hidden editor a diff presenter -- it never registers a diff
+        // callback, so a pending generation parks in `awaiting-presenter` for a
+        // real editor rather than waiting on an acknowledgement that has no
+        // surface to come from. A lookup failure must not fail the load; the
+        // model logs and retries on its own timer.
+        await documentModel.ensureInitialized(content).catch(() => {});
         return content;
       },
 
@@ -554,6 +568,21 @@ class HiddenTabManager {
       setEditorContext(): void {
         // Hidden editors don't push context to chat
       },
+
+      /*
+       * Sibling-file reads, the same surface a visible tab gets.
+       *
+       * Without this an editor whose document references files next to it --
+       * an animation's `htmlFile` partials, a mockup's assets -- renders those
+       * regions as nothing here while looking correct in a tab, so a screenshot
+       * taken to check the work quietly disagrees with the work. Nothing about
+       * the offscreen path made `fs` impossible; it was simply never wired.
+       */
+      fs: createProjectFileSystemHost({
+        // Nothing on screen to refresh: this host exists to render once.
+        onAfterWrite: async () => {},
+      }),
+
       setEditorContextItems(): void {
         // Hidden editors don't push context to chat
       },

@@ -78,6 +78,10 @@ import type {
   ProviderCapabilities,
   StreamChunk,
 } from '@nimbalyst/runtime/ai/server/types';
+import {
+  NO_AGENT_CAPABILITIES,
+  type AgentCapabilities,
+} from '@nimbalyst/runtime/ai/server/agentCapabilities';
 import { logger } from '../utils/logger';
 import {
   getAgentProviderRegistry,
@@ -87,7 +91,6 @@ import {
   getPrivilegedExtensionHost,
   type ModuleHandle,
 } from './PrivilegedExtensionHost';
-import { geminiUsageService } from '../services/GeminiUsageService';
 import { toBackendHistory } from './extensionAgentHistory';
 
 // ---------------------------------------------------------------------------
@@ -419,15 +422,7 @@ const bridge: ExtensionAgentBridge = {
 
       stream.onChunk(push);
       stream.done.then(
-        () => {
-          finish(null);
-          // A turn finished, so the Antigravity language server is up: wake the
-          // Gemini usage poller to replace the muted "module not running" chip
-          // with real quota. Fire-and-forget; never blocks the turn.
-          if (entry.extensionId === 'gemini-antigravity') {
-            void geminiUsageService.recordActivity();
-          }
-        },
+        () => finish(null),
         (err) => finish(err instanceof Error ? err : new Error(String(err)))
       );
 
@@ -568,6 +563,26 @@ const bridge: ExtensionAgentBridge = {
       edits: true,
       resumeSession: c.supportsResume ?? false,
       supportsFileTools: true,
+    };
+  },
+
+  getAgentCapabilities(args): AgentCapabilities {
+    // Also static manifest data. An extension that declares nothing gets
+    // NO_AGENT_CAPABILITIES: we cannot inspect a third-party agent to find out
+    // whether it interprets `/compact`, and guessing "probably yes" is exactly
+    // the permissive default that made #1251-#1254 invisible. Opting in is one
+    // manifest field.
+    const entry = getAgentProviderRegistry().get(args.extensionId, args.contributionId);
+    if (!entry) {
+      return NO_AGENT_CAPABILITIES;
+    }
+    const c = entry.contribution;
+    return {
+      slashCommands: c.supportsSlashCommands ?? false,
+      skills: c.supportsSkills ?? false,
+      compaction: c.compaction ?? 'unsupported',
+      // Extension manifests do not declare a measured usage protocol yet.
+      contextReporting: 'none',
     };
   },
 };

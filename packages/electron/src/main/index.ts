@@ -1,14 +1,16 @@
-import { app, BrowserWindow, dialog, nativeImage, nativeTheme, session } from 'electron';
+import { app, BrowserWindow, dialog, nativeImage, nativeTheme, session, shell } from 'electron';
 import {
     parseTrackerDeepLink,
     type TrackerDeepLinkTarget,
     type TrackerDeepLinkView,
 } from '../shared/trackerDeepLinks';
 import { parseInviteDeepLink, type InviteDeepLinkTarget } from '../shared/inviteDeepLinks';
+import { resolveOrgMessagingDestination } from '../shared/orgMessagingRouting';
 import { safeHandle, safeOn } from './utils/ipcRegistry';
 import { installMicrophoneGate } from './mediaPermissionGate';
 import { markBootComplete } from './utils/bootState';
 import { markStart, markEnd, checkpoint, logSummary } from './utils/startupTiming';
+import { resolveSpellCheckerLanguages } from './utils/spellcheckLanguages';
 import type { SessionStore } from '@nimbalyst/runtime';
 import * as os from 'os';
 import * as path from 'path';
@@ -23,10 +25,13 @@ import {
     findWindowByWorkspace,
     getMostRecentlyFocusedWorkspaceWindow,
 } from './window/WindowManager';
+import { beginStartupActivation, finishStartupWindowCreation } from './window/StartupActivation';
 import { loadFileIntoWindow } from './file/FileOperations';
 import { createApplicationMenu } from './menu/ApplicationMenu';
 import { updateNativeTheme, updateWindowTitleBars } from './theme/ThemeManager';
 import { restoreSessionState, saveSessionState } from './session/SessionState';
+import { setSafeModeSessionStateProtection } from './session/safeModeSessionState';
+import { isSafeModeArgument } from './session/startupSafeMode';
 import { getRestartSignalPath } from './utils/appPaths';
 import { planProtocolRegistration } from './utils/protocolRegistration';
 import {
@@ -34,7 +39,10 @@ import {
     type AppAction,
 } from './utils/appActionLinks';
 import { createWorkspaceManagerWindow, setupWorkspaceManagerHandlers, wasWorkspaceManagerManuallyClosed } from './window/WorkspaceManagerWindow.ts';
-import { setupTeamManagementHandlers } from './window/TeamManagementWindow';
+import { createTeamManagementWindow, setupTeamManagementHandlers } from './window/TeamManagementWindow';
+import { setupTrayPanelHandlers } from './window/TrayPanelWindow';
+import { setupMenuBarIslandHandlers } from './window/MenuBarIslandWindow';
+import { applyDockIcon } from './utils/dockIcon';
 import {
     createControllerPopover,
     toggleControllerPopover,
@@ -56,6 +64,7 @@ import { registerAttachmentHandlers } from './ipc/AttachmentHandlers';
 import { registerThemeHandlers } from './ipc/ThemeHandlers';
 import { registerWorkspaceWatcherHandlers } from './file/WorkspaceWatcher';
 import { setupSessionFileHandlers } from './ipc/SessionFileHandlers';
+import { setupCanvasRevisionProvenanceHandlers } from './ipc/CanvasRevisionProvenanceHandlers';
 import { registerSlashCommandHandlers } from './ipc/SlashCommandHandlers';
 import { registerActionPromptHandlers } from './ipc/ActionPromptHandlers';
 import { registerClaudeCodeHandlers } from './ipc/ClaudeCodeHandlers';
@@ -70,6 +79,7 @@ import { registerMultiProjectRailHandlers } from './ipc/MultiProjectRailHandlers
 import { registerUsageAnalyticsHandlers } from './ipc/UsageAnalyticsHandlers';
 import { registerWorktreeHandlers } from './ipc/WorktreeHandlers';
 import { registerPullRequestHandlers, stopPullRequestPollScheduler } from './ipc/PullRequestHandlers';
+import { registerGithubIssueHandlers } from './ipc/GithubIssueHandlers';
 import { registerReadReceiptHandlers } from './ipc/ReadReceiptHandlers';
 import { registerTrackerPersonalStateHandlers } from './ipc/TrackerPersonalStateHandlers';
 import {
@@ -77,9 +87,17 @@ import {
     shutdownTeamInboxHandlers,
 } from './ipc/TeamInboxHandlers';
 import {
+    startAgentMentionDispatchService,
+    shutdownAgentMentionDispatchService,
+} from './services/AgentMentionDispatchService';
+import {
     registerConversationHandlers,
     shutdownConversationHandlers,
 } from './ipc/ConversationHandlers';
+import {
+    registerFeedbackRequestHandlers,
+    shutdownFeedbackRequestHandlers,
+} from './ipc/FeedbackRequestHandlers';
 import { registerOrgSettingsHandlers } from './ipc/OrgSettingsHandlers';
 import { registerWakeupHandlers } from './ipc/WakeupHandlers';
 import { registerBlitzHandlers } from './ipc/BlitzHandlers';
@@ -112,8 +130,12 @@ import {
     getAppSetting,
     getClaudeCodeSettings,
     getAttachmentStagingConfig,
+    getOpenCodeModelCatalogCache,
+    getAiSettingsStore,
+    getProviderApiKeyFromSettings,
     isSettingsAgentToolsDisabled,
     isTrackersAgentToolsEnabled,
+    setOpenCodeModelCatalogCache,
     store
 } from './utils/store';
 import { shouldShowFirstLaunchOnboarding } from './utils/firstLaunchOnboarding';
@@ -121,17 +143,20 @@ import { getAIProviderOverridesWithWorktreeFallback } from './utils/aiSettingsMe
 import { registerMCPConfigHandlers } from './ipc/MCPConfigHandlers';
 import { registerMcpSessionStatusHandlers } from './ipc/McpSessionStatusHandlers';
 import { getOpenCodeConfigService, registerOpenCodeConfigHandlers } from './ipc/OpenCodeConfigHandlers';
+import { createOpenCodeModelCatalogCacheKey } from './services/OpenCodeModelCatalogService';
 import { registerClaudeCodePluginHandlers } from './ipc/ClaudeCodePluginHandlers';
 import { registerExportHandlers } from './ipc/ExportHandlers';
 import { registerSemanticSearchHandlers } from './ipc/SemanticSearchHandlers';
 import { SemanticCatalogService } from './services/SemanticCatalogService';
 import { registerShareHandlers } from './ipc/ShareHandlers';
 import { MCPConfigService } from './services/MCPConfigService';
+import { compressImage, shouldCompress } from './services/ImageCompressor';
 import { setMcpConfigServiceGetter } from './mcpConfigServiceRef';
 import { ClaudeCliLauncherConfig } from './services/ai/claudeCliLauncherSingleton';
 import { registerDatabaseBrowserHandlers } from './ipc/DatabaseBrowserHandlers';
 import { registerDatabaseBrowserSqliteHandlers } from './ipc/DatabaseBrowserSqliteHandlers';
 import { registerMigrationHandlers } from './ipc/MigrationHandlers';
+import { registerRecoveryHandlers } from './ipc/RecoveryHandlers';
 import { registerTerminalHandlers, shutdownTerminalHandlers } from './ipc/TerminalHandlers';
 import { AIService } from './services/ai/AIService';
 import { detectFileWorkspace, suggestWorkspaceForFile, getAdditionalDirectoriesForWorkspace } from './utils/workspaceDetection';
@@ -140,7 +165,8 @@ import {
   getExternalAttachmentStagingDirectory,
   resolveWorkspaceAttachmentStagingDirectory,
 } from './services/attachments/attachmentStagingRoot';
-import { cliManager, initEnhancedPath, getEnhancedPath, getShellEnvironment } from './services/CLIManager';
+import { cliManager } from './services/CLIManager';
+import { initEnhancedPath, getEnhancedPath, getShellEnvironment } from './services/shellEnvironment';
 import { registerWorkspaceWindow, registerExtensionTools, shutdownHttpServer, startMcpHttpServer, updateDocumentState, getActiveExtensionShortNames } from './mcp/httpServer';
 import { writeMcpEndpointDescriptor, removeMcpEndpointDescriptor, type EndpointWorkspace } from './mcp/mcpEndpointDescriptor';
 import {
@@ -196,15 +222,35 @@ import { installExtensionAgentBridge } from './extensions/extensionAgentBridge';
 import { getAgentWorkflowService } from './services/AgentWorkflowService';
 import { queueMarketplaceInstallRequest, registerExtensionMarketplaceHandlers, runExtensionAutoUpdate } from './ipc/ExtensionMarketplaceHandlers';
 import { getRegisteredExtensions } from './extensions/RegisteredFileTypes';
-import { ClaudeCodeProvider, OpenAICodexProvider, OpenAICodexACPProvider, OpenCodeProvider, CopilotCLIProvider } from '@nimbalyst/runtime/ai/server';
+import {
+  ClaudeCodeProvider,
+  OpenAICodexProvider,
+  OpenAICodexACPProvider,
+  OpenCodeProvider,
+  CopilotCLIProvider,
+  GrokBuildProvider,
+  CursorAgentProvider,
+  GeminiAntigravityProvider,
+  configureOpenCodeModelCatalog,
+} from '@nimbalyst/runtime/ai/server';
 import { configureMcpServers } from '@nimbalyst/runtime/ai/server';
 import { matchesAllowPattern } from '@nimbalyst/runtime/ai/server/permissions/toolPermissionHelpers';
 import { resolveCodexPreEditHookScriptPath } from './services/ai/codexPreEditHookPath';
+import { createGrokAskUserQuestionHandler } from './services/ai/grokAskUserQuestionHandler';
+import { executeGeminiTool } from './services/ai/geminiToolExecutor';
 import { sessionFileTracker } from './services/SessionFileTracker';
+import {
+  refreshHeadlessAgentAvailability,
+  setHeadlessAgentEnhancedPathLoader,
+} from './services/ai/headlessAgentAvailability';
+import {
+  headlessAgentMcpConfigService,
+  type HeadlessAgentMcpTarget,
+} from './services/HeadlessAgentMcpConfigService';
 import { historyManager } from './HistoryManager';
 import { readFileContentOrNull } from './services/ai/aiServiceUtils';
 import { AISessionsRepository } from '@nimbalyst/runtime/storage/repositories/AISessionsRepository';
-import { isMCPServerEnabledForProvider, MCP_PROVIDER_IDS } from '@nimbalyst/runtime/types/MCPServerConfig';
+import { isMCPServerEnabledForProvider, MCP_PROVIDER_IDS, type MCPProviderId } from '@nimbalyst/runtime/types/MCPServerConfig';
 import type { MCPServerConfig } from '@nimbalyst/runtime/types/MCPServerConfig';
 import { logger, overrideConsole } from './utils/logger';
 import { startPerformanceMonitoring, stopPerformanceMonitoring } from './utils/performanceMonitor';
@@ -217,6 +263,17 @@ import { autoUpdaterService, AutoUpdaterService } from './services/autoUpdater';
 import { initializeDatabase } from './database/initialize';
 import { database, HandledError } from './database/PGLiteDatabaseWorker';
 import { buildDatabaseInitializationErrorProperties } from './database/DatabaseErrorTelemetry';
+import { findRestorableBackups } from './database/sqlite/recoveryArtifacts';
+import {
+    applyDatabaseFailureChoice,
+    buildDatabaseFailureDialog,
+} from './database/databaseFailureDialog';
+import {
+    mayTryAnotherCandidate,
+    reconcileRecoveryOnStartup,
+    restoreFromNamedBackup,
+} from './database/recovery';
+import { resolveDatabaseUserDataPath } from './database/userDataPath';
 import { resolveTrackerDeepLinkId } from './services/tracker/resolveTrackerDeepLinkId';
 import { AnalyticsService } from "./services/analytics/AnalyticsService.ts";
 import { registerAnalyticsHandlers } from "./ipc/AnalyticsHandlers.ts";
@@ -229,8 +286,11 @@ import {
   getPersonalUserId,
   setAuthCallbackSuccessHandler,
 } from './services/StytchAuthService';
+import { requestMobilePush } from './services/ai/mobilePushRequest';
 import { registerTrackerSyncHandlers, initializeTrackerSync } from './services/TrackerSyncManager';
+import { ensureWorkspaceLocalNumbersInBackground } from './services/tracker/ensureWorkspaceLocalNumbers';
 import { initTrackerSchemaService, updateTrackerSchemaWorkspace } from './services/TrackerSchemaService';
+import { registerTrackerLifecycleIpc } from './services/tracker/trackerLifecycleService';
 import { initTrackerNavigationService } from './services/TrackerNavigationService';
 import { initTrackerSavedViewService } from './services/TrackerSavedViewService';
 import {
@@ -241,11 +301,25 @@ import {
   resolveInviteDeepLink,
   type InviteDeepLinkOutcome,
 } from './services/TeamService';
-import { windowStates, windows, resolveActiveWorkspacePath } from './window/windowState';
+import { registerOrgProjectWalkHandlers } from './services/OrgProjectWalkService';
+import {
+    consumePendingOrgFeedbackLink,
+    queuePendingOrgFeedbackLink,
+} from './services/PendingOrgFeedbackLinks';
+import { registerSignInAttributionHandlers } from './services/SignInAttribution';
+import { registerProjectWalkClaimHandlers } from './services/ProjectWalkClaim';
+import {
+    getWindowIdForWindow,
+    resolveActiveWorkspacePath,
+    resolveActiveWorkspacePathForWindowId,
+    windowStates,
+    windows,
+} from './window/windowState';
 import { getRecentItems, isControllerMode } from './utils/store';
 import { registerTeamCustodyHandlers } from './services/TeamCustodyService';
 import { purgeLegacyKeyFiles } from './services/LegacyKeyFilePurge';
 import { registerDocumentSyncHandlers } from './ipc/DocumentSyncHandlers';
+import { registerCollabTestIdentityHandlers } from './ipc/CollabTestIdentityHandlers';
 import { getCollabOutboxDrainCoordinator } from './services/CollabOutboxDrainerService';
 import { getCollabAssetOutboxDrainCoordinator } from './services/CollabAssetOutboxDrainCoordinator';
 import { getCollabAssetStore } from './services/CollabAssetStore';
@@ -261,6 +335,11 @@ import { pathToFileURL } from 'url';
 import { registerLinuxAppImageProtocolHandler } from './services/LinuxProtocolRegistration';
 import { installWindowOpenGuard } from './window/windowOpenGuard';
 import { resolveClaudeConfigDir } from '@nimbalyst/runtime/ai/server/providers/claudeCode/claudeConfigDir';
+import { parseConversationDeepLink } from '../shared/conversationDeepLinks';
+import {
+    FEEDBACK_REQUEST_DEEP_LINK_HOST,
+    parseFeedbackRequestDeepLink,
+} from '../shared/feedbackRequestLinks';
 
 setAuthCallbackSuccessHandler(async () => {
   try {
@@ -325,6 +404,7 @@ let pendingWorkspacePath: string | null = null;
 let pendingFilter: string | null = null;
 // Track pending file to open within workspace (--file flag, requires --workspace)
 let pendingCliFilePath: string | null = null;
+let safeModeRequested = false;
 
 // Session save interval
 let sessionSaveInterval: NodeJS.Timeout | null = null;
@@ -795,7 +875,26 @@ let pendingDeepLinkUrl: string | null = null;
 // Per-workspace queue of shared-document deep links waiting for the renderer
 // to be ready (e.g., a window we just created for the project). Drained via
 // the `deep-link:consume-pending-shared-doc` IPC during listener init.
-const pendingSharedDocLinks = new Map<string, { documentId: string; orgId: string }>();
+const pendingSharedDocLinks = new Map<string, { documentId: string; orgId: string; threadId?: string }>();
+
+/**
+ * A comment notification carries the thread it is about, and nothing else about
+ * where that thread lives. Identity only — no DOM selector, node key, or
+ * coordinate ever goes in a notification URL, because the anchor is resolved by
+ * whichever editor is mounted when the link is followed.
+ */
+const MAX_DEEP_LINK_THREAD_ID_CHARS = 200;
+
+function parseDeepLinkThreadId(parsed: URL): string | undefined {
+    const raw = parsed.searchParams.get('threadId');
+    if (!raw) return undefined;
+    const threadId = raw.trim();
+    if (!threadId || threadId.length > MAX_DEEP_LINK_THREAD_ID_CHARS) return undefined;
+    // Control characters cannot appear in a thread id and are how a crafted
+    // link would smuggle a newline into a log line or a renderer payload.
+    if (/[\u0000-\u001F\u007F]/u.test(threadId)) return undefined;
+    return threadId;
+}
 
 safeHandle('deep-link:consume-pending-shared-doc', (_event, workspacePath: string) => {
     if (!workspacePath) return null;
@@ -803,6 +902,19 @@ safeHandle('deep-link:consume-pending-shared-doc', (_event, workspacePath: strin
     if (!pending) return null;
     pendingSharedDocLinks.delete(workspacePath);
     return { ...pending, workspacePath };
+});
+
+// Project-org feedback requests land in Org mode. Queued by workspace so a
+// renderer still mounting can consume the same target as a live window; see
+// PendingOrgFeedbackLinks for why the sender's own window decides.
+safeHandle('deep-link:consume-pending-org-feedback-request', (event, workspacePath: string) => {
+    // The sender's path is resolved with the same resolver that keyed the
+    // entry in `openFeedbackRequestFromDeepLink`, so the two sides agree on
+    // what "this window's project" means.
+    const senderWorkspacePath = resolveActiveWorkspacePathForWindowId(
+        getWindowIdForWindow(BrowserWindow.fromWebContents(event.sender)),
+    );
+    return consumePendingOrgFeedbackLink(workspacePath, senderWorkspacePath);
 });
 
 // Same pattern for tracker deep links:
@@ -855,11 +967,24 @@ async function openInboxSourceFromDeepLink(rawUrl: string): Promise<boolean> {
         }
         if (parsed.host === 'doc' && orgId) {
             const documentId = decodeURIComponent(parsed.pathname.replace(/^\//, ''));
-            return documentId ? openSharedDocumentFromDeepLink(documentId, orgId) : false;
+            return documentId
+                ? openSharedDocumentFromDeepLink(documentId, orgId, parseDeepLinkThreadId(parsed))
+                : false;
         }
-        // Conversation deep links are already the canonical address, but the
-        // room surface has not landed in the desktop client yet. Returning
-        // false preserves unread state instead of pretending navigation won.
+        if (parsed.host === 'conversation' && orgId) {
+            const conversation = parseConversationDeepLink(rawUrl);
+            createTeamManagementWindow({
+                orgId: conversation.orgId,
+                conversationId: conversation.conversationId,
+            });
+            return true;
+        }
+        if (parsed.host === FEEDBACK_REQUEST_DEEP_LINK_HOST) {
+            const feedback = parseFeedbackRequestDeepLink(rawUrl);
+            return feedback
+                ? openFeedbackRequestFromDeepLink(feedback.requestId, feedback.orgId)
+                : false;
+        }
         return false;
     } catch {
         return false;
@@ -983,7 +1108,7 @@ async function handleDeepLink(url: string): Promise<void> {
                 return;
             }
 
-            await openSharedDocumentFromDeepLink(documentId, orgId);
+            await openSharedDocumentFromDeepLink(documentId, orgId, parseDeepLinkThreadId(parsed));
         } else if (parsed.host === 'folder' || parsed.pathname?.startsWith('/folder/')) {
             // Handle shared folder link: nimbalyst://folder/{folderId}?orgId={orgId}
             const encoded = parsed.host === 'folder'
@@ -1004,6 +1129,16 @@ async function handleDeepLink(url: string): Promise<void> {
             }
 
             await openSharedFolderFromDeepLink(folderId, orgId);
+        } else if (parsed.host === FEEDBACK_REQUEST_DEEP_LINK_HOST) {
+            // nimbalyst://feedback-request/{requestId}?orgId={orgId} — the app
+            // half of the pasteable link, and the console's "Open in Nimbalyst"
+            // hand-off. Lands on the request's Inbox row.
+            const feedback = parseFeedbackRequestDeepLink(url);
+            if (!feedback) {
+                logger.main.warn('[DeepLink] Feedback request link is incomplete:', summarizeDeepLink(url));
+                return;
+            }
+            await openFeedbackRequestFromDeepLink(feedback.requestId, feedback.orgId);
         } else if (parsed.host === 'invite' || parsed.pathname?.startsWith('/invite/')) {
             // Handle team invitation handoff from the web console:
             // nimbalyst://invite/{orgId}?email={email}
@@ -1163,8 +1298,13 @@ async function findWorkspaceForOrgId(orgId: string): Promise<string | null> {
  * Route a shared-document deep link to the renderer holding the matching
  * team workspace. Queues the payload in `pendingSharedDocLinks` so a freshly
  * created window's renderer can drain it on listener init.
+ *
+ * `threadId` is present when the link came from a comment notification. It is
+ * carried verbatim to the renderer, which opens the document's comments panel
+ * on that thread; resolving where the thread is anchored is the mounted
+ * editor's job, never this payload's.
  */
-async function openSharedDocumentFromDeepLink(documentId: string, orgId: string): Promise<boolean> {
+async function openSharedDocumentFromDeepLink(documentId: string, orgId: string, threadId?: string): Promise<boolean> {
     const reason = !isAuthenticated() ? 'not-authenticated' : 'no-workspace';
     const workspacePath = isAuthenticated() ? await findWorkspaceForOrgId(orgId) : null;
 
@@ -1182,7 +1322,7 @@ async function openSharedDocumentFromDeepLink(documentId: string, orgId: string)
     // Queue first; the renderer drains by workspacePath on listener init.
     // For an already-loaded window we also fire the live event below; the
     // renderer treats it as idempotent against the pending queue.
-    pendingSharedDocLinks.set(workspacePath, { documentId, orgId });
+    pendingSharedDocLinks.set(workspacePath, { documentId, orgId, ...(threadId ? { threadId } : {}) });
 
     const existing = findWindowByWorkspace(workspacePath);
     if (existing && !existing.isDestroyed()) {
@@ -1192,6 +1332,7 @@ async function openSharedDocumentFromDeepLink(documentId: string, orgId: string)
             documentId,
             orgId,
             workspacePath,
+            ...(threadId ? { threadId } : {}),
         });
         logger.main.info('[DeepLink] Routed shared doc to existing window:', { workspacePath, documentId });
         return true;
@@ -1241,6 +1382,82 @@ async function openSharedFolderFromDeepLink(folderId: string, orgId: string): Pr
 
     logger.main.info('[DeepLink] Opening new window for shared folder workspace:', { workspacePath, folderId });
     createWindow(false, true, workspacePath);
+}
+
+/**
+ * Route a feedback-request deep link to the project's Org mode or the
+ * standalone organization window's Inbox.
+ *
+ * The destination is a *selected row*, not a tab: the respond card renders
+ * inline in the Inbox's context pane, while `virtual://feedback-request/` is the
+ * author's results view and would be the wrong place to land a recipient.
+ *
+ * That pane reads the request through a workspace-scoped target, so a workspace
+ * bound to this org has to be resolvable first. Without one the link fails
+ * honestly — the inbox row that offered it stays unread rather than opening a
+ * window that could only show an empty pane.
+ */
+async function openFeedbackRequestFromDeepLink(
+    requestId: string,
+    orgId: string,
+): Promise<boolean> {
+    if (!isAuthenticated()) {
+        logger.main.warn('[DeepLink] Cannot route feedback request:', {
+            reason: 'not-authenticated',
+            orgId,
+            requestId,
+        });
+        return false;
+    }
+
+    const focusedWindow = getMostRecentlyFocusedWorkspaceWindow();
+    const focusedWorkspacePath = resolveActiveWorkspacePathForWindowId(
+        getWindowIdForWindow(focusedWindow),
+    );
+    const focusedProjectOrgId = focusedWorkspacePath
+        ? (await findTeamForWorkspace(focusedWorkspacePath))?.orgId
+        : null;
+
+    if (
+        focusedWindow
+        && !focusedWindow.isDestroyed()
+        && focusedWorkspacePath
+        && resolveOrgMessagingDestination(focusedProjectOrgId, orgId) === 'project-mode'
+    ) {
+        queuePendingOrgFeedbackLink(focusedWorkspacePath, { requestId, orgId });
+        if (focusedWindow.isMinimized()) focusedWindow.restore();
+        focusedWindow.focus();
+        focusedWindow.webContents.send('deep-link:open-org-feedback-request', {
+            requestId,
+            orgId,
+            workspacePath: focusedWorkspacePath,
+        });
+        logger.main.info('[DeepLink] Routed feedback request to project Org mode:', {
+            orgId,
+            requestId,
+            workspacePath: focusedWorkspacePath,
+        });
+        return true;
+    }
+
+    const workspacePath = await findWorkspaceForOrgId(orgId);
+
+    if (!workspacePath) {
+        logger.main.warn('[DeepLink] Cannot route feedback request:', {
+            reason: 'no-workspace',
+            orgId,
+            requestId,
+        });
+        return false;
+    }
+
+    createTeamManagementWindow({ orgId, workspacePath, feedbackRequestId: requestId });
+    logger.main.info('[DeepLink] Routed feedback request to the organization window:', {
+        orgId,
+        requestId,
+        workspacePath,
+    });
+    return true;
 }
 
 /**
@@ -1385,10 +1602,14 @@ async function openFileWithWorkspaceDetection(filePath: string): Promise<void> {
             await loadFileIntoWindow(workspaceWindow, filePath);
         } else {
             // Create new workspace window for this workspace
-            workspaceWindow = createWindow(false, true, workspacePath);
+            workspaceWindow = createWindow(false, true, workspacePath, undefined, {
+                startupReveal: true,
+                startupFrontmost: true,
+            });
             updateTrackerSchemaWorkspace(workspacePath);
+            // createWindow reveals the window itself — inactive while this runs
+            // during launch, activating for a file opened later.
             workspaceWindow.once('ready-to-show', async () => {
-                workspaceWindow!.show();
                 // Window state is already set by createWindow with workspace path
                 // Just load the file
                 await loadFileIntoWindow(workspaceWindow!, filePath);
@@ -1407,10 +1628,12 @@ async function openFileWithWorkspaceDetection(filePath: string): Promise<void> {
             if (suggestedWorkspace && suggestedWorkspace !== path.dirname(filePath)) {
                 logger.main.info(`Opening suggested workspace: ${suggestedWorkspace}`);
                 addToRecentItems('workspaces', suggestedWorkspace, path.basename(suggestedWorkspace));
-                const newWindow = createWindow(false, true, suggestedWorkspace);
+                const newWindow = createWindow(false, true, suggestedWorkspace, undefined, {
+                    startupReveal: true,
+                    startupFrontmost: true,
+                });
                 updateTrackerSchemaWorkspace(suggestedWorkspace);
                 newWindow.once('ready-to-show', async () => {
-                    newWindow.show();
                     await loadFileIntoWindow(newWindow, filePath);
                 });
             } else {
@@ -1418,10 +1641,12 @@ async function openFileWithWorkspaceDetection(filePath: string): Promise<void> {
                 const fileDir = path.dirname(filePath);
                 logger.main.info(`Using file directory as workspace: ${fileDir}`);
                 addToRecentItems('workspaces', fileDir, path.basename(fileDir));
-                const newWindow = createWindow(false, true, fileDir);
+                const newWindow = createWindow(false, true, fileDir, undefined, {
+                    startupReveal: true,
+                    startupFrontmost: true,
+                });
                 updateTrackerSchemaWorkspace(fileDir);
                 newWindow.once('ready-to-show', async () => {
-                    newWindow.show();
                     await loadFileIntoWindow(newWindow, filePath);
                 });
             }
@@ -1439,7 +1664,10 @@ function parseCommandLineArgs() {
         const arg = args[i];
         logger.main.info(`Checking arg[${i}]: "${arg}"`);
 
-        if (arg === '--workspace' && i + 1 < args.length) {
+        if (isSafeModeArgument(arg)) {
+            safeModeRequested = true;
+            logger.main.warn('[SAFE MODE] Session restoration will be skipped');
+        } else if (arg === '--workspace' && i + 1 < args.length) {
             pendingWorkspacePath = args[i + 1];
             logger.main.info(`✓ Workspace path from CLI: ${pendingWorkspacePath}`);
         } else if (arg === '--file' && i + 1 < args.length) {
@@ -1483,6 +1711,14 @@ function activationLog(msg: string) {
     // logger.main.info(`[ACTIVATION +${elapsed}ms] ${msg}`);
 }
 
+app.on('did-become-active', () => {
+    activationLog('app did-become-active');
+});
+
+app.on('did-resign-active', () => {
+    activationLog('app did-resign-active');
+});
+
 app.on('browser-window-focus', (_event, win) => {
     activationLog(`browser-window-focus: window id=${win.id} title="${win.getTitle()}"`);
 });
@@ -1519,6 +1755,10 @@ BrowserWindow.prototype.focus = function(this: BrowserWindow) {
 app.whenReady().then(async () => {
     checkpoint('app-ready');
 
+    // Windows opened from here on are revealed without activating; the app is
+    // foregrounded exactly once, after the last of them is on screen.
+    beginStartupActivation();
+
     // The default renderer session may use the microphone after Voice Mode has
     // explicitly obtained the OS grant. Non-default sessions are deny-always.
     installMicrophoneGate(session.defaultSession, {
@@ -1542,6 +1782,29 @@ app.whenReady().then(async () => {
     const spellcheckEnabled = getAppSetting<boolean>('spellcheckEnabled');
     if (spellcheckEnabled === false) {
         session.defaultSession.setSpellCheckerEnabled(false);
+    }
+
+    // Set the spellchecker LANGUAGE. Chromium otherwise defaults to en-US and
+    // ignores the OS locale, so an `en_CA` user sees Canadian spelling flagged
+    // as wrong. Prefer a saved override, else the system locale. macOS uses the
+    // OS spellchecker and ignores setSpellCheckerLanguages, so skip it there.
+    if (spellcheckEnabled !== false && process.platform !== 'darwin') {
+        try {
+            const available = session.defaultSession.availableSpellCheckerLanguages ?? [];
+            const saved = getAppSetting<string[]>('spellcheckLanguages');
+            const localeSource =
+                app.getSystemLocale?.() ||
+                app.getLocale() ||
+                process.env.LC_ALL ||
+                process.env.LANG ||
+                process.env.LC_MESSAGES;
+            const langs = resolveSpellCheckerLanguages(localeSource, available, saved);
+            if (langs.length > 0) {
+                session.defaultSession.setSpellCheckerLanguages(langs);
+            }
+        } catch {
+            // Non-fatal: fall back to Chromium's default language selection.
+        }
     }
 
     // Issue #146: wire up the `nim-asset://` request handler. Workspaces are
@@ -1628,6 +1891,27 @@ app.whenReady().then(async () => {
     // Initialize PGLite database
     markStart('database-init');
     try {
+        // Before anything can open -- and therefore CREATE -- a database at the
+        // live path, put back one that an interrupted recovery left displaced.
+        // A recovery killed between its two renames leaves no database where
+        // the app looks for it and a perfectly good copy one name over; this
+        // reads the journal that recovery wrote before it moved anything and
+        // acts on the paths recorded there. `blockDatabaseOpen` is the case
+        // where it cannot: throwing here surfaces the failure dialog, which is
+        // where the user can restore, rather than silently starting empty.
+        // `resolveDatabaseUserDataPath`, not `app.getPath('userData')`: the
+        // recovery journal is written next to the database, and
+        // `NIMBALYST_USER_DATA_PATH` can put the database somewhere else. Read
+        // from the wrong root this returns "no interrupted recovery" for an
+        // install that has one.
+        const interruptedRecovery = reconcileRecoveryOnStartup({
+            userDataPath: resolveDatabaseUserDataPath(),
+            log: (level, msg, meta) => logger.main[level](msg, meta),
+        });
+        if (interruptedRecovery.plan.blockDatabaseOpen) {
+            throw new Error(interruptedRecovery.plan.message);
+        }
+
         runtimeSessionStore = await initializeDatabase();
         markEnd('database-init');
         logger.main.info('Database initialization completed');
@@ -1651,6 +1935,20 @@ app.whenReady().then(async () => {
                                    errorMessage.includes('Aborted') ||
                                    errorMessage.includes('DATABASE_INIT_FAILED');
 
+        // Which dialog the user gets must not depend on how the database failed.
+        // The recovery dialog used to be reachable only through the WASM-crash
+        // branch above, so the journaled-cutover hard stop -- the most serious
+        // state there is, where the install's only real store sits at a
+        // preserved path -- fell through to a bare showErrorBox and quit. Its
+        // message says "Settings -> Database can restore it", which the user
+        // cannot reach once the app has quit. If there is anything recoverable
+        // on disk, say so and offer to reveal it, whatever the error was.
+        // Same root the database and its backups actually live under, which is
+        // not `app.getPath('userData')` when `NIMBALYST_USER_DATA_PATH` is set.
+        const userDataPath = resolveDatabaseUserDataPath();
+        const backups = findRestorableBackups(userDataPath);
+        const canOfferRecovery = isWasmRuntimeCrash || backups.length > 0;
+
         // Send analytics about the failure. The detailed engine text stays in
         // the local log above -- init failures name the database path, which
         // carries the user's account name. PostHog gets fixed codes instead.
@@ -1672,24 +1970,91 @@ app.whenReady().then(async () => {
         }
 
         // Show appropriate error dialog
-        if (isWasmRuntimeCrash) {
-            // Get database path for the error message (use actual expanded path)
-            const dbPath = join(app.getPath('userData'), 'pglite-db');
+        if (canOfferRecovery) {
+            // This dialog used to end with "delete the database folder: <path>".
+            // Users followed it, and because the project list lives in
+            // electron-store rather than the database, the app came back up
+            // looking healthy with every session and all document history gone
+            // (#1347). Never instruct a delete: say what is recoverable, and
+            // give the user a way to reach it.
+            const content = buildDatabaseFailureDialog(backups);
 
-            dialog.showErrorBox(
-                'Nimbalyst - Database Initialization Failed',
-                `The database system failed to start.\n\n` +
-                `This usually indicates:\n` +
-                `1. Another process has the database locked\n` +
-                `2. Database files are corrupted\n` +
-                `3. Insufficient file system permissions\n\n` +
-                `To fix this:\n` +
-                `1. Close any other Nimbalyst windows\n` +
-                `2. Restart your computer (clears stale locks)\n` +
-                `3. If the problem persists, delete the database folder:\n` +
-                `   ${dbPath}\n\n` +
-                `Nimbalyst will now close.`
-            );
+            const choice = dialog.showMessageBoxSync({
+                type: 'error',
+                title: content.title,
+                message: content.message,
+                detail: content.detail,
+                buttons: content.buttons,
+                defaultId: content.defaultId,
+                cancelId: content.cancelId,
+                noLink: true,
+            });
+
+            // Resolve the click by the LABEL the user read, not by index. This
+            // branch used to be `content.revealPath !== null && choice === 0`,
+            // which was written when index 0 was "Show Backups"; once Restore
+            // took that slot, the primary action of the dialog opened a Finder
+            // window and quit (#1347).
+            const dialogOutcome = await applyDatabaseFailureChoice(content, choice, {
+                restore: async (candidate) => {
+                    logger.main.info('[Database] Restoring from the failure dialog', {
+                        name: candidate.name,
+                        bytes: candidate.bytes,
+                    });
+                    // The full recovery transaction: the copy is staged and
+                    // verified before the live database moves anywhere, the swap
+                    // is a rename, and the displaced database is kept.
+                    const outcome = await restoreFromNamedBackup({
+                        backupPath: candidate.path,
+                        backupName: candidate.name,
+                    });
+                    if (!outcome.ok) {
+                        logger.main.error('[Database] Restore failed', outcome);
+                        return {
+                            ok: false,
+                            message: outcome.message,
+                            // Whether the dialog may fall through to the next
+                            // copy. False once this attempt has moved something.
+                            canTryAnother: mayTryAnotherCandidate(outcome),
+                        };
+                    }
+                    logger.main.info('[Database] Restore succeeded', {
+                        indicators: outcome.indicators,
+                        displacedLivePath: outcome.artifacts.displacedLivePath,
+                    });
+                    return { ok: true };
+                },
+                reveal: (revealPath) => {
+                    try {
+                        shell.showItemInFolder(revealPath);
+                    } catch (revealErr) {
+                        logger.main.warn('[Database] Could not reveal backup folder', revealErr);
+                    }
+                },
+                onRestoreFailed: (message) => {
+                    dialog.showErrorBox('Nimbalyst - Restore Failed', message);
+                },
+            });
+
+            if (dialogOutcome.restored) {
+                // Initialization already failed in this process, so the rest of
+                // startup never ran. Come back up cleanly on the restored
+                // database rather than trying to resume from here.
+                app.relaunch();
+            }
+
+            // NIM-3624: this dialog was previously invisible in telemetry, so
+            // there was no way to see how many users it sent to delete their
+            // database. Report that it was shown and what the user did.
+            try {
+                AnalyticsService.getInstance().sendEvent('database_init_failure_dialog', {
+                    backup_count: backups.length,
+                    largest_backup_bytes: backups.reduce((max, b) => Math.max(max, b.bytes), 0),
+                    action: dialogOutcome.reportedAction,
+                });
+            } catch {
+                // Analytics failure shouldn't block error handling
+            }
         } else {
             dialog.showErrorBox(
                 'Nimbalyst - Database Initialization Failed',
@@ -1702,20 +2067,9 @@ app.whenReady().then(async () => {
         return;
     }
 
-    // Set dock icon for macOS
-    if (process.platform === 'darwin' && app.dock) {
-        // icon.png is at the package root in both dev and packaged builds
-        // (included in electron-builder's `files` array, so it's inside the ASAR at the root)
-        const iconPath = join(app.getAppPath(), 'icon.png');
-
-        if (existsSync(iconPath)) {
-            const dockIcon = nativeImage.createFromPath(iconPath);
-            app.dock.setIcon(dockIcon);
-            // logger.main.info('Dock icon set successfully from:', iconPath);
-        } else {
-            logger.main.warn(`icon not found at: ${iconPath}`);
-        }
-    }
+    // Set dock icon for macOS. Shared with TrayPanelWindow, which has to
+    // re-apply it after setting the activation policy.
+    applyDockIcon();
 
     // Register all IPC handlers
     markStart('ipc-handlers');
@@ -1746,7 +2100,30 @@ app.whenReady().then(async () => {
             return documentServices.get(workspacePath)?.listTrackerItems() ?? [];
         },
     });
+    setupTrayPanelHandlers({
+        getFeed: () => TrayManager.getInstance().buildPanelFeed(),
+        onSelectSession: (sessionId, workspacePath) =>
+            TrayManager.getInstance().handleSessionClick(sessionId, workspacePath),
+        onNewSession: () => TrayManager.getInstance().handleNewSession(),
+        onOpenApp: () => TrayManager.getInstance().handleOpenApp(),
+        onClearAllUnread: () => {
+            void TrayManager.getInstance().clearAllUnreadSessions();
+        },
+    });
+    setupMenuBarIslandHandlers({
+        onSelectSession: (sessionId, workspacePath) =>
+            TrayManager.getInstance().handleSessionClick(sessionId, workspacePath),
+        onExpandedChange: (expanded) =>
+            TrayManager.getInstance().onIslandExpandedChange(expanded),
+        onNewSession: () => TrayManager.getInstance().handleNewSession(),
+        onOpenApp: () => TrayManager.getInstance().handleOpenApp(),
+        onSettingChange: (change) => TrayManager.getInstance().applyIslandSetting(change),
+        onClearAllUnread: () => {
+            void TrayManager.getInstance().clearAllUnreadSessions();
+        },
+    });
     setupSessionFileHandlers();
+    setupCanvasRevisionProvenanceHandlers();
     registerSlashCommandHandlers();
     registerActionPromptHandlers();
     await registerUsageAnalyticsHandlers();
@@ -1770,6 +2147,7 @@ app.whenReady().then(async () => {
     registerGitHandlers();
     registerWorktreeHandlers();
     registerPullRequestHandlers();
+    registerGithubIssueHandlers();
     registerReadReceiptHandlers();
     registerTrackerPersonalStateHandlers();
     registerWakeupHandlers();
@@ -1792,6 +2170,7 @@ app.whenReady().then(async () => {
         registerDatabaseBrowserHandlers();
     }
     registerMigrationHandlers();
+    registerRecoveryHandlers();
     registerTerminalHandlers();
     registerExportHandlers();
     registerShareHandlers();
@@ -1801,6 +2180,7 @@ app.whenReady().then(async () => {
     // serve Quick Open semantic search.
     SemanticCatalogService.getInstance().start();
     initTrackerSchemaService(); // Register IPC handlers + load built-in schemas
+    registerTrackerLifecycleIpc(); // Promote to team / archive, from the UI
     initTrackerNavigationService();
     initTrackerSavedViewService();
 
@@ -1809,10 +2189,14 @@ app.whenReady().then(async () => {
     gitRefWatcher.onCommitDetected((event) => commitTrackerLinker.handleCommitDetected(event));
 
     registerTeamHandlers();
+    registerOrgProjectWalkHandlers();
+    registerSignInAttributionHandlers();
+    registerProjectWalkClaimHandlers();
     registerTeamInboxHandlers({
         openInboxSource: openInboxSourceFromDeepLink,
     });
     registerConversationHandlers();
+    registerFeedbackRequestHandlers();
     registerOrgSettingsHandlers();
     registerTeamCustodyHandlers();
     // Team custody is server-managed; drop the client key material the retired
@@ -1820,6 +2204,8 @@ app.whenReady().then(async () => {
     purgeLegacyKeyFiles();
     registerCollabConversionClient();
     registerDocumentSyncHandlers();
+    // No-op outside an unpackaged Playwright run with the collab harness env.
+    registerCollabTestIdentityHandlers();
     getCollabOutboxDrainCoordinator().start();
     getCollabAssetOutboxDrainCoordinator().start();
     registerCollabBackupHandlers();
@@ -1987,6 +2373,37 @@ app.whenReady().then(async () => {
         }
         return enabledServers;
     });
+    /**
+     * Filter the merged MCP config down to the servers enabled for one
+     * provider, dropping any OAuth server the user has not authorized.
+     *
+     * Extracted because the per-provider loaders below were four copies of the
+     * same twenty lines with the provider id and a log string swapped.
+     */
+    const loadEnabledMcpServersFor = async (
+        providerId: MCPProviderId,
+        displayName: string,
+        workspacePath?: string,
+    ): Promise<Record<string, any>> => {
+        if (!mcpConfigService) {
+            throw new Error('MCP config service not initialized');
+        }
+        const mergedConfig = await mcpConfigService.getMergedConfig(workspacePath);
+        const enabledServers: Record<string, any> = {};
+        for (const [name, config] of Object.entries(mergedConfig.mcpServers || {})) {
+            if (!isMCPServerEnabledForProvider(config as MCPServerConfig, providerId)) continue;
+            const isAuthorized = await mcpConfigService.isOAuthAuthorized(config as MCPServerConfig, {
+                useMcpRemoteForNativeOAuth: true,
+            });
+            if (!isAuthorized) {
+                logger.mcp.info(`[MCP] Skipping unauthorized OAuth server for ${displayName}: ${name}`);
+                continue;
+            }
+            enabledServers[name] = mcpConfigService.processServerConfigForRuntime(config as any);
+        }
+        return enabledServers;
+    };
+
     CopilotCLIProvider.setMCPConfigLoader(async (workspacePath?: string) => {
         if (!mcpConfigService) {
             throw new Error('MCP config service not initialized');
@@ -2009,6 +2426,43 @@ app.whenReady().then(async () => {
         }
         return enabledServers;
     });
+
+    // Cursor reads MCP servers from a config file, not from a command-line
+    // list or a session/new payload. So its loader writes the filtered set to
+    // disk before returning it -- the returned value still feeds the provider's
+    // mcpServerCount, but the file is what the CLI acts on. Only
+    // `nimbalyst:`-prefixed entries are touched; see
+    // HeadlessAgentMcpConfigService.
+    const syncHeadlessAgentMcpConfig = async (
+        target: HeadlessAgentMcpTarget,
+        providerId: MCPProviderId,
+        displayName: string,
+        workspacePath?: string,
+    ): Promise<Record<string, any>> => {
+        const servers = await loadEnabledMcpServersFor(providerId, displayName, workspacePath);
+        try {
+            const written = await headlessAgentMcpConfigService.sync(target, servers, workspacePath);
+            if (written) {
+                logger.mcp.info(`[MCP] Wrote ${Object.keys(servers).length} server(s) for ${displayName}: ${written}`);
+            }
+        } catch (error) {
+            // A turn with no MCP servers is far better than a turn that cannot
+            // start, so this never throws into the provider.
+            logger.mcp.warn(`[MCP] Could not write ${displayName} MCP config:`, error);
+        }
+        return servers;
+    };
+
+    // Grok gets its servers inline through ACP `session/new`, so it writes
+    // nothing to disk. `~/.grok/mcp.json` used to be written here for the old
+    // `grok -p` transport; it is mode 0644 and holds resolved credentials, so
+    // once ACP delivery landed the write was redundant exposure.
+    GrokBuildProvider.setMCPConfigLoader(
+        (workspacePath?: string) => loadEnabledMcpServersFor(MCP_PROVIDER_IDS.GROK, 'Grok', workspacePath),
+    );
+    CursorAgentProvider.setMCPConfigLoader(
+        (workspacePath?: string) => syncHeadlessAgentMcpConfig('cursor-agent', MCP_PROVIDER_IDS.CURSOR, 'Cursor', workspacePath),
+    );
 
     // Claude CLI (subscription) launcher shares the Claude Agent MCP filter —
     // the genuine CLI hits the identical MCP handlers as the SDK path (NIM-806).
@@ -2111,6 +2565,8 @@ app.whenReady().then(async () => {
     OpenAICodexACPProvider.setShellEnvironmentLoader(() => getShellEnvironment());
     OpenCodeProvider.setShellEnvironmentLoader(() => getShellEnvironment());
     CopilotCLIProvider.setShellEnvironmentLoader(() => getShellEnvironment());
+    GrokBuildProvider.setShellEnvironmentLoader(() => getShellEnvironment());
+    CursorAgentProvider.setShellEnvironmentLoader(() => getShellEnvironment());
 
     // Inject enhanced PATH loader so agents can access system tools
     // (docker, homebrew, nvm, etc.) that are missing from Electron's GUI PATH.
@@ -2122,10 +2578,73 @@ app.whenReady().then(async () => {
     OpenAICodexACPProvider.setEnhancedPathLoader(() => getEnhancedPath());
     OpenCodeProvider.setEnhancedPathLoader(() => getEnhancedPath());
     CopilotCLIProvider.setEnhancedPathLoader(() => getEnhancedPath());
+    GrokBuildProvider.setEnhancedPathLoader(() => getEnhancedPath());
+    CursorAgentProvider.setEnhancedPathLoader(() => getEnhancedPath());
 
-    // Inject opencode.json loader so OpenCodeProvider.getModels() can surface
-    // user-configured providers (e.g. an LM Studio bridge) in the model picker.
-    OpenCodeProvider.setConfigLoader(() => getOpenCodeConfigService().readConfig());
+    // Gemini executes its tools in this process. The provider ships in the
+    // runtime package, which cannot import from main, so the executor is
+    // injected rather than imported.
+    GeminiAntigravityProvider.setToolExecutor(executeGeminiTool);
+    // The Antigravity language server enforces a supported-build floor against
+    // --override_ide_version and rejects anything below it. Reading the value
+    // from settings means a user hit by a vendor-side bump can raise it without
+    // waiting for a Nimbalyst release; the baked-in default is what works today.
+    GeminiAntigravityProvider.setServerConfigLoader(() => {
+      const settings = (getAiSettingsStore().get('providerSettings', {}) as Record<string, {
+        overrideIdeVersion?: unknown;
+        spawnPortCandidates?: unknown;
+      }>)['antigravity-gemini-agent'] ?? {};
+      return {
+        overrideIdeVersion: typeof settings.overrideIdeVersion === 'string'
+          ? settings.overrideIdeVersion
+          : undefined,
+        spawnPortCandidates: Array.isArray(settings.spawnPortCandidates)
+          ? settings.spawnPortCandidates.filter(
+            (port): port is number => typeof port === 'number' && Number.isFinite(port) && port > 0,
+          )
+          : undefined,
+      };
+    });
+
+    // Grok, Cursor and Gemini default to on when their tool is present and
+    // usable. Deliberately fire-and-forget: subprocess spawns must not sit on
+    // the startup path, and until this resolves all three read as unavailable,
+    // so the providers appear a beat after launch rather than blocking it.
+    // Nothing is written to settings -- see headlessAgentAvailability.ts.
+    setHeadlessAgentEnhancedPathLoader(() => getEnhancedPath());
+    void refreshHeadlessAgentAvailability().catch((error) => {
+      logger.ai.warn('[AI] Headless agent availability probe failed:', error);
+    });
+
+    configureOpenCodeModelCatalog({
+      loadCache: (workspacePath) => getOpenCodeModelCatalogCache(workspacePath),
+      saveCache: (cache) => setOpenCodeModelCatalogCache(cache),
+      getCacheKey: (workspacePath) => {
+        const shellEnvironment = getShellEnvironment();
+        return createOpenCodeModelCatalogCacheKey({
+          enhancedPath: getEnhancedPath(),
+          configPath: getOpenCodeConfigService().getConfigPath(),
+          workspacePath,
+          xdgDataHome: shellEnvironment?.XDG_DATA_HOME ?? process.env.XDG_DATA_HOME,
+          configuredApiKey: getProviderApiKeyFromSettings('opencode'),
+        });
+      },
+      getRetainedModelIds: async () => {
+        // The model the user picked in settings stays in the catalog even if
+        // discovery stops reporting its provider as connected, so a revoked or
+        // not-yet-added credential never silently erases the selection (#916).
+        try {
+          const config = await getOpenCodeConfigService().readConfig();
+          return config?.model ? [config.model] : [];
+        } catch {
+          return [];
+        }
+      },
+      getEnvironment: () => ({
+        ...(getShellEnvironment() ?? {}),
+        PATH: getEnhancedPath(),
+      }),
+    });
 
     // Inject SDK module loader for packaged builds where dynamic import('@openai/codex-sdk')
     // can't resolve the package from within app.asar.
@@ -2316,6 +2835,8 @@ app.whenReady().then(async () => {
       ClaudeCodeProvider.setSecurityLogger(securityLogger);
       OpenAICodexProvider.setSecurityLogger(securityLogger);
       OpenAICodexACPProvider.setSecurityLogger(securityLogger);
+      GrokBuildProvider.setSecurityLogger(securityLogger);
+      CursorAgentProvider.setSecurityLogger(securityLogger);
     }
 
     ClaudeCodeProvider.setClaudeSettingsPatternSaver(patternSaver);
@@ -2329,6 +2850,20 @@ app.whenReady().then(async () => {
     OpenAICodexACPProvider.setPermissionPatternSaver(patternSaver);
     OpenAICodexACPProvider.setPermissionPatternChecker(patternChecker);
     OpenAICodexACPProvider.setTrustChecker(trustChecker);
+
+    GrokBuildProvider.setPermissionPatternSaver(patternSaver);
+    GrokBuildProvider.setPermissionPatternChecker(patternChecker);
+    GrokBuildProvider.setTrustChecker(trustChecker);
+
+    // Grok's native `ask_user_question` tool reaches the user through the
+    // ordinary AskUserQuestion widget. Without a handler the ACP request
+    // returns `cancelled` and Grok answers itself, which is the bug that
+    // started this workstream.
+    GrokBuildProvider.setAskUserQuestionHandler(createGrokAskUserQuestionHandler());
+
+    // Cursor's one-shot headless transport still gates the whole turn; Grok's
+    // ACP transport uses the same trust check plus per-tool permission events.
+    CursorAgentProvider.setTrustChecker(trustChecker);
 
     // ACP exposes pre/post file-write hooks. Wire them so Codex ACP edits
     // produce the same FilesEditedSidebar entries and pre-edit baselines as
@@ -2392,7 +2927,12 @@ app.whenReady().then(async () => {
     // Inject image compressor
     // Compresses images to fit within Claude API 5MB base64 limit
     ClaudeCodeProvider.setImageCompressor(async (buffer, mimeType, options) => {
-      const { compressImage } = await import('./services/ImageCompressor');
+      // A small or animated image gains nothing from a re-encode, so decoding it
+      // only creates a way to fail. Skipping keeps those attachments off Jimp
+      // entirely. #1389
+      if (!shouldCompress(buffer, mimeType)) {
+        return { buffer, mimeType, wasCompressed: false };
+      }
       const result = await compressImage(buffer, mimeType, options);
       return {
         buffer: result.buffer,
@@ -2495,6 +3035,12 @@ app.whenReady().then(async () => {
       });
     } catch (recoveryErr) {
       logger.main.error('[Main] Boot queue recovery failed:', recoveryErr);
+    }
+
+    try {
+      await startAgentMentionDispatchService(aiService);
+    } catch (error) {
+      logger.main.error('[AgentMentionDispatch] Failed to start agent wake dispatch:', error);
     }
 
     // Recover any super loops that were running when the app last shut down
@@ -2641,6 +3187,8 @@ app.whenReady().then(async () => {
         await metaAgentService.start(
             aiService,
             (options) => notificationService.showNotificationWithResult(options),
+            (sessionId, title, body, options) =>
+                requestMobilePush(sessionId, title, body, options),
         );
     } catch (error) {
         logger.mcp.error('Failed to start meta-agent MCP server:', error);
@@ -2772,7 +3320,10 @@ app.whenReady().then(async () => {
 
     // Skip session restoration if opening a specific workspace from CLI
     markStart('session-restore');
-    const shouldSkipSessionRestore = !!pendingWorkspacePath;
+    const shouldSkipSessionRestore = !!pendingWorkspacePath || safeModeRequested;
+    if (safeModeRequested) {
+        setSafeModeSessionStateProtection(true);
+    }
     const sessionRestored = shouldSkipSessionRestore ? false : await restoreSessionState();
     markEnd('session-restore');
 
@@ -2780,7 +3331,8 @@ app.whenReady().then(async () => {
     // where it has direct access to the ai-settings store that owns this value.
 
     // Close splash screen now that initialization is done and a real window is about to show.
-    // The last restored window activates the app via its own ready-to-show handler.
+    // Restored windows reveal themselves without activating; StartupActivation
+    // brings Nimbalyst to the front once, after the last of them has painted.
     closeSplashScreen();
 
     if (pendingWorkspacePath) {
@@ -2876,18 +3428,26 @@ app.whenReady().then(async () => {
             }
         }
 
-        const window = createWindow(false, true, workspacePath);
+        const window = createWindow(false, true, workspacePath, undefined, {
+            startupReveal: true,
+            startupFrontmost: true,
+        });
 
         setTimeout(() => {
             // Yield before background workspace initialization so CLI opens don't
             // inherit synchronous git/process work on the startup tick.
             void autoMatchTeamForWorkspace(workspacePath).catch(() => {});
             void initializeTrackerSync(workspacePath).catch(() => {});
+            // Sibling, not a step inside tracker sync: that path returns early
+            // for a workspace with no team, which is exactly the workspace whose
+            // items have nothing but a local number.
+            ensureWorkspaceLocalNumbersInBackground(workspacePath);
             updateTrackerSchemaWorkspace(workspacePath);
         }, 0);
 
         window.once('ready-to-show', () => {
-            window.show();
+            // createWindow already revealed the window; showing it again here
+            // would activate the app ahead of the single startup foregrounding.
             // Notify renderer to ensure workspace UI syncs with the selected path
             window.webContents.send('open-workspace-from-cli', workspacePath);
 
@@ -2906,9 +3466,9 @@ app.whenReady().then(async () => {
             unifiedOnboardingCompleted: onboardingState.unifiedOnboardingCompleted,
             launchCount: getLaunchCount(),
         })) {
-            createWorkspaceManagerWindow({ showOnboarding: true });
+            createWorkspaceManagerWindow({ showOnboarding: true, safeMode: safeModeRequested, startupReveal: true });
         } else {
-            createWorkspaceManagerWindow();
+            createWorkspaceManagerWindow({ safeMode: safeModeRequested, startupReveal: true });
         }
     } else if (pendingFilePath) {
         // Handle pending file with workspace detection
@@ -2923,6 +3483,10 @@ app.whenReady().then(async () => {
         pendingDeepLinkUrl = null;
         await handleDeepLink(urlToHandle);
     }
+
+    // Every window launch intends to open has been requested. Nimbalyst comes
+    // to the front once, as soon as the last of them has painted.
+    finishStartupWindowCreation();
 
     // Community popup fallback for passive users:
     // show on launch 5+ if success-moment trigger (3 tool sessions) has not fired.
@@ -3192,6 +3756,7 @@ app.on('before-quit', async (event) => {
     }
 
     try {
+        shutdownAgentMentionDispatchService();
         shutdownTeamInboxHandlers();
     } catch (error) {
         console.error('[QUIT] Error shutting down Teams inbox:', error);
@@ -3200,6 +3765,11 @@ app.on('before-quit', async (event) => {
         shutdownConversationHandlers();
     } catch (error) {
         console.error('[QUIT] Error shutting down Teams conversations:', error);
+    }
+    try {
+        shutdownFeedbackRequestHandlers();
+    } catch (error) {
+        console.error('[QUIT] Error shutting down feedback requests:', error);
     }
 
     // Check if we can write to userData directory

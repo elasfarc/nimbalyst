@@ -1,3 +1,5 @@
+import { database } from '../database/PGLiteDatabaseWorker';
+import { projectSessionList, readSessionLaunchCounts } from './sessionListProjection';
 import { SessionManager, ProviderFactory } from '@nimbalyst/runtime/ai/server';
 import { AISessionsRepository, TranscriptMigrationRepository } from '@nimbalyst/runtime';
 import {
@@ -18,12 +20,14 @@ import { parseJsonObjectColumn } from '../utils/jsonColumn';
 import type { SessionCreateResult } from '../../shared/ipc/types';
 import { TrayManager } from '../tray/TrayManager';
 import { AnalyticsService } from '../services/analytics/AnalyticsService';
+import { trackCreateAiSession } from '../services/analytics/sessionLaunchAnalytics';
 import { resolveRequestUserInputPromptTargets } from '../mcp/tools/codexToolCallResolver';
 import {
     getGitCommitProposalResponseChannel,
     resolveGitCommitProposalPromptId,
 } from '../services/ai/gitCommitProposalPromptUtils';
-import { enrichTranscriptMessagesWithToolCallDiffs } from '../services/TranscriptToolCallEnricher';
+import { SessionCommitService } from '../services/SessionCommitService';
+import { findSessionIdsForFile } from '../services/sessionFilesByPath';
 import { setSessionPendingPrompt } from '../services/ai/pendingPromptPersistence';
 import { normalizeSessionPhaseMetadataUpdate } from '../services/session/sessionPhaseTransition';
 import { destroyProviderForArchivedSession } from '../services/ai/archiveSessionProviderLifecycle';
@@ -63,13 +67,10 @@ function trackCreateAISession(provider: AIProviderType, options?: {
     worktreeId?: string | null;
     parentSessionId?: string | null;
     agentRole?: string | null;
+    launchSource?: string | null;
+    hadPrefilledPrompt?: boolean;
 }): void {
-    analyticsService.sendEvent('create_ai_session', {
-        provider,
-        is_worktree_session: !!options?.worktreeId,
-        is_workstream_child: !!options?.parentSessionId,
-        is_meta_agent_session: options?.agentRole === 'meta-agent',
-    });
+    trackCreateAiSession({ provider, ...options });
 }
 
 function makeSessionFilesCacheKey(workspacePath: string, uncommittedFiles: Set<string>): string {
@@ -221,9 +222,18 @@ export async function registerSessionHandlers() {
     });
 
     // Create session (new format for agentic coding)
-    safeHandle('sessions:create', async (event, payload: { session: any; workspaceId: string }): Promise<SessionCreateResult> => {
+    safeHandle('sessions:create', async (event, payload: {
+        session: any;
+        workspaceId: string;
+        // Optional so an un-updated caller degrades to `unknown` rather than
+        // failing to create a session. Every renderer path that knows its
+        // surface passes it; the ones that cannot are honestly uncounted.
+        launchSource?: string;
+        /** A boolean, deliberately never the draft text itself. */
+        hadPrefilledPrompt?: boolean;
+    }): Promise<SessionCreateResult> => {
         try {
-            const { session, workspaceId } = payload;
+            const { session, workspaceId, launchSource, hadPrefilledPrompt } = payload;
 
             const requestedProvider = session.provider as AIProviderType;
             const { provider, model } = resolveSessionModelSelection(requestedProvider, session.model);
@@ -251,6 +261,8 @@ export async function registerSessionHandlers() {
                 worktreeId: createPayload.worktreeId,
                 parentSessionId: (session.parentSessionId as string | null | undefined) ?? null,
                 agentRole: createPayload.agentRole,
+                launchSource,
+                hadPrefilledPrompt,
             });
 
             // Update with full metadata
@@ -505,43 +517,8 @@ export async function registerSessionHandlers() {
                 console.error('[SessionHandlers] Failed to get uncommitted counts:', error);
             }
 
-            // Use entry data directly - it already has all the info we need including updatedAt
-            const sessions = entries.map(entry => {
-                const uncommittedCount = uncommittedMap.get(entry.id) || 0;
-                return {
-                    id: entry.id,
-                    createdAt: entry.createdAt,
-                    updatedAt: entry.updatedAt,
-                    name: entry.title,
-                    title: entry.title,
-                    provider: entry.provider,
-                    model: entry.model,
-                    sessionType: entry.sessionType || 'session',
-                    agentRole: entry.agentRole || 'standard',
-                    createdBySessionId: entry.createdBySessionId || null,
-                    messageCount: entry.messageCount || 0,
-                    isArchived: entry.isArchived || false,
-                    isPinned: entry.isPinned || false,  // Include isPinned from repository
-                    worktreeId: entry.worktreeId,  // Include worktreeId from repository
-                    parentSessionId: entry.parentSessionId || null,  // Hierarchical workstream support
-                    childCount: entry.childCount || 0,  // Number of child sessions
-                    uncommittedCount,  // Number of uncommitted files
-                    hasUnread: entry.hasUnread || false,  // Unread state from metadata
-                    hasPendingInteractivePrompt: (entry as any).hasPendingInteractivePrompt || false,
-                    // Branch tracking - SEPARATE from hierarchical parentSessionId
-                    branchedFromSessionId: entry.branchedFromSessionId,
-                    branchPointMessageId: entry.branchPointMessageId,
-                    branchedAt: entry.branchedAt,
-                    // Kanban board phase and tags
-                    phase: (entry as any).phase || undefined,
-                    tags: (entry as any).tags || undefined,
-                    // Linked tracker item IDs
-                    linkedTrackerItemIds: (entry as any).linkedTrackerItemIds || undefined,
-                    metadata: {}
-                };
-            });
-
-            return { success: true, sessions };
+            const launchedSessionCounts = await readSessionLaunchCounts(database, workspacePath);
+            return { success: true, sessions: projectSessionList(entries, uncommittedMap), launchedSessionCounts };
         } catch (error) {
             console.error('[SessionHandlers] Failed to list sessions:', error);
             return { success: false, error: String(error), sessions: [] };
@@ -673,9 +650,13 @@ export async function registerSessionHandlers() {
             };
 
             await AISessionsRepository.create(createPayload as any);
+            // Always `workstream_child`: this handler exists only to parent a
+            // session under another one, so the surface is knowable here and
+            // does not need to be passed in.
             trackCreateAISession(provider as AIProviderType, {
                 worktreeId: createPayload.worktreeId,
                 parentSessionId,
+                launchSource: 'workstream_child',
             });
             console.log(`[SessionHandlers] Child session ${sessionId} created successfully with model: ${model}`);
 
@@ -782,7 +763,13 @@ export async function registerSessionHandlers() {
             // Destroy any active provider (aborts lead query and kills all teammates)
             ProviderFactory.destroyProvider(sessionId);
 
+            const session = await AISessionsRepository.get(sessionId);
             await AISessionsRepository.delete(sessionId);
+            if (session?.workspacePath) {
+                for (const window of BrowserWindow.getAllWindows()) {
+                    if (!window.isDestroyed()) window.webContents.send('sessions:refresh-list', { workspacePath: session.workspacePath });
+                }
+            }
             return { success: true };
         } catch (error) {
             console.error('[SessionHandlers] Failed to delete session:', error);
@@ -897,34 +884,16 @@ export async function registerSessionHandlers() {
 
             const projectPath = resolveProjectPath(workspaceId);
 
-            let fileLinksResult;
-            if (relativePath) {
-                // Query across all related workspaces using relative path suffix
-                // This handles: worktree -> main project, main project -> worktrees,
-                // and worktree -> other worktrees
-                // Escape SQL LIKE wildcards in the path to prevent unintended pattern matching
-                const escapedRelativePath = relativePath.replace(/[%_\\]/g, '\\$&');
-                const escapedProjectPath = projectPath.replace(/[%_\\]/g, '\\$&');
-                fileLinksResult = await database.query(
-                    `SELECT DISTINCT session_id FROM session_files
-                     WHERE file_path LIKE '%' || $1 ESCAPE '\\'
-                     AND (workspace_id = $2 OR workspace_id = $3 OR workspace_id LIKE $4 ESCAPE '\\')`,
-                    [escapedRelativePath, workspaceId, projectPath, escapedProjectPath + '_worktrees/%']
-                );
-            } else {
-                // Fallback: exact match only
-                fileLinksResult = await database.query(
-                    `SELECT DISTINCT session_id FROM session_files
-                     WHERE workspace_id = $1 AND file_path = $2`,
-                    [workspaceId, filePath]
-                );
-            }
+            const sessionIds = await findSessionIdsForFile(database, {
+                workspaceId,
+                projectPath,
+                relativePath,
+                filePath,
+            });
 
-            if (!fileLinksResult.rows || fileLinksResult.rows.length === 0) {
+            if (sessionIds.length === 0) {
                 return [];
             }
-
-            const sessionIds = fileLinksResult.rows.map((row: any) => row.session_id);
 
             // Get list entries with messageCount (only available for current workspace sessions)
             const listEntries = await AISessionsRepository.list(workspaceId);
@@ -1146,6 +1115,35 @@ export async function registerSessionHandlers() {
         }
     });
 
+    // Batch lookup of the session that produced each commit, for the Git Log
+    // panel's Session column. One call per page of the log, never per row.
+    //
+    // Keyed on sha alone -- do NOT add a workspacePath filter here. A session
+    // running in a worktree commits under the worktree path while the user
+    // browses the log from the main checkout; scoping by workspace would drop
+    // exactly the parallel-agent commits this column exists to show.
+    safeHandle('sessions:get-by-commits', async (event, shas: string[]) => {
+        try {
+            const service = SessionCommitService.getInstance();
+
+            // First read kicks off the historical backfill. Fire-and-forget so
+            // the log renders immediately with whatever is already recorded;
+            // the panel fills in on its next fetch.
+            void service.backfillFromRawMessages().catch((error) => {
+                console.error('[SessionHandlers] Session commit backfill failed:', error);
+            });
+
+            const links = await service.getSessionsForCommits(shas || []);
+            // The caller polls on this: on a first-ever open the scan is still
+            // running and `links` is empty, so the panel needs to ask again.
+            const backfillPending = !(await service.isBackfillComplete());
+            return { success: true, links, backfillPending };
+        } catch (error) {
+            console.error('[SessionHandlers] Failed to get sessions by commits:', error);
+            return { success: false, error: String(error), links: {}, backfillPending: false };
+        }
+    });
+
     // ============================================================
     // Interactive Prompts - Durable AI-to-User Interactions
     // These handlers support the durable interactive prompts architecture
@@ -1218,6 +1216,17 @@ export async function registerSessionHandlers() {
                     respondedAt: timestamp,
                     respondedBy,
                 };
+                // Record the sha -> session link for the Git Log panel. The MCP
+                // settle path records it too; the insert is idempotent, and this
+                // one still fires if the tool already timed out or the app
+                // restarted while the proposal was open.
+                if (response.action === 'committed' && response.commitHash) {
+                    void SessionCommitService.getInstance().recordCommit({
+                        commitSha: response.commitHash,
+                        sessionId,
+                        committedAt: new Date(timestamp),
+                    });
+                }
             } else if (promptType === 'request_user_input_request') {
                 responseContent = {
                     type: 'request_user_input_response',
@@ -1524,7 +1533,7 @@ export async function registerSessionHandlers() {
         );
 
         const viewModel = TranscriptProjector.project(tailEvents);
-        return await enrichTranscriptMessagesWithToolCallDiffs(sessionId, viewModel.messages);
+        return viewModel.messages;
     });
 
     // DEV/TESTING ONLY: Force a single session's canonical events to be

@@ -61,9 +61,12 @@ describe('deriveCollabProductStatus', () => {
     ['ready', 'connected', 'rejected', 'access-changed'],
     ['ready', 'disconnected', 'replaying', 'replaying'],
     ['ready', 'replaying', 'clean', 'replaying'],
-    // connected+pending is in-flight typing, not an offline backlog -- it
-    // must read as synced or the pill flashes on every keystroke.
+    // connected+pending and connected+replaying are both in-flight typing (the
+    // outbox walks clean -> pending -> in-flight -> clean per keystroke), not an
+    // offline backlog -- both must read as synced or the pill and the presence
+    // avatars flash on every character.
     ['ready', 'connected', 'pending', 'synced'],
+    ['ready', 'connected', 'replaying', 'synced'],
     ['ready', 'connected', 'clean', 'synced'],
     ['ready', 'connecting', 'clean', 'connecting'],
     ['ready', 'syncing', 'clean', 'connecting'],
@@ -126,6 +129,22 @@ describe('deriveCollabProductStatus', () => {
     });
     expect(status.kind).toBe('local-saving-unavailable');
     expect(status.showRejectedActions).toBe(true);
+  });
+
+  // The regression this guards is invisible on screen: every other signal on a
+  // render-failed document reads healthy, so the status must be derived from
+  // renderFailed rather than from transport.
+  it('reports a render failure instead of Synced on an otherwise healthy document', () => {
+    const healthy = {
+      replica: 'ready',
+      transport: 'connected',
+      outbox: 'clean',
+    } as const;
+    expect(deriveCollabProductStatus(healthy).kind).toBe('synced');
+
+    const status = deriveCollabProductStatus({ ...healthy, renderFailed: true });
+    expect(status.kind).toBe('not-receiving-changes');
+    expect(status.severity).toBe('error');
   });
 
   it('keeps the legacy single status honest about durable outbox work', () => {

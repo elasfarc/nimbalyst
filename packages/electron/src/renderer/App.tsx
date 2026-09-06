@@ -13,6 +13,9 @@ import type { LexicalCommand } from '@nimbalyst/runtime';
 // aiChatBridge has been replaced by editorRegistry
 // Import editor styles (CSS side-effect)
 import '../../../runtime/src/editor/index.css';
+// Shared runtime UI rendered by extensions lives in the host document, so its
+// styles must be injected by the host rather than imported by extension code.
+import '../../../runtime/src/editor/commenting/ui/comments.css';
 // Import refactored hooks and utilities
 import { useIPCHandlers } from './hooks/useIPCHandlers';
 import { useWindowLifecycle } from './hooks/useWindowLifecycle';
@@ -26,6 +29,7 @@ import { useOnboarding } from './hooks/useOnboarding';
 import { handleWorkspaceFileSelect as handleWorkspaceFileSelectUtil } from './utils/workspaceFileOperations';
 import { createInitialFileContent } from './utils/fileUtils';
 import { resolveHistoryDocumentPath } from './utils/historyDocumentResolver';
+import { parseExtensionInstallLink } from './utils/extensionInstallDeepLink';
 import { loadActiveExtensionPanel, persistActiveExtensionPanel } from './utils/activeExtensionPanelPersistence';
 import { aiToolService } from './services/AIToolService';
 import { editorRegistry } from '@nimbalyst/runtime/ai/EditorRegistry';
@@ -35,6 +39,10 @@ import { DialogProvider, dialogRef } from './contexts/DialogContext';
 import { initializeDialogs, DIALOG_IDS } from './dialogs';
 import type { ProjectSelectionData, ErrorDialogData, ExtensionProjectIntroData } from './dialogs';
 import { NavigationDialogKeyboardHandler } from './components/NavigationDialogKeyboardHandler';
+import {
+  revealEditorPosition,
+  type EditorRevealPosition,
+} from './components/TabEditor/editorRevealCommand';
 import { ConfirmDialog } from './components/ConfirmDialog/ConfirmDialog';
 import { GlobalHistoryDialog } from './components/HistoryDialog';
 // NOTE: DiscordInvitation, KeyboardShortcutsDialog, ApiKeyDialog now managed by DialogProvider
@@ -121,9 +129,11 @@ import { initMenuCommandListeners } from './store/listeners/menuCommandListeners
 import { initNetworkAvailabilityListeners } from './store/listeners/networkAvailabilityListeners';
 import { initTeamInboxListeners } from './store/listeners/teamInboxListeners';
 import { initConversationListeners } from './store/listeners/conversationListeners';
+import { initFeedbackRequestListeners } from './store/listeners/feedbackRequestListeners';
 import { initConversationDirectoryListeners } from './store/listeners/conversationDirectoryListeners';
 import { initOrgSettingsListeners } from './store/listeners/orgSettingsListeners';
 import { initProjectOrgListeners } from './store/listeners/projectOrgListeners';
+import { initOrgProjectWalkListeners } from './store/listeners/orgProjectWalkListeners';
 import { initCollabScopeListeners } from './store/listeners/collabScopeListeners';
 import { initCollabReplicaListeners } from './store/listeners/collabReplicaListeners';
 import { initCollabConversionListeners } from './store/listeners/collabConversionListeners';
@@ -138,9 +148,12 @@ import { initDbMigrationListeners } from './store/listeners/dbMigrationListeners
 import { initOpenAICodexAuthListeners } from './store/listeners/openAICodexAuthListeners';
 import { initThemeListener } from './store/listeners/themeListeners';
 import { initWindowMenuListener } from './store/listeners/windowMenuListeners';
+import { initWorkspaceActivationListeners } from './store/listeners/workspaceActivationListeners';
+import { initWindowFullScreenListener } from './store/listeners/windowFullScreenListeners';
 import { initThemeFallbackListener } from './store/listeners/themeFallbackListeners';
 import { initTrackerSyncListeners } from './store/listeners/trackerSyncListeners';
 import { initPullRequestListeners } from './store/listeners/pullRequestListeners';
+import { initGithubIssueListeners } from './store/listeners/githubIssueListeners';
 import { initReadReceiptListeners } from './store/listeners/readReceiptListeners';
 import { initWorktreeListeners } from './store/listeners/worktreeListeners';
 import { initBlitzListeners } from './store/listeners/blitzListeners';
@@ -151,14 +164,28 @@ import { TrackerMode } from './components/TrackerMode';
 import { PullRequestMode, type PullRequestModeRef } from './components/PullRequestMode';
 import { CollabMode, type CollabModeRef } from './components/CollabMode';
 import { RemoteSessionsView } from './components/RemoteSessions/RemoteSessionsView';
-import { TeamManagementApp } from './components/TeamMode';
+import {
+  OrgModeHost,
+  PROJECT_ORG_MODE_SURFACE_ID,
+  TeamManagementApp,
+  type OrgModeHostRef,
+} from './components/TeamMode';
+import { useProjectOrg } from './hooks/useProjectOrg';
+import { shouldLeaveOrgMode } from '../shared/orgProjectWalk';
+import { TrayPanelApp } from './components/TrayPanel/TrayPanelApp';
+import { MenuBarIslandApp } from './components/MenuBarIsland/MenuBarIslandApp';
 import { TerminalBottomPanel } from './components/TerminalBottomPanel';
 import { SessionLaunchPopup } from './components/UnifiedAI/SessionLaunchPopup';
+import { TrackerQuickCreatePopup } from './components/TrackerQuickCreate/TrackerQuickCreatePopup';
 import { ProjectRail } from './components/ProjectRail';
 import {
   WindowTopBar,
+  type WindowTopBarGitActivity,
+  type WindowTopBarGitActivityEntry,
   type WindowTopBarPanelControls,
 } from './components/WindowTopBar';
+import { resolveCreateAction, type CreateKind } from '../shared/createActions';
+import { titleBarCreateMenusAtom } from './store/atoms/titleBarCreate';
 import { AccountExpiryBanner } from './components/Accounts/AccountExpiryBanner';
 import { organizationDirectoryAtom, personalAccountsAtom } from './store/atoms/settingsDomains';
 import {
@@ -171,13 +198,11 @@ import { registerTrackerLinkPlugin } from './plugins/registerTrackerLinkPlugin';
 import { registerAIChatPlugin } from './plugins/registerAIChatPlugin';
 import { registerTrackerPlugin } from './plugins/registerTrackerPlugin';
 import { registerSearchReplacePlugin } from './plugins/registerSearchReplacePlugin';
-import { registerMockupPlugin } from './plugins/registerMockupPlugin';
 import { registerEmbedFrame } from './components/EmbedFrame';
 import { registerExtensionSystem, setExtensionWorkspacePath } from './plugins/registerExtensionSystem';
 import { SettingsView } from './components/Settings/SettingsView';
 import type { SettingsCategory } from './components/Settings/SettingsSidebar';
 import { loadCustomTrackers } from './services/CustomTrackerLoader';
-import { MockupPickerMenuHost } from './components/MockupPickerMenu';
 import { ExtensionHostComponents } from './components/ExtensionHostComponents';
 // ClaudeCommandsToast removed - commands now provided via extension-based claude plugins
 import { UpdateToast } from './components/UpdateToast';
@@ -197,6 +222,7 @@ import {
   electronStorageBackend,
   initializeElectronStorageBackend,
 } from './extensions/panels';
+import { registerBuiltinCustomEditors } from './components/CustomEditors/registerBuiltinCustomEditors';
 import { setStorageBackend, getExtensionEditorAPI } from '@nimbalyst/runtime';
 import { store, editorDirtyAtom, makeEditorKey } from '@nimbalyst/runtime/store';
 import { extensionPanelAIContextAtom } from './store/atoms/extensionPanels';
@@ -212,7 +238,14 @@ import {
   sidebarCollapsedAtomFamily,
 } from './store/atoms/workspaceLayout';
 import { gitStatusAtom } from './store/atoms/gitOperations';
+import { activeFileRepoPathAtom, workspaceRepoPathsAtom } from './store/atoms/workspaceRepos';
+import { repoLabels } from './utils/workspaceRepos';
 import { normalizeGitStatus } from './utils/gitStatus';
+import { useGitActivity, type GitActivityEntry } from './hooks/useGitActivity';
+import {
+  GIT_SHOW_OUTPUT_REQUEST_EVENT,
+  type GitShowOutputRequestDetail,
+} from '@nimbalyst/extension-sdk/git-operation-log';
 import {
   defaultAgentModelAtom,
   developerModeAtom,
@@ -241,15 +274,19 @@ import {
   showSessionImportDialogRequestAtom,
   showTrustToastRequestAtom,
   toggleAIChatPanelRequestAtom,
+  toggleExpandedTabRequestAtom,
+  trackerQuickCreateRequestAtom,
 } from './store/atoms/appCommands';
-import { isCollabUri } from './utils/collabUri';
+import { isCollabUri } from '@nimbalyst/collab-protocol';
 import {
   collabConnectionStatusAtom,
   hasCollabUnsyncedChanges,
 } from './store/atoms/collabEditor';
 import {
   initTrackerPanelLayout,
+  toggleTrackerSidebarCollapsedAtom,
   trackerModeLayoutAtom,
+  trackerSidebarCollapsedAtom,
 } from './store/atoms/trackers';
 import { prNavigateRequestAtom } from './store/atoms/pullRequests';
 import {
@@ -294,7 +331,6 @@ if (!pluginsRegistered) {
   registerTrackerPlugin(null); // Load built-in trackers now, custom trackers loaded in AppLayout
   registerAIChatPlugin();
   registerSearchReplacePlugin(); // Search/replace bar in fixed tab header
-  registerMockupPlugin(); // Mockup embedding support
   registerEmbedFrame(); // Inline embeds of extension editors in markdown docs
   pluginsRegistered = true;
 }
@@ -314,6 +350,10 @@ export default function App() {
 
   // Register custom editors and extensions based on settings
   useEffect(() => {
+    // Core editors first and synchronously, so a file type owned by the app
+    // (`.canvas`) is claimed even while extension discovery is still running.
+    registerBuiltinCustomEditors();
+
     const registerCustomEditors = async () => {
       try {
         // Set up storage backend for extensions BEFORE loading extensions
@@ -384,6 +424,7 @@ export default function App() {
     const cleanupTrackerSync = initTrackerSyncListeners();
     const cleanupWorktree = initWorktreeListeners();
     const cleanupPullRequest = initPullRequestListeners();
+    const cleanupGithubIssue = initGithubIssueListeners();
     const cleanupReadReceipts = initReadReceiptListeners();
     const cleanupBlitz = initBlitzListeners();
     const cleanupUpdate = initUpdateListeners();
@@ -392,15 +433,21 @@ export default function App() {
     const cleanupNetworkAvailability = initNetworkAvailabilityListeners();
     const cleanupTeamInbox = initTeamInboxListeners();
     const cleanupConversations = initConversationListeners();
+    const cleanupFeedbackRequests = initFeedbackRequestListeners();
     const cleanupConversationDirectory = initConversationDirectoryListeners();
     const cleanupOrgSettings = initOrgSettingsListeners();
     const cleanupProjectOrg = initProjectOrgListeners();
+    const cleanupOrgProjectWalk = initOrgProjectWalkListeners();
     const cleanupCollabScope = initCollabScopeListeners();
     const cleanupCollabReplicas = initCollabReplicaListeners();
     const cleanupCollabConversion = initCollabConversionListeners();
     const cleanupWindowMenu = initWindowMenuListener();
+    const cleanupWindowFullScreen = initWindowFullScreenListener();
+    const cleanupWorkspaceActivation = initWorkspaceActivationListeners();
     return () => {
+      cleanupWorkspaceActivation?.();
       cleanupWindowMenu?.();
+      cleanupWindowFullScreen?.();
       cleanupActionPrompts?.();
       cleanupAiCommands?.();
       cleanupAppCommands?.();
@@ -426,6 +473,7 @@ export default function App() {
       cleanupTrackerSync?.();
       cleanupWorktree?.();
       cleanupPullRequest?.();
+      cleanupGithubIssue?.();
       cleanupReadReceipts?.();
       cleanupBlitz?.();
       cleanupUpdate?.();
@@ -434,9 +482,11 @@ export default function App() {
       cleanupNetworkAvailability?.();
       cleanupTeamInbox?.();
       cleanupConversations?.();
+      cleanupFeedbackRequests?.();
       cleanupConversationDirectory?.();
       cleanupOrgSettings?.();
       cleanupProjectOrg?.();
+      cleanupOrgProjectWalk?.();
       cleanupCollabScope?.();
       cleanupCollabReplicas?.();
       cleanupCollabConversion?.();
@@ -497,6 +547,7 @@ export default function App() {
     return (
       <WorkspaceManagerOnboarding
         showOnboarding={urlParams.get('onboarding') === '1'}
+        safeMode={urlParams.get('safeMode') === '1'}
       />
     );
   }
@@ -534,6 +585,17 @@ export default function App() {
   // (2026-07-17 decision-log correction). TeamManagementApp sets its own title.
   if (windowMode === 'team-management') {
     return <TeamManagementApp />;
+  }
+
+  // Menu-bar sessions panel. A frameless tray-anchored window with no title.
+  if (windowMode === 'tray-panel') {
+    return <TrayPanelApp />;
+  }
+
+  // The menu bar island: the fleet strip drawn in the menu bar row itself,
+  // expanding into the same session rows the panel above shows.
+  if (windowMode === 'menu-bar-island') {
+    return <MenuBarIslandApp />;
   }
 
   // IMPORTANT: These are refs, not state, to prevent re-renders when the active file changes.
@@ -617,15 +679,73 @@ export default function App() {
   const setActiveMode = useSetAtom(setWindowModeAtom);
   const toggleAgentCollapsed = useSetAtom(toggleSessionHistoryCollapsedAtom);
   const agentHistoryCollapsed = useAtomValue(sessionHistoryCollapsedAtom);
+  const toggleTrackerCollapsed = useSetAtom(toggleTrackerSidebarCollapsedAtom);
+  const trackerSidebarCollapsed = useAtomValue(trackerSidebarCollapsedAtom);
   const filesSidebarCollapsed = useAtomValue(sidebarCollapsedAtomFamily(workspacePath || ''));
   const filesAIChatCollapsed = useAtomValue(aiChatCollapsedAtomFamily(workspacePath || ''));
   const toggleAIChatPanelVersion = useAtomValue(toggleAIChatPanelRequestAtom);
+  const toggleExpandedTabVersion = useAtomValue(toggleExpandedTabRequestAtom);
   const gitStatus = useAtomValue(gitStatusAtom);
   const setGitStatus = useSetAtom(gitStatusAtom);
+  // Projection of the main-process Git journal, so the title bar shows commands
+  // this window did not start (Git panel, agent sessions) as well as its own.
+  const gitActivity = useGitActivity(workspacePath);
   const [gitActionState, setGitActionState] = useState<{
     busyAction: 'pull' | 'push' | null;
     feedback: { kind: 'success' | 'error'; message: string } | null;
   }>({ busyAction: null, feedback: null });
+
+  /**
+   * Which repository the title-bar indicator reports on.
+   *
+   * It follows the active file, so editing a file in an attached folder shows
+   * that folder's branch. Picking a repo from the menu pins it until the active
+   * file moves to a different repo, which is the point at which the pin has
+   * clearly stopped describing what the user is looking at.
+   *
+   * A single-folder project has exactly one repo, so this is the workspace path
+   * and nothing about the indicator changes.
+   */
+  const workspaceRepoPaths = useAtomValue(workspaceRepoPathsAtom);
+  const activeFileRepoPath = useAtomValue(activeFileRepoPathAtom);
+  const [pinnedGitRepoPath, setPinnedGitRepoPath] = useState<string | null>(null);
+  useEffect(() => {
+    setPinnedGitRepoPath(null);
+  }, [activeFileRepoPath]);
+  const gitRepoPath =
+    (pinnedGitRepoPath && workspaceRepoPaths.includes(pinnedGitRepoPath) ? pinnedGitRepoPath : null)
+    ?? activeFileRepoPath
+    ?? workspacePath;
+
+  // Branch per repo for the git menu's repository rows. Read on menu open
+  // rather than kept live: N repos would otherwise mean N `git status` reads
+  // on every status event, for a list that is usually not on screen.
+  const [gitBranchByRepo, setGitBranchByRepo] = useState<Record<string, string>>({});
+  const loadGitRepoBranches = useCallback(() => {
+    if (workspaceRepoPaths.length < 2) return;
+    void Promise.all(
+      workspaceRepoPaths.map(async (repoPath) => {
+        try {
+          const result = await window.electronAPI?.invoke('git:status', repoPath);
+          return [repoPath, normalizeGitStatus(result)?.branch ?? ''] as const;
+        } catch {
+          return [repoPath, ''] as const;
+        }
+      }),
+    ).then((entries) => {
+      setGitBranchByRepo(Object.fromEntries(entries.filter(([, branch]) => branch)));
+    });
+  }, [workspaceRepoPaths]);
+
+  const gitReposForTopBar = useMemo(() => {
+    if (workspaceRepoPaths.length < 2) return [];
+    const labels = repoLabels(workspaceRepoPaths);
+    return workspaceRepoPaths.map((repoPath) => ({
+      path: repoPath,
+      label: labels[repoPath] ?? repoPath,
+      branch: gitBranchByRepo[repoPath],
+    }));
+  }, [workspaceRepoPaths, gitBranchByRepo]);
   const [agentPanelState, setAgentPanelState] = useState<AgentModePanelState>({
     available: false,
     visible: false,
@@ -655,18 +775,37 @@ export default function App() {
   useEffect(() => {
     let cancelled = false;
     setGitStatus(null);
-    if (!workspacePath) return () => {
+    if (!gitRepoPath) return () => {
       cancelled = true;
     };
 
+    // Two orderings can regress the displayed counts: a `git:status` response
+    // landing after a newer one, and a revisioned snapshot arriving out of
+    // order. `generation` settles the first, `appliedRevision` the second.
+    let generation = 0;
+    let appliedGeneration = 0;
+    let appliedRevision = -1;
+
+    const applySnapshot = (status: unknown, revision?: number) => {
+      if (cancelled) return;
+      if (revision !== undefined) {
+        if (revision <= appliedRevision) return;
+        appliedRevision = revision;
+      }
+      appliedGeneration = ++generation;
+      setGitStatus(normalizeGitStatus(status));
+    };
+
     const refreshGitStatus = async () => {
+      const requested = ++generation;
       try {
-        const result = await window.electronAPI?.invoke('git:status', workspacePath);
-        if (!cancelled) {
-          setGitStatus(normalizeGitStatus(result));
-        }
+        const result = await window.electronAPI?.invoke('git:status', gitRepoPath);
+        if (cancelled || requested < appliedGeneration) return;
+        appliedGeneration = requested;
+        setGitStatus(normalizeGitStatus(result));
       } catch (error) {
-        if (!cancelled) {
+        if (!cancelled && requested >= appliedGeneration) {
+          appliedGeneration = requested;
           setGitStatus(null);
           console.error('[App] Failed to refresh title-bar git status:', error);
         }
@@ -675,16 +814,25 @@ export default function App() {
 
     void refreshGitStatus();
     const unsubscribe = window.electronAPI?.git?.onStatusChanged?.((data) => {
-      if (data.workspacePath === workspacePath) {
-        void refreshGitStatus();
+      // Multi-root: a move in a repo the indicator is not showing must not
+      // repaint it, and must never have its snapshot applied. Payloads without
+      // `repoPath` predate multi-root and only ever concern the one repo.
+      const eventRepo = data.repoPath ?? data.workspacePath;
+      if (eventRepo !== gitRepoPath) return;
+      // Main computes the snapshot when it publishes a revision; the index and
+      // ref watchers still send the legacy path-only shape, which needs a read.
+      if (data.status) {
+        applySnapshot(data.status, data.revision);
+        return;
       }
+      void refreshGitStatus();
     });
 
     return () => {
       cancelled = true;
       unsubscribe?.();
     };
-  }, [setGitStatus, workspacePath]);
+  }, [setGitStatus, gitRepoPath]);
 
   useEffect(() => {
     if (activeMode === 'pr-review' && !developerMode) {
@@ -731,6 +879,17 @@ export default function App() {
       if (typeof off === 'function') off();
     };
   }, [isControllerPopover]);
+
+  // Org mode is the project's own organization; the standalone org window keeps
+  // its own selection. Resolving it here also gates the gutter item, the
+  // shortcut and the mount.
+  const { org: projectOrg, loading: projectOrgLoading } = useProjectOrg(workspacePath);
+
+  useEffect(() => {
+    if (shouldLeaveOrgMode({ activeMode, projectOrg, projectOrgLoading })) {
+      setActiveMode('files');
+    }
+  }, [activeMode, projectOrg, projectOrgLoading, setActiveMode]);
 
   const openMarketplaceInstallRequest = useCallback((request: { extensionId: string; requestedAt?: string }) => {
     if (!request.extensionId) return;
@@ -1072,6 +1231,7 @@ export default function App() {
   const agentModeRef = useRef<AgentModeRef>(null);
   const editorModeRef = useRef<EditorModeRef>(null);
   const collabModeRef = useRef<CollabModeRef | null>(null);
+  const orgModeRef = useRef<OrgModeHostRef | null>(null);
   const pullRequestModeRef = useRef<PullRequestModeRef | null>(null);
 
   const toggleActiveLeftPane = useCallback(() => {
@@ -1082,8 +1242,12 @@ export default function App() {
       toggleAgentCollapsed();
     } else if (activeMode === 'collab') {
       collabModeRef.current?.toggleSidebarCollapsed();
+    } else if (activeMode === 'tracker') {
+      toggleTrackerCollapsed();
+    } else if (activeMode === 'org') {
+      orgModeRef.current?.toggleSidebarCollapsed();
     }
-  }, [activeMode, isFullscreenPanelActive, toggleAgentCollapsed]);
+  }, [activeMode, isFullscreenPanelActive, toggleAgentCollapsed, toggleTrackerCollapsed]);
 
   const toggleActiveRightPane = useCallback(() => {
     if (isFullscreenPanelActive) return;
@@ -1098,6 +1262,19 @@ export default function App() {
     }
   }, [activeMode, isFullscreenPanelActive]);
 
+  // Expand the active tab to fill the window — the menu/shortcut equivalent of
+  // double-clicking a tab. Only the modes that own editor tabs implement it.
+  const toggleActiveEditorMaximized = useCallback(() => {
+    if (isFullscreenPanelActive) return;
+    if (activeMode === 'files') {
+      editorModeRef.current?.toggleEditorMaximized();
+    } else if (activeMode === 'agent') {
+      agentModeRef.current?.toggleEditorMaximized();
+    } else if (activeMode === 'collab') {
+      collabModeRef.current?.toggleEditorMaximized();
+    }
+  }, [activeMode, isFullscreenPanelActive]);
+
   // Route the ApplicationMenu command through the same mode-owned pane action
   // used by WindowTopBar. Track the request version so React effect replays
   // cannot toggle the pane twice.
@@ -1107,6 +1284,13 @@ export default function App() {
     handledAIChatToggleVersionRef.current = toggleAIChatPanelVersion;
     toggleActiveRightPane();
   }, [toggleAIChatPanelVersion, toggleActiveRightPane]);
+
+  const handledExpandedTabVersionRef = useRef(toggleExpandedTabVersion);
+  useEffect(() => {
+    if (toggleExpandedTabVersion === handledExpandedTabVersionRef.current) return;
+    handledExpandedTabVersionRef.current = toggleExpandedTabVersion;
+    toggleActiveEditorMaximized();
+  }, [toggleExpandedTabVersion, toggleActiveEditorMaximized]);
 
   const windowTopBarPanelControls = useMemo<WindowTopBarPanelControls | undefined>(() => {
     if (isFullscreenPanelActive) return undefined;
@@ -1184,6 +1368,17 @@ export default function App() {
         },
       };
     }
+    if (activeMode === 'tracker') {
+      // Tracker Mode has no title-bar right pane; its detail panel is owned by
+      // the main view.
+      return {
+        left: {
+          label: 'Tracker sidebar',
+          collapsed: trackerSidebarCollapsed,
+          onToggle: toggleActiveLeftPane,
+        },
+      };
+    }
     if (activeMode === 'pr-review') {
       // The PR list remains visible; this mode currently exposes only its
       // persisted right-side AI pane through the title-bar controls.
@@ -1207,43 +1402,100 @@ export default function App() {
     prPanelState,
     toggleActiveLeftPane,
     toggleActiveRightPane,
+    trackerSidebarCollapsed,
   ]);
 
+  /**
+   * The right end of the title bar. Always present, always a session — the
+   * button's value is that it has no exceptions, so there is deliberately no
+   * `return undefined` branch here. Each mode routes to whichever surface owns
+   * its chat rail; modes with no rail switch to Agent first, which is what
+   * "new session" means from a tracker or the org view anyway.
+   */
   const windowTopBarNewSessionControl = useMemo(() => {
-    if (isFullscreenPanelActive && activeFullscreenPanel?.aiSupported) {
-      return {
-        label: 'New AI session',
-        onCreate: () => {
-          void chatSidebarRef.current?.createNewSession();
-        },
-      };
-    }
-    if (activeMode === 'files') {
-      return {
-        label: 'New AI session',
-        onCreate: () => {
+    // Agent mode is the one place the left control already means "new session",
+    // and its menu carries the variants. A second identical button on the right
+    // would be pure duplication, so that mode gets one create control, on the
+    // left, where the session list it fills lives.
+    if (activeMode === 'agent') return undefined;
+
+    const startSession = () => {
+      if (isFullscreenPanelActive && activeFullscreenPanel?.aiSupported) {
+        void chatSidebarRef.current?.createNewSession();
+        return;
+      }
+      switch (activeMode) {
+        case 'files':
           void editorModeRef.current?.createNewChatSession();
-        },
-      };
-    }
-    if (activeMode === 'collab') {
-      return {
-        label: 'New AI session',
-        onCreate: () => {
+          return;
+        case 'collab':
           void collabModeRef.current?.createNewChatSession();
-        },
-      };
-    }
-    if (activeMode === 'pr-review') {
-      return {
-        label: 'New AI session',
-        onCreate: () => {
+          return;
+        case 'pr-review':
           void pullRequestModeRef.current?.createNewChatSession();
-        },
-      };
+          return;
+        default:
+          // Tracker, Organization and Settings have no chat rail of their own.
+          setActiveMode('agent');
+          setTimeout(() => void agentModeRef.current?.createNewSession(), 0);
+      }
+    };
+
+    return { label: 'New session', onCreate: startSession, primaryIcon: 'forum' };
+  }, [activeFullscreenPanel?.aiSupported, activeMode, isFullscreenPanelActive, setActiveMode]);
+
+  /**
+   * The left end of the title bar, sitting over the tree column. What it makes
+   * is whatever that tree is made of; `resolveCreateAction` is the single place
+   * that decides, shared with the Cmd+N accelerator so the two cannot drift.
+   */
+  const titleBarCreateMenus = useAtomValue(titleBarCreateMenusAtom);
+  const setTrackerQuickCreateRequest = useSetAtom(trackerQuickCreateRequestAtom);
+
+  const runCreateInTree = useCallback((kind: CreateKind, anchor?: HTMLElement | null) => {
+    switch (kind) {
+      case 'file':
+        editorModeRef.current?.createNewFile();
+        return;
+      case 'sharedDoc':
+        collabModeRef.current?.createNewDocument();
+        return;
+      case 'session':
+        void agentModeRef.current?.createNewSession();
+        return;
+      case 'trackerItem':
+        // Bumping the request atom is what the IPC listener for
+        // `tracker-quick-create-open` does. Dispatching a window event of that
+        // name looks equivalent and is not — that channel is IPC-only.
+        setTrackerQuickCreateRequest((value) => value + 1);
     }
-    return undefined;
-  }, [activeFullscreenPanel?.aiSupported, activeMode, isFullscreenPanelActive]);
+  }, []);
+
+  const windowTopBarNewInTreeControl = useMemo(() => {
+    const action = resolveCreateAction(activeMode);
+    if (!action) return undefined;
+
+    const menu = titleBarCreateMenus[activeMode] ?? null;
+
+    return {
+      label: action.label,
+      primaryIcon: action.kind === 'session' ? 'forum' : 'description',
+      destination: menu?.destination ?? null,
+      menuHeading: menu?.heading,
+      menuItems: menu?.items,
+      menuTestId: menu?.menuTestId,
+      primaryTrailing: menu?.primaryTrailing,
+      onCreate: (anchor?: HTMLElement | null) =>
+        menu?.onPrimary ? menu.onPrimary() : runCreateInTree(action.kind, anchor),
+    };
+  }, [activeMode, runCreateInTree, titleBarCreateMenus]);
+
+  // Cmd+N for the modes whose noun is neither a local file nor a session. Main
+  // resolves the kind with the same function the button uses.
+  useEffect(() => {
+    if (!window.electronAPI?.onCreateInTree) return undefined;
+    return window.electronAPI.onCreateInTree((kind) => runCreateInTree(kind as CreateKind));
+  }, [runCreateInTree]);
 
   const activeModeLabel = useMemo(() => {
     const labels: Record<ContentMode, string> = {
@@ -1251,6 +1503,7 @@ export default function App() {
       agent: 'Agent',
       tracker: 'Tracker',
       collab: 'Shared Docs',
+      org: 'Organization',
       'pr-review': 'PR Review',
       settings: 'Settings',
       'remote-sessions': 'Remote Sessions',
@@ -1258,17 +1511,21 @@ export default function App() {
     return labels[activeMode];
   }, [activeMode]);
 
+  /**
+   * `busyAction` is now only a re-entrancy guard and a label for the menu the
+   * user clicked; the running command itself is shown from the shared activity
+   * projection. Notably there is no status re-read here any more -- main
+   * publishes a revisioned snapshot when the operation settles, which is what
+   * keeps this bar and the Git panel on the same counts. Re-reading here raced
+   * that broadcast and could put the older answer on screen.
+   */
   const runTitleBarGitAction = useCallback(async (action: 'pull' | 'push') => {
-    if (!workspacePath || gitActionState.busyAction) return;
+    if (!gitRepoPath || gitActionState.busyAction) return;
     setGitActionState({ busyAction: action, feedback: null });
     try {
-      const result = await window.electronAPI.invoke(`git:${action}`, workspacePath);
+      const result = await window.electronAPI.invoke(`git:${action}`, gitRepoPath);
       if (!result?.success) {
         throw new Error(result?.error || `Git ${action} failed`);
-      }
-      const refreshedStatus = await window.electronAPI.invoke('git:status', workspacePath);
-      if (store.get(activeWorkspacePathAtom) === workspacePath) {
-        setGitStatus(normalizeGitStatus(refreshedStatus));
       }
       setGitActionState({
         busyAction: null,
@@ -1286,9 +1543,9 @@ export default function App() {
         },
       });
     }
-  }, [gitActionState.busyAction, setGitStatus, workspacePath]);
+  }, [gitActionState.busyAction, gitRepoPath]);
 
-  const handleOpenGitLog = useCallback(() => {
+  const handleOpenGitLog = useCallback((options?: { showOutput?: boolean }) => {
     const panelId = 'com.nimbalyst.git.git-log';
     const panel = getPanelById(panelId);
     if (!panel || panel.placement !== 'bottom') {
@@ -1303,7 +1560,35 @@ export default function App() {
     }
     setActiveExtensionBottomPanel(panelId);
     closeTerminalPanel();
-  }, [closeTerminalPanel]);
+    if (options?.showOutput && workspacePath) {
+      // Which tab is showing is the panel's own state; ask for Output rather
+      // than reaching into the extension bundle to set it.
+      window.dispatchEvent(
+        new CustomEvent<GitShowOutputRequestDetail>(GIT_SHOW_OUTPUT_REQUEST_EVENT, {
+          detail: { workspacePath },
+        }),
+      );
+    }
+  }, [closeTerminalPanel, workspacePath]);
+
+  const handleOpenGitActivity = useCallback(() => {
+    handleOpenGitLog({ showOutput: true });
+  }, [handleOpenGitLog]);
+
+  const gitActivityForTopBar = useMemo<WindowTopBarGitActivity>(() => {
+    const toIndicatorEntry = (entry: GitActivityEntry): WindowTopBarGitActivityEntry => ({
+      id: entry.id,
+      command: entry.command,
+      source: entry.source ?? 'nimbalyst',
+      sessionId: entry.sessionId,
+    });
+    return {
+      running: gitActivity.runningEntries.map(toIndicatorEntry),
+      latest: gitActivity.latestRunningEntry
+        ? toIndicatorEntry(gitActivity.latestRunningEntry)
+        : null,
+    };
+  }, [gitActivity]);
 
   const handleOpenGitExtensionSettings = useCallback(() => {
     setGitActionState({ busyAction: null, feedback: null });
@@ -1482,7 +1767,7 @@ export default function App() {
   // Wrapper for workspace file selection - delegates to EditorMode
   // CRITICAL: Use activeModeStateRef.current to avoid stale closure bugs
   // This function is passed to AgenticPanel and stored in callbacks that may have stale references
-  const handleWorkspaceFileSelect = useCallback(async (filePath: string) => {
+  const handleWorkspaceFileSelect = useCallback(async (filePath: string, location?: EditorRevealPosition) => {
     const currentMode = activeModeStateRef.current;
 
     // CRITICAL: If workspacePath is null, something is very wrong
@@ -1501,6 +1786,13 @@ export default function App() {
       await editorModeRef.current.selectFile(filePath);
     } else {
       console.error('[App.handleWorkspaceFileSelect] editorModeRef.current is null! This should never happen if workspacePath is set.');
+      return;
+    }
+
+    // Queued rather than applied: the tab may still be mounting. The registry
+    // replays it once the editor for this path registers.
+    if (location) {
+      revealEditorPosition(filePath, location);
     }
   }, [workspacePath]); // Only workspacePath - activeMode is read from ref
 
@@ -1921,6 +2213,7 @@ export default function App() {
     openHistoryForCurrentDocument,
     isFullscreenPanelActive,
     exitFullscreenPanel: () => setActiveExtensionPanel(null),
+    orgModeAvailable: !!projectOrg,
   });
 
   // Extension-contributed keybindings (reads from manifests, fires commands via registry)
@@ -2092,9 +2385,11 @@ export default function App() {
   useEffect(() => {
     const handleCommitWithAi = async (event: CustomEvent<{
       workspacePath: string;
+      /** The repo the git panel's picker selected, when it sent one. */
+      repoPath?: string;
       files: SelectedCommitFile[];
     }>) => {
-      const { workspacePath: commitWorkspacePath, files } = event.detail ?? {};
+      const { workspacePath: commitWorkspacePath, repoPath: commitRepoPath, files } = event.detail ?? {};
       if (!commitWorkspacePath || !Array.isArray(files) || files.length === 0) return;
 
       const commitFiles = mapSelectedCommitFiles(files);
@@ -2114,6 +2409,7 @@ export default function App() {
         const sessionId = await dispatchCreateNewSession({
           title: `Commit: ${commitFiles.length} ${commitFiles.length === 1 ? 'file' : 'files'}`,
           mode: 'agent',
+          launchSource: 'commit_flow',
         });
 
         if (!sessionId) {
@@ -2125,7 +2421,7 @@ export default function App() {
           detail: { sessionId, workspacePath: commitWorkspacePath },
         }));
 
-        const message = buildSelectedCommitPrompt(commitFiles);
+        const message = buildSelectedCommitPrompt(commitFiles, commitRepoPath);
         const docContext = {
           filePath: undefined,
           content: undefined,
@@ -2538,6 +2834,33 @@ export default function App() {
           const anchor = target as HTMLAnchorElement;
           const href = anchor.getAttribute('href');
 
+          // `nimbalyst://install/<extensionId>` -- the affordance /planning:nimbalyst-coach
+          // uses to recommend an extension. The OS-level deep-link handler
+          // already routes this scheme when it arrives from outside the app;
+          // a click on the same link *inside* the renderer had no branch here
+          // and silently did nothing. Opens Settings > Marketplace at that
+          // extension; it never installs on its own.
+          const installExtensionId = parseExtensionInstallLink(href);
+          if (installExtensionId) {
+            event.preventDefault();
+            event.stopPropagation();
+            openMarketplaceInstallRequest({ extensionId: installExtensionId });
+            return;
+          }
+
+          if (href?.startsWith('nimbalyst://conversation/')) {
+            event.preventDefault();
+            event.stopPropagation();
+            void window.electronAPI.invoke('deep-link:open-inbox-source', href)
+              .then((opened: boolean) => {
+                if (!opened) logger.ui.warn('Conversation link could not be opened:', href);
+              })
+              .catch((error: unknown) => {
+                logger.ui.error('Failed to open conversation link:', error);
+              });
+            return;
+          }
+
           // Check if it's an external link (http:// or https://)
           if (href && (href.startsWith('http://') || href.startsWith('https://'))) {
             event.preventDefault();
@@ -2585,7 +2908,10 @@ export default function App() {
     return () => {
       document.removeEventListener('click', handleClick, true);
     };
-  }, []);
+    // openMarketplaceInstallRequest is declared here rather than relying on it
+    // being incidentally stable -- an empty dep array would freeze the first
+    // closure, which is the stale-listener trap in docs/IPC_LISTENERS.md.
+  }, [openMarketplaceInstallRequest]);
 
   // Wait for both initial state and extensions to be ready before rendering editors
   // This ensures extension nodes (like DataModelNode) are published into the runtime extension stores.
@@ -2626,16 +2952,22 @@ export default function App() {
             onPush: () => {
               void runTitleBarGitAction('push');
             },
-            onOpenLog: handleOpenGitLog,
+            onOpenLog: () => handleOpenGitLog(),
+            onOpenActivity: handleOpenGitActivity,
             onOpenExtensionSettings: handleOpenGitExtensionSettings,
+            repos: gitReposForTopBar,
+            activeRepoPath: gitRepoPath,
+            onSelectRepo: setPinnedGitRepoPath,
+            onMenuOpen: loadGitRepoBranches,
             gitLogAvailable:
               getPanelById('com.nimbalyst.git.git-log')?.placement === 'bottom',
             busyAction: gitActionState.busyAction,
+            activity: gitActivityForTopBar,
             feedback: gitActionState.feedback,
           }}
           panelControls={windowTopBarPanelControls}
           newSessionControl={windowTopBarNewSessionControl}
-          workspacePath={workspacePath}
+          newInTreeControl={windowTopBarNewInTreeControl}
         />
       )}
       <div data-layout="workspace-row" className="flex flex-row flex-1 min-h-0">
@@ -2695,6 +3027,12 @@ export default function App() {
         }}
         onToggleCollabCollapsed={() => {
           collabModeRef.current?.toggleSidebarCollapsed();
+        }}
+        onToggleTrackerCollapsed={() => {
+          toggleTrackerCollapsed();
+        }}
+        onToggleOrgCollapsed={() => {
+          orgModeRef.current?.toggleSidebarCollapsed();
         }}
       />
 
@@ -2894,6 +3232,31 @@ export default function App() {
               {controllerMode && <RemoteSessionsView isActive={activeMode === 'remote-sessions'} />}
             </div>
 
+            {/* Org Mode - the project's organization inbox, rooms and DMs */}
+            <div
+              data-layout="org-mode-wrapper"
+              className={`flex-1 flex-col overflow-hidden min-h-0 ${
+                activeMode === 'org' && !isFullscreenPanelActive ? 'flex' : 'hidden'
+              }`}
+            >
+              {/* Activity: the surface holds a live room view and an inbox list,
+                  so hidden updates belong at background priority. */}
+              <Activity mode={activeMode === 'org' && !isFullscreenPanelActive ? 'visible' : 'hidden'}>
+                {projectOrg && (
+                  <OrgModeHost
+                    ref={orgModeRef}
+                    orgId={projectOrg.orgId}
+                    workspacePath={workspacePath || undefined}
+                    // Distinct from the standalone window's surface id, so the
+                    // two surfaces cannot navigate each other.
+                    surfaceId={PROJECT_ORG_MODE_SURFACE_ID}
+                    chrome="mode"
+                    isActive={activeMode === 'org'}
+                  />
+                )}
+              </Activity>
+            </div>
+
             {/* Extension Fullscreen Panel Mode */}
             {activeExtensionPanel && (() => {
               const panel = getPanelById(activeExtensionPanel);
@@ -2992,6 +3355,7 @@ export default function App() {
       {/* KeyboardShortcutsDialog, ApiKeyDialog, ProjectSelectionDialog, ErrorDialog are now managed by DialogProvider */}
       <GlobalHistoryDialog theme={theme === 'auto' ? 'dark' : theme} workspacePath={workspacePath || undefined} />
       <SessionLaunchPopup workspacePath={workspacePath} />
+      <TrackerQuickCreatePopup workspacePath={workspacePath} />
       <ConfirmDialog
         isOpen={confirmDialog.isOpen}
         title={confirmDialog.options.title}
@@ -3007,7 +3371,6 @@ export default function App() {
       {/* UnifiedOnboarding is now managed by DialogProvider via useOnboarding hook */}
       {/* ClaudeCommandsToast removed - commands now via extension-based plugins */}
       <ErrorToastContainer />
-      <MockupPickerMenuHost />
       <ExtensionHostComponents />
       <ExtensionPermissionPrompt />
       <UpdateToast />

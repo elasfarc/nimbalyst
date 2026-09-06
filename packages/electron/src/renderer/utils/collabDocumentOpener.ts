@@ -10,9 +10,9 @@
  * host scope so identical document URIs in two mounted scopes cannot alias.
  */
 
-import { buildCollabUri } from './collabUri';
+import { buildCollabUri } from '@nimbalyst/collab-protocol';
 import { logger } from './logger';
-import { createProxiedWebSocket } from './proxiedWebSocket';
+import { appendCollabUrlQuery, createProxiedWebSocket } from './proxiedWebSocket';
 import {
   getSharedDocumentDisplayName,
   normalizeCollabPath,
@@ -21,6 +21,7 @@ import {
 import { toStableAnalyticsCategory } from '../../shared/analytics/teamAnalytics';
 import { trackTeamAnalyticsEvent } from './teamAnalytics';
 import type { CollabOpenSource, CollabScope } from '@nimbalyst/collab-client/core';
+import type { TeamJwt, TeamMemberId } from '@nimbalyst/runtime/auth/jwtScopes';
 import { resolveDesktopCollabScope } from '../store/atoms/collabDocuments';
 
 /**
@@ -35,10 +36,10 @@ export interface CollabDocumentConfig {
   /** Last-known logical path used while the shared index resolves. */
   displayPath?: string;
   serverUrl: string;
-  getJwt: (opts?: { forceRefresh?: boolean }) => Promise<string>;
+  getJwt: (opts?: { forceRefresh?: boolean }) => Promise<TeamJwt>;
   /** Optional extra query appended to revision-history HTTP requests. */
   urlExtraQuery?: string;
-  userId: string;
+  teamMemberId: TeamMemberId;
   /** Stable local account identity used to partition encrypted replicas. */
   accountId: string;
   /** Human-readable display name (first+last from Stytch, falls back to email). */
@@ -184,7 +185,7 @@ export function findCollabConfigByDocumentId(
  *   documentKey: aesKey,
  *   serverUrl: 'wss://sync.nimbalyst.com',
  *   getJwt: () => stytchClient.getToken(),
- *   userId: 'user-xyz',
+ *   teamMemberId: asTeamMemberId('user-xyz'),
  *   addTab: tabsActions.addTab,
  * });
  */
@@ -231,7 +232,7 @@ export function openCollabDocument(options: CollabDocumentConfig & {
 
 // Re-exported for existing callers; the implementation lives in its own module
 // so collab providers can use it without importing this file (import cycle).
-export { createProxiedWebSocket };
+export { appendCollabUrlQuery, createProxiedWebSocket };
 
 /**
  * Resolve a collab config from the main process and populate the registry.
@@ -315,7 +316,7 @@ export async function resolveCollabConfigForUri(
       return null;
     }
 
-    const { orgId, title: resolvedTitle, serverUrl, accountId, userId, userName, userEmail, pendingUpdateBase64 } = result.config;
+    const { orgId, title: resolvedTitle, serverUrl, accountId, teamMemberId, userName, userEmail, pendingUpdateBase64 } = result.config;
     if (orgId !== scope.orgId) {
       logger.ui.error('[collabDocumentOpener] Resolved document org does not match scope:', {
         documentId,
@@ -337,17 +338,13 @@ export async function resolveCollabConfigForUri(
       ...resolvedMetadata,
       serverUrl,
       accountId,
-      userId,
+      teamMemberId,
       userName,
       userEmail,
       urlExtraQuery,
       pendingUpdateBase64,
       createWebSocket: hasWsProxy
-        ? (url: string) => createProxiedWebSocket(
-            urlExtraQuery
-              ? `${url}${url.includes('?') ? '&' : '?'}${urlExtraQuery}`
-              : url,
-          )
+        ? (url: string) => createProxiedWebSocket(appendCollabUrlQuery(url, urlExtraQuery))
         : undefined,
       getJwt: async (opts) => {
         const jwtResult = await window.electronAPI.documentSync.getJwt(orgId, opts?.forceRefresh);
@@ -464,7 +461,18 @@ export async function openCollabDocumentViaIPC(options: {
     throw new Error(result.error || 'Failed to resolve collaborative document config');
   }
 
-  const { orgId, documentId, title, serverUrl, accountId, userId, userName, userEmail, pendingUpdateBase64 } = result.config;
+  const {
+    orgId,
+    documentId,
+    title,
+    serverUrl,
+    accountId,
+    teamMemberId,
+    userName,
+    userEmail,
+    urlExtraQuery,
+    pendingUpdateBase64,
+  } = result.config;
   if (orgId !== options.scope.orgId) {
     throw new Error('Resolved collaborative document belongs to a different scope');
   }
@@ -496,12 +504,15 @@ export async function openCollabDocumentViaIPC(options: {
     isPinned: options.isPinned,
     serverUrl,
     accountId,
-    userId,
+    teamMemberId,
     userName,
     userEmail,
+    urlExtraQuery,
     initialContent: options.initialContent,
     pendingUpdateBase64,
-    createWebSocket: hasWsProxy ? createProxiedWebSocket : undefined,
+    createWebSocket: hasWsProxy
+      ? (url: string) => createProxiedWebSocket(appendCollabUrlQuery(url, urlExtraQuery))
+      : undefined,
     getJwt: async (opts) => {
       const jwtResult = await window.electronAPI.documentSync.getJwt(orgId, opts?.forceRefresh);
       if (!jwtResult.success || !jwtResult.jwt) {

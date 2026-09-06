@@ -46,6 +46,7 @@ import {
 } from './codexAppServer/codexAppServerBinary';
 import { terminateOwnedProcessTree } from './processTreeTermination';
 import { resolveCodexPermissionProfile } from './codexPermissionProfile';
+import { clampEffortLevel, parseEffortLevel } from '../effortLevels';
 import type {
   AnyItem,
   ApprovalResponse,
@@ -64,6 +65,8 @@ import type {
   ThreadResumeResponse,
   ThreadStartParams,
   ThreadStartResponse,
+  SkillsListResponse,
+  ThreadTokenUsageUpdatedNotification,
   TokenUsage,
   TurnCompletedNotification,
   TurnInterruptParams,
@@ -211,6 +214,8 @@ function extractNotificationRouting(paramsUnknown: unknown): {
 
 export class CodexAppServerProtocol implements AgentProtocol {
   readonly platform = 'codex-app-server';
+  /** Populated asynchronously by registerSkillRoots (#1253). */
+  private skillNames: string[] = [];
 
   private apiKey: string;
   private readonly resolveCodexPathOverride: () => string | undefined;
@@ -286,9 +291,17 @@ export class CodexAppServerProtocol implements AgentProtocol {
       // console.log('[CODEX][APPSERVER] thread resumed:', raw.threadId);
       return { id: raw.threadId, platform: this.platform, raw: raw as unknown as ProtocolSession['raw'] };
     } catch (err) {
-      console.warn('[CODEX][APPSERVER] thread/resume failed, falling back to thread/start:', err);
+      // #1254: this used to fall back to thread/start. The transcript still
+      // rendered every prior message, so a dropped history looked like the
+      // agent had spontaneously forgotten the conversation rather than like
+      // something had failed. Surface it and let the caller decide -- an
+      // interrupted turn is recoverable, silently discarded context is not.
       this.killChild(raw);
-      return this.createSession(options);
+      const detail = err instanceof Error ? err.message : String(err);
+      throw new Error(
+        `[CodexAppServer] thread/resume failed for thread ${sessionId}: ${detail}. `
+        + 'The previous conversation history was not restored; start a new session to continue.',
+      );
     }
   }
 
@@ -322,6 +335,8 @@ export class CodexAppServerProtocol implements AgentProtocol {
     };
 
     let usage: { input_tokens: number; output_tokens: number; total_tokens: number } | undefined;
+    let contextFillTokens: number | undefined;
+    let contextWindow: number | undefined;
     let fullText = '';
 
     const unsubscribers: Array<() => void> = [];
@@ -348,7 +363,18 @@ export class CodexAppServerProtocol implements AgentProtocol {
       }
 
       try {
-        this.dispatchNotification(method, params, push, raw, (delta) => { fullText += delta; }, (u) => { usage = u; });
+        this.dispatchNotification(
+          method,
+          params,
+          push,
+          raw,
+          (delta) => { fullText += delta; },
+          (u) => { usage = u; },
+          (c) => {
+            if (c.contextFillTokens !== undefined) contextFillTokens = c.contextFillTokens;
+            if (c.contextWindow !== undefined) contextWindow = c.contextWindow;
+          },
+        );
       } catch (err) {
         push({ kind: 'fail', error: err instanceof Error ? err : new Error(String(err)) });
       }
@@ -447,6 +473,10 @@ export class CodexAppServerProtocol implements AgentProtocol {
             type: 'complete',
             content: fullText,
             usage: usage ?? { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
+            // turn/completed carries no usage on this transport, so both of
+            // these come from thread/tokenUsage/updated earlier in the turn.
+            ...(contextFillTokens !== undefined ? { contextFillTokens } : {}),
+            ...(contextWindow !== undefined ? { contextWindow } : {}),
           };
           return;
         }
@@ -456,6 +486,29 @@ export class CodexAppServerProtocol implements AgentProtocol {
         try { unsub(); } catch { /* noop */ }
       }
       raw.activeTurnId = null;
+    }
+  }
+
+  /**
+   * Compact the thread's context via the app-server's own RPC (#1252).
+   *
+   * Codex runs compaction as a full turn of its own: `turn/started` ->
+   * `item/started` with `{ type: 'contextCompaction' }` -> `item/completed` ->
+   * `turn/completed`. The RPC itself resolves as soon as that turn is
+   * accepted, so this returning is "compaction started", not "compaction
+   * finished". The follow-up `thread/tokenUsage/updated` is what reports the
+   * reduced fill.
+   */
+  async compactSession(session: ProtocolSession): Promise<void> {
+    const raw = this.assertRaw(session);
+    if (!raw.threadId) {
+      throw new Error('[CodexAppServer] cannot compact: no active thread');
+    }
+    try {
+      await raw.client.request('thread/compact/start', { threadId: raw.threadId });
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      throw new Error(`[CodexAppServer] thread/compact/start failed: ${detail}`);
     }
   }
 
@@ -536,6 +589,7 @@ export class CodexAppServerProtocol implements AgentProtocol {
       const configHint = describeCodexConfigError(rawError);
       throw new Error(`[CodexAppServer] initialize failed: ${rawError}${configHint ? `\n\n${configHint}` : ''}`);
     }
+    this.registerSkillRoots(client, cwd);
     return {
       child,
       client,
@@ -547,6 +601,49 @@ export class CodexAppServerProtocol implements AgentProtocol {
       stderrTail,
       cleanupStarted: false,
     };
+  }
+
+  /**
+   * Point codex at Nimbalyst's exported skills (#1253).
+   *
+   * `AgentWorkflowService.syncCodexExports` already writes every Codex-targeted
+   * skill to `<workspace>/.agents/skills/.nimbalyst-generated/<name>/SKILL.md`,
+   * but codex only scans its own roots, so the agent saw none of them and
+   * plans built with the planning skills had no instructions to execute
+   * against. Registering the root closes that gap natively -- no prompt
+   * injection, and codex keeps owning skill resolution.
+   *
+   * Deliberately NOT awaited. The request is written to stdin before
+   * `thread/start`, and codex processes stdin in order, so the roots are
+   * registered first either way -- blocking on the response would just add a
+   * round trip to every session start and make an older codex that never
+   * answers hang the whole spawn. Failures are logged, never fatal: skills are
+   * an enhancement, not a precondition for running a turn.
+   */
+  private registerSkillRoots(client: JsonRpcClient, cwd: string): void {
+    Promise.resolve(
+      client.request('skills/extraRoots/set', {
+        extraRoots: [path.join(cwd, '.agents', 'skills', '.nimbalyst-generated')],
+      }),
+    )
+      .then(() => client.request<SkillsListResponse>('skills/list', {}))
+      .then((response) => {
+        // Cached for the `/` typeahead, which is synchronous and cannot wait on
+        // an RPC. An empty cache renders as "no skills" rather than blocking.
+        const names = (response?.data ?? [])
+          .flatMap((group) => group?.skills ?? [])
+          .map((skill) => skill?.name)
+          .filter((name): name is string => typeof name === 'string' && name.length > 0);
+        this.skillNames = Array.from(new Set(names)).sort();
+      })
+      .catch((err) => {
+        console.warn('[CODEX][APPSERVER] skills registration failed; Nimbalyst skills will not be visible to the agent:', err);
+      });
+  }
+
+  /** Skill names reported by the last `skills/list`, for the `/` typeahead. */
+  getSkillNames(): string[] {
+    return [...this.skillNames];
   }
 
   private extractDynamicTools(options: SessionOptions): DynamicToolSpec[] {
@@ -592,7 +689,12 @@ export class CodexAppServerProtocol implements AgentProtocol {
     );
 
     const effortLevel = options.raw?.effortLevel as string | undefined;
-    const reasoningEffortRaw = effortLevel === 'max' ? 'xhigh' : (effortLevel ?? 'high');
+    // Clamp to what this model's catalog entry accepts: gpt-5.4/5.5 stop at
+    // xhigh, gpt-5.6-luna at max, and only Astra/Sol/Terra reach ultra.
+    const reasoningEffortRaw = clampEffortLevel(
+      parseEffortLevel(effortLevel ?? 'high'),
+      options.model ?? undefined,
+    );
 
     const systemPrompt = (options.raw?.systemPrompt as string | undefined) ?? options.systemPrompt;
     const additionalDirectories = Array.isArray(options.raw?.additionalDirectories)
@@ -712,6 +814,74 @@ export class CodexAppServerProtocol implements AgentProtocol {
   }
 
   /**
+   * MCP tool calls codex has announced via `item/started` but not yet settled.
+   *
+   * Codex normally closes every one with an `item/completed`. Occasionally it
+   * does not: the call is announced, never reaches our MCP server, and no
+   * terminal event ever arrives. 13 of 3856 `update_session_meta` calls in one
+   * install ended this way, clustered — once a session started dropping them it
+   * kept dropping them. The server is not the culprit; a stale `/mcp/core`
+   * connection answers every POST with a fast 404, never a hang.
+   *
+   * The damage is that the transcript keeps an in-flight tool call forever and
+   * the agent goes on believing the call is merely slow. Sweeping at turn end
+   * settles it and gives us a log line naming the tool.
+   */
+  private inFlightMcpCalls = new Map<
+    string,
+    { server: string; tool: string; arguments?: unknown; startedAt: number }
+  >();
+
+  /**
+   * Settle every MCP tool call still open when a turn ends. A turn cannot end
+   * with a legitimately-pending tool call: codex blocks the turn on it.
+   */
+  private sweepOrphanedMcpCalls(
+    push: (entry: { kind: 'event'; event: ProtocolEvent } | { kind: 'end' } | { kind: 'fail'; error: Error }) => void,
+    threadId: string | undefined,
+    turnId: string | undefined,
+  ): void {
+    if (this.inFlightMcpCalls.size === 0) return;
+    const orphans = [...this.inFlightMcpCalls.entries()];
+    this.inFlightMcpCalls.clear();
+
+    for (const [itemId, call] of orphans) {
+      const waitedMs = Date.now() - call.startedAt;
+      console.warn(
+        `[CODEX][APPSERVER] tool call never settled: mcp__${call.server}__${call.tool} ` +
+          `(item ${itemId}, ${waitedMs}ms) -- the turn ended with it still in flight`
+      );
+      push({
+        kind: 'event',
+        event: {
+          type: 'tool_call',
+          toolCall: {
+            id: itemId,
+            name: `mcp__${call.server}__${call.tool}`,
+            arguments: call.arguments as Record<string, unknown> | undefined,
+            result: {
+              success: false,
+              error: `The ${call.tool} call was never completed by the agent transport (waited ${waitedMs}ms).`,
+            } as ToolResult,
+            // Rides on the toolCall, not the metadata: the transcript adapter
+            // forwards this object by reference, while metadata is dropped when
+            // the provider re-yields the chunk. The host reads it to repair
+            // calls whose effect would otherwise be silently lost.
+            orphaned: true,
+          } as NonNullable<ProtocolEvent['toolCall']> & { orphaned: boolean },
+          metadata: {
+            transport: 'app-server',
+            threadId,
+            turnId,
+            itemId,
+            orphaned: true,
+          },
+        },
+      });
+    }
+  }
+
+  /**
    * Translate a single codex notification into zero or more `ProtocolEvent`s.
    * Pushed entries terminate with either `{kind:'end'}` (turn/completed) or
    * `{kind:'fail',error}` (turn/failed).
@@ -723,6 +893,7 @@ export class CodexAppServerProtocol implements AgentProtocol {
     raw: AppServerSessionRaw,
     appendText: (delta: string) => void,
     setUsage: (u: { input_tokens: number; output_tokens: number; total_tokens: number }) => void,
+    setContext: (c: { contextFillTokens?: number; contextWindow?: number }) => void,
   ): void {
     const params = paramsUnknown as Record<string, unknown> | undefined;
     const summary = summarizeNotificationParams(method, paramsUnknown);
@@ -768,15 +939,33 @@ export class CodexAppServerProtocol implements AgentProtocol {
         return;
       }
       case 'thread/tokenUsage/updated': {
-        const usage = params?.usage as TokenUsage | undefined;
-        const normalized = normalizeUsage(usage);
+        // The payload nests everything under `tokenUsage`; reading `usage`
+        // here is what kept every Codex turn at zero tokens (#1251).
+        const n = params as unknown as ThreadTokenUsageUpdatedNotification;
+        const breakdown = n?.tokenUsage;
+        if (!breakdown) return;
+
+        // `total` is cumulative thread spend -- that is what the billing
+        // counters want. `last` is the live context fill, which is the only
+        // one that drops when the thread is compacted.
+        const normalized = normalizeUsage(breakdown.total ?? breakdown.last);
         if (normalized) setUsage(normalized);
+
+        // Settles on the `complete` event. A mid-turn snapshot would need a
+        // `usage` case in AgentProtocolTranscriptAdapter, which drops the type
+        // today -- emitting one here without that would be dead code.
+        const fill = pickTokenTotal(breakdown.last);
+        const window = breakdown.modelContextWindow;
+        if (fill !== undefined || window !== undefined) {
+          setContext({ contextFillTokens: fill, contextWindow: window });
+        }
         return;
       }
       case 'turn/completed': {
         const n = params as unknown as TurnCompletedNotification;
         const usage = normalizeUsage(n.usage);
         if (usage) setUsage(usage);
+        this.sweepOrphanedMcpCalls(push, n.threadId, n.turn?.id);
         if (n.turn?.status === 'failed') {
           const msg = n.turn?.error?.message ?? 'turn failed';
           push({ kind: 'fail', error: new Error(msg) });
@@ -789,6 +978,7 @@ export class CodexAppServerProtocol implements AgentProtocol {
       case 'error': {
         const n = params as unknown as ErrorNotification;
         const msg = n?.error?.message ?? 'codex app-server error';
+        this.sweepOrphanedMcpCalls(push, undefined, undefined);
         push({ kind: 'fail', error: new Error(msg) });
         return;
       }
@@ -871,12 +1061,21 @@ export class CodexAppServerProtocol implements AgentProtocol {
         arguments?: unknown;
       };
       if (!mcp.server || !mcp.tool) return;
+      const startedId = (mcp as { id?: string }).id;
+      if (startedId) {
+        this.inFlightMcpCalls.set(startedId, {
+          server: mcp.server,
+          tool: mcp.tool,
+          arguments: mcp.arguments,
+          startedAt: Date.now(),
+        });
+      }
       push({
         kind: 'event',
         event: {
           type: 'tool_call',
           toolCall: {
-            id: (mcp as { id?: string }).id,
+            id: startedId,
             name: `mcp__${mcp.server}__${mcp.tool}`,
             arguments: mcp.arguments as Record<string, unknown> | undefined,
           },
@@ -885,7 +1084,7 @@ export class CodexAppServerProtocol implements AgentProtocol {
             stage: 'started',
             threadId: n.threadId,
             turnId: n.turnId,
-            itemId: (mcp as { id?: string }).id,
+            itemId: startedId,
             method: 'item/started',
           },
         },
@@ -986,6 +1185,8 @@ export class CodexAppServerProtocol implements AgentProtocol {
           error?: { message: string };
           status: string;
         };
+        const completedId = (mcp as { id?: string }).id;
+        if (completedId) this.inFlightMcpCalls.delete(completedId);
         push({
           kind: 'event',
           event: {
@@ -1085,7 +1286,10 @@ export class CodexAppServerProtocol implements AgentProtocol {
     const record = item as Record<string, unknown>;
     const args: Record<string, unknown> = {};
     for (const [key, value] of Object.entries(record)) {
-      if (value === undefined) continue;
+      // Generic started items can carry null/empty output placeholders (for
+      // example webSearch's `action`, `results`, and empty `query`). Do not
+      // expose those placeholders as user-visible tool arguments.
+      if (value == null || value === '') continue;
       if (['id', 'type', 'status', 'result', 'error', 'aggregated_output', 'exit_code', 'text', 'content', 'items'].includes(key)) {
         continue;
       }
@@ -1097,18 +1301,22 @@ export class CodexAppServerProtocol implements AgentProtocol {
   private buildGenericToolLikeResult(item: AnyItem): ToolResult | string {
     const record = item as Record<string, unknown>;
     const error = record.error as { message?: string } | undefined;
+    // This helper is called only from item/completed. The envelope is the
+    // lifecycle authority: current Codex webSearch payloads omit `status`, so
+    // equality with the optional duplicate field would mislabel success.
+    const success = record.status !== 'failed' && !error?.message;
     if (error?.message) {
       return { success: false, error: error.message } as ToolResult;
     }
     if (record.result !== undefined) {
       return {
-        success: record.status === 'completed',
+        success,
         result: record.result,
       } as ToolResult;
     }
     if (typeof record.aggregated_output === 'string' || typeof record.exit_code === 'number') {
       return {
-        success: record.status === 'completed',
+        success,
         output: record.aggregated_output,
         exit_code: record.exit_code,
       } as ToolResult;
@@ -1121,7 +1329,7 @@ export class CodexAppServerProtocol implements AgentProtocol {
       summary[key] = value;
     }
     return {
-      success: record.status === 'completed',
+      success,
       result: summary,
     } as ToolResult;
   }
@@ -1176,4 +1384,21 @@ function normalizeUsage(u: TokenUsage | undefined): { input_tokens: number; outp
   const total = u.total_tokens ?? u.totalTokens ?? input + output;
   if (input === 0 && output === 0 && total === 0) return undefined;
   return { input_tokens: input, output_tokens: output, total_tokens: total };
+}
+
+/**
+ * Total tokens from a codex breakdown, tolerating both casings. Returns
+ * undefined rather than 0 for a missing breakdown so callers can tell "no
+ * reading yet" from "genuinely empty context".
+ */
+function pickTokenTotal(u: TokenUsage | undefined): number | undefined {
+  if (!u) return undefined;
+  const total = u.total_tokens ?? u.totalTokens;
+  if (typeof total === 'number') return total;
+  const input = u.input_tokens ?? u.inputTokens;
+  const output = u.output_tokens ?? u.outputTokens;
+  if (typeof input === 'number' || typeof output === 'number') {
+    return (input ?? 0) + (output ?? 0);
+  }
+  return undefined;
 }

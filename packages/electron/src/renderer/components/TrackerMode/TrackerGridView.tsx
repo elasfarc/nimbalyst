@@ -39,6 +39,7 @@ import {
   globalRegistry,
   TrackerRowContextMenu,
   type TrackerColumnDef,
+  type TrackerLinkedSessionOption,
   type TypeColumnConfig,
 } from '@nimbalyst/runtime/plugins/TrackerPlugin';
 import { isCollectionType } from '@nimbalyst/runtime/plugins/TrackerPlugin/models/trackerCollections';
@@ -49,6 +50,7 @@ import {
 import {
   trackerItemsByTypeAtom,
   trackerDataLoadedAtom,
+  trackerRelationshipLabelAtom,
 } from '@nimbalyst/runtime/plugins/TrackerPlugin/trackerDataAtoms';
 import {
   getRecordTitle,
@@ -63,6 +65,7 @@ import {
   type TrackerFilterEvaluationContext,
   type TrackerFieldFilter,
   type TrackerFilterSet,
+  type TrackerGroupBy,
 } from '@nimbalyst/runtime/plugins/TrackerPlugin/models';
 import {
   buildGridActionsColumn,
@@ -70,14 +73,13 @@ import {
   buildGridSource,
   ROW_ACTIONS,
   ROW_ITEM_ID,
-} from './grid/trackerGridColumns';
-import type { RelationshipCandidate } from './grid/trackerGridEditors';
-import {
   TrackerFilterValueMenu,
-} from './TrackerFilterValueMenu';
-import type { TrackerFilterField } from './TrackerViewHeaderControls';
+  useGridKeyOriginGuard,
+  type RelationshipCandidate,
+  type TrackerFilterField,
+} from '@nimbalyst/collab-client/trackers-ui';
 import { errorNotificationService } from '../../services/ErrorNotificationService';
-import './grid/trackerGrid.css';
+import '@nimbalyst/collab-client/trackers-ui/grid.css';
 
 const ROW_GROUP_LABEL = '__trackerGroupLabel';
 
@@ -91,6 +93,7 @@ interface TrackerGridViewProps {
   filterType?: TrackerItemType | 'all';
   sortBy?: string;
   sortDirection?: 'asc' | 'desc';
+  groupBy?: TrackerGroupBy;
   onItemSelect?: (itemId: string) => void;
   onDetailClose?: () => void;
   selectedItemId?: string | null;
@@ -116,6 +119,14 @@ interface TrackerGridViewProps {
   onCopyDeepLink?: (itemId: string) => void;
   /** Open a row's item as a document -- double-click and the row context menu. */
   onOpenDocument?: (itemId: string) => void;
+  /** AI sessions already linked to a row's item, for the context menu submenu. */
+  getLinkedSessions?: (itemId: string) => TrackerLinkedSessionOption[];
+  /** Jump to an existing linked session from the row context menu. */
+  onOpenSession?: (sessionId: string) => void;
+  /** Start a new AI session for a row's item. */
+  onLaunchSession?: (itemId: string) => void;
+  /** Start a new isolated worktree session for a row's item. */
+  onLaunchWorktree?: (itemId: string) => void;
   favoriteItemIds?: ReadonlySet<string>;
   onToggleFavorite?: (itemId: string) => void;
 }
@@ -129,6 +140,7 @@ export function TrackerGridView({
   filterType = 'all',
   sortBy = 'lastIndexed',
   sortDirection = 'desc',
+  groupBy = 'none',
   onItemSelect,
   onDetailClose,
   selectedItemId,
@@ -150,6 +162,10 @@ export function TrackerGridView({
   onNewItem,
   onCopyDeepLink,
   onOpenDocument,
+  getLinkedSessions,
+  onOpenSession,
+  onLaunchSession,
+  onLaunchWorktree,
   favoriteItemIds,
   onToggleFavorite,
 }: TrackerGridViewProps): JSX.Element {
@@ -159,6 +175,7 @@ export function TrackerGridView({
 
   const atomItems = useAtomValue(trackerItemsByTypeAtom(activeTypeFilter));
   const dataLoaded = useAtomValue(trackerDataLoadedAtom);
+  const relationshipLabel = useAtomValue(trackerRelationshipLabelAtom);
   const sourceItems = overrideItems ?? atomItems;
 
   // Collections live outside the active type filter (you add bugs to a
@@ -234,8 +251,8 @@ export function TrackerGridView({
 
   const sortedItems = useMemo(() => {
     if (preserveItemOrder) return filteredItems;
-    return sortTrackerRecords(filteredItems, sortBy, sortDirection);
-  }, [filteredItems, sortBy, sortDirection, preserveItemOrder]);
+    return sortTrackerRecords(filteredItems, sortBy, sortDirection, allColumnDefs);
+  }, [allColumnDefs, filteredItems, sortBy, sortDirection, preserveItemOrder]);
 
   // The archive recorder needs `recordUndoEntry`, and the hook needs the
   // recorder so an archive undo inverts through the same callback. The ref
@@ -260,6 +277,7 @@ export function TrackerGridView({
   });
   const {
     handleItemUpdate,
+    handleItemsUpdate,
     runUndoable,
     recordUndoEntry,
     captureUndoGeneration,
@@ -280,7 +298,6 @@ export function TrackerGridView({
   } = rows;
   const gridRef = useRef<HTMLRevoGridElement | null>(null);
   const gridCanvasRef = useRef<HTMLDivElement | null>(null);
-  const focusOriginRef = useRef<'keyboard' | null>(null);
 
   // Row index -> record, kept in a ref so the edit handler never reads a stale
   // list after a re-render triggered by the write it just made.
@@ -383,13 +400,17 @@ export function TrackerGridView({
         sortingEnabled,
         favorites,
         rowActions: true,
+        keyLink: onItemSelect
+          ? { onOpenDetail: onItemSelect, onOpenDocument: onOpenDocument }
+          : undefined,
+        resolveRelationshipLabel: relationshipLabel,
       }),
       buildGridActionsColumn(),
     ],
     [
       visibleColumnDefs, schemaType, effectiveColumnConfig.columnWidths,
       isRowEditable, relationshipCandidates, filteredColumnIds, onColumnFiltersChange,
-      sortingEnabled, favorites,
+      sortingEnabled, favorites, onItemSelect, onOpenDocument, relationshipLabel,
     ],
   );
   const gridSorting = useMemo<SortingConfig | undefined>(() => {
@@ -410,16 +431,17 @@ export function TrackerGridView({
       ...row,
       [ROW_GROUP_LABEL]: getTrackerGroupLabel(
         sortedItems[index],
-        effectiveColumnConfig.groupBy,
+        groupBy,
+        relationshipLabel,
       ),
     })),
-    [effectiveColumnConfig.groupBy, sortedItems, visibleColumnDefs],
+    [groupBy, sortedItems, visibleColumnDefs, relationshipLabel],
   );
   const gridGrouping = useMemo(
-    () => effectiveColumnConfig.groupBy
+    () => groupBy !== 'none'
       ? { props: [ROW_GROUP_LABEL], expandedAll: true }
       : undefined,
-    [effectiveColumnConfig.groupBy],
+    [groupBy],
   );
 
   const resolveGridRowItem = useCallback(async (rowIndex: number): Promise<TrackerRecord | null> => {
@@ -510,13 +532,13 @@ export function TrackerGridView({
     return { fieldName, field };
   }, [isItemEditable, visibleColumnDefs]);
 
-  /** Commit one or more cells from the same row as one durable item update. */
-  const commitRow = useCallback(async (
+  /** Resolve one row edit without writing, so a range can cross IPC once. */
+  const prepareRow = useCallback(async (
     rowIndex: number,
     changes: Record<string, unknown>,
-  ): Promise<void> => {
+  ): Promise<{ item: TrackerRecord; updates: Record<string, unknown> } | null> => {
     const item = await resolveGridRowItem(rowIndex);
-    if (!item) return;
+    if (!item) return null;
 
     const updates: Record<string, unknown> = {};
     for (const [prop, rawValue] of Object.entries(changes)) {
@@ -528,26 +550,34 @@ export function TrackerGridView({
         updates[editable.fieldName] = value;
       }
     }
-    if (Object.keys(updates).length > 0) {
-      await handleItemUpdate(item, updates);
-    }
-  }, [handleItemUpdate, resolveEditableField, resolveGridRowItem]);
+    return Object.keys(updates).length > 0 ? { item, updates } : null;
+  }, [resolveEditableField, resolveGridRowItem]);
+
+  /** Commit one or more cells from the same row as one durable item update. */
+  const commitRow = useCallback(async (
+    rowIndex: number,
+    changes: Record<string, unknown>,
+  ): Promise<void> => {
+    const entry = await prepareRow(rowIndex, changes);
+    if (entry) await handleItemUpdate(entry.item, entry.updates);
+  }, [handleItemUpdate, prepareRow]);
 
   const handleAfterEdit = useCallback((event: RevoGridCustomEvent<AfterEditEvent>) => {
     const detail = event.detail;
 
     if (isRangeEdit(detail)) {
-      // Paste / fill-down: one write per touched row, so two cells in the same
-      // JSON-backed item cannot race and overwrite each other. The whole range
-      // is one undo entry so a mis-landed paste takes one Cmd+Z, not one per row.
+      // Paste / fill-down: collect one update per touched row, then cross IPC
+      // through the update-items batch seam. The whole range is one undo entry
+      // so a mis-landed paste takes one Cmd+Z, not one per row.
       const rowEntries = Object.entries(detail.data ?? {});
       const cellCount = rowEntries.reduce(
         (total, [, changes]) => total + Object.keys(changes as Record<string, unknown>).length,
         0,
       );
       void runUndoable(`Paste ${cellCount} cell${cellCount === 1 ? '' : 's'}`, async () => {
-        await Promise.all(rowEntries.map(([rowKey, changes]) =>
-          commitRow(Number(rowKey), changes as Record<string, unknown>)));
+        const resolved = await Promise.all(rowEntries.map(([rowKey, changes]) =>
+          prepareRow(Number(rowKey), changes as Record<string, unknown>)));
+        await handleItemsUpdate(resolved.filter((entry): entry is NonNullable<typeof entry> => entry !== null));
       });
       return;
     }
@@ -556,41 +586,7 @@ export function TrackerGridView({
     const prop = String(single.prop);
     const columnLabel = visibleColumnDefs.find(column => column.id === prop)?.label ?? prop;
     void runUndoable(`Edit ${columnLabel}`, () => commitRow(single.rowIndex, { [prop]: single.val }));
-  }, [commitRow, runUndoable, visibleColumnDefs]);
-
-  /**
-   * Double-click edits an editable cell and opens the row's item as a document
-   * otherwise. RevoGrid's own double-click handler already opened the inline
-   * editor by the time this runs, so opening the document over an editable cell
-   * would immediately throw the edit away. RevoGrid renders its own cells, so
-   * the row comes from the same `data-rgrow` attribute the context menu
-   * resolves against rather than a React row handler.
-   */
-  const handleGridDoubleClick = useCallback(async (
-    event: ReactMouseEvent<HTMLDivElement>,
-  ): Promise<void> => {
-    if (!onOpenDocument) return;
-    const cell = (event.target as HTMLElement | null)?.closest?.('[data-rgrow]');
-    const rowAttr = cell?.getAttribute('data-rgrow');
-    if (rowAttr == null) return;
-    const rowIndex = Number(rowAttr);
-    if (!Number.isFinite(rowIndex)) return;
-    const item = await resolveGridRowItem(rowIndex);
-    if (!item) return;
-
-    // The pointer down that started this double-click already focused the cell,
-    // so the focused column is the one under the cursor.
-    const focused = await gridRef.current?.getFocused?.();
-    const prop = focused?.column?.prop;
-    if (
-      focused?.cell?.y === rowIndex
-      && prop != null
-      && resolveEditableField(item, String(prop))
-    ) {
-      return;
-    }
-    onOpenDocument(item.id);
-  }, [onOpenDocument, resolveEditableField, resolveGridRowItem]);
+  }, [commitRow, handleItemsUpdate, prepareRow, runUndoable, visibleColumnDefs]);
 
   const openFocusedItem = useCallback(async (): Promise<void> => {
     const focused = await gridRef.current?.getFocused();
@@ -624,6 +620,10 @@ export function TrackerGridView({
     errorNotificationService.showInfo(title, body, { duration: 2500 });
   }, [redo, undo]);
 
+  // RevoGrid's document-level keydown listener acts on keys typed anywhere in the
+  // app while a cell is selected. Decline the ones that did not start in here.
+  useGridKeyOriginGuard(gridCanvasRef);
+
   const handleGridKeyDownCapture = useCallback((event: ReactKeyboardEvent<HTMLDivElement>) => {
     const key = event.key;
     const path = event.nativeEvent.composedPath();
@@ -635,12 +635,8 @@ export function TrackerGridView({
         || target.classList.contains('tracker-grid-editor-checkbox')
       ));
 
-    // RevoGrid owns editor keystrokes. Remember the keyboard origin so the
-    // focus change after Enter/Tab does not accidentally open the detail panel.
-    if (isEditing) {
-      if (key === 'Enter' || key === 'Tab') focusOriginRef.current = 'keyboard';
-      return;
-    }
+    // RevoGrid owns editor keystrokes.
+    if (isEditing) return;
 
     // Outside a cell editor Cmd/Ctrl+Z belongs to the grid's own history. The
     // app menu's `Edit > Undo` role does not swallow the keydown, so this runs.
@@ -648,17 +644,6 @@ export function TrackerGridView({
       event.preventDefault();
       event.stopPropagation();
       void replayUndoEntry(event.shiftKey ? 'redo' : 'undo');
-      return;
-    }
-
-    if (
-      key === 'ArrowUp'
-      || key === 'ArrowDown'
-      || key === 'ArrowLeft'
-      || key === 'ArrowRight'
-      || key === 'Tab'
-    ) {
-      focusOriginRef.current = 'keyboard';
       return;
     }
 
@@ -687,22 +672,20 @@ export function TrackerGridView({
     event: RevoGridCustomEvent<FocusAfterRenderEvent>,
   ) => {
     const rowIndex = event.detail?.rowIndex;
-    const keyboardFocused = focusOriginRef.current === 'keyboard';
-    focusOriginRef.current = null;
     if (typeof rowIndex !== 'number') return;
-    // A mouse focus opens details as before. Keyboard focus only changes the
-    // row while browsing; once details are open, it keeps the panel in sync.
-    if (onItemSelect && (!keyboardFocused || selectedItemId)) {
-      if (!effectiveColumnConfig.groupBy) {
-        const item = sortedItemsRef.current[rowIndex];
-        if (item) onItemSelect(item.id);
-        return;
-      }
-      void resolveGridRowItem(rowIndex).then(item => {
-        if (item) onItemSelect(item.id);
-      });
+    // Moving the selection never *opens* the detail pane -- that is the Key
+    // cell's job. It only follows the selection once the pane is already open,
+    // so arrowing down the grid reads as browsing the open item.
+    if (!onItemSelect || !selectedItemId) return;
+    if (groupBy === 'none') {
+      const item = sortedItemsRef.current[rowIndex];
+      if (item) onItemSelect(item.id);
+      return;
     }
-  }, [effectiveColumnConfig.groupBy, onItemSelect, resolveGridRowItem, selectedItemId]);
+    void resolveGridRowItem(rowIndex).then(item => {
+      if (item) onItemSelect(item.id);
+    });
+  }, [groupBy, onItemSelect, resolveGridRowItem, selectedItemId]);
 
   const handleBeforeSorting = useCallback((
     event: RevoGridCustomEvent<BeforeSortingDetail>,
@@ -865,10 +848,6 @@ export function TrackerGridView({
         className="tracker-grid-canvas relative min-h-0 flex-1 outline-none"
         onKeyDownCapture={handleGridKeyDownCapture}
         onContextMenu={(event) => { void handleGridContextMenu(event); }}
-        onDoubleClick={(event) => { void handleGridDoubleClick(event); }}
-        onPointerDownCapture={() => {
-          focusOriginRef.current = null;
-        }}
       >
         {sortedItems.length === 0 && !columnFiltersActive ? (
           <div className="tracker-grid-empty flex h-full flex-col items-center justify-center gap-2 text-sm text-nim-muted" data-testid="tracker-grid-empty">
@@ -984,6 +963,10 @@ export function TrackerGridView({
         onAddToCollection={handleAddSelectionToCollection}
         onCopyDeepLink={onCopyDeepLink}
         onOpenDocument={onOpenDocument}
+        getLinkedSessions={getLinkedSessions}
+        onOpenSession={onOpenSession}
+        onLaunchSession={onLaunchSession}
+        onLaunchWorktree={onLaunchWorktree}
         onArchiveItems={onArchiveItems ? archiveWithUndo : undefined}
         onDeleteItems={onDeleteItems}
         closeContextMenu={closeContextMenu}

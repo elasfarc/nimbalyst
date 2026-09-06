@@ -5,6 +5,7 @@ import { WorktreeIcon } from '../common/WorktreeIcon';
 import { groupSessionStatusAtom, sessionProcessingAtom, sessionUnreadAtom, sessionPendingPromptAtom } from '../../store';
 import { SessionContextMenu } from './SessionContextMenu';
 import { SessionRelativeTime } from './SessionRelativeTime';
+import { sessionAgentWakePendingAtom } from '../../store/atoms/teamInbox';
 
 import type { SessionMeta as SessionItem } from '../../store';
 
@@ -92,6 +93,7 @@ const BlitzGroupStatus: React.FC<{ sessionIds: string[] }> = memo(({ sessionIds 
 const BlitzSessionStatus: React.FC<{ sessionId: string }> = memo(({ sessionId }) => {
   const isProcessing = useAtomValue(sessionProcessingAtom(sessionId));
   const hasPendingPrompt = useAtomValue(sessionPendingPromptAtom(sessionId));
+  const hasAgentWakePending = useAtomValue(sessionAgentWakePendingAtom(sessionId));
   const hasUnread = useAtomValue(sessionUnreadAtom(sessionId));
 
   if (isProcessing) {
@@ -100,6 +102,9 @@ const BlitzSessionStatus: React.FC<{ sessionId: string }> = memo(({ sessionId })
         <MaterialSymbol icon="progress_activity" size={12} />
       </div>
     );
+  }
+  if (hasAgentWakePending) {
+    return <MaterialSymbol icon="hourglass_top" size={12} />;
   }
   if (hasPendingPrompt) {
     return (

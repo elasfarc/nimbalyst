@@ -36,7 +36,10 @@ import {
   SearchReplaceStateManager,
 } from '@nimbalyst/runtime';
 import { ModelIdentifier } from '@nimbalyst/runtime/ai/server/types';
+import type { TranscriptFileLocation } from '@nimbalyst/runtime/ui/AgentTranscript/components/MarkdownRenderer';
 import { WorkstreamEditorTabs, type WorkstreamEditorTabsRef } from './WorkstreamEditorTabs';
+import { usePushRepresentedFile } from '../../hooks/useRepresentedFileSync';
+import { resolveRepresentedFile } from '../../utils/representedFile';
 import { WorkstreamSessionTabs } from './WorkstreamSessionTabs';
 import { FilesEditedSidebar } from './FilesEditedSidebar';
 import { AgentReviewPanel } from './AgentReviewPanel';
@@ -110,6 +113,7 @@ import { defaultAgentModelAtom } from '../../store/atoms/appSettings';
 
 export interface AgentWorkstreamPanelRef {
   closeActiveTab: () => void;
+  toggleEditorMaximized: () => void;
 }
 
 export interface AgentWorkstreamPanelProps {
@@ -1184,19 +1188,20 @@ export const AgentWorkstreamPanel = React.memo(React.forwardRef<AgentWorkstreamP
     }
   }, [updateSessionStore, sessionWorktreeId, sessions.length]);
 
-  // Track pending file open when switching to split mode
-  const pendingFileOpenRef = useRef<string | null>(null);
+  // Track pending file open when switching to split mode. Carries the line
+  // location too, so a `file.md:653` link survives the layout flip.
+  const pendingFileOpenRef = useRef<{ filePath: string; location?: TranscriptFileLocation } | null>(null);
 
   // File clicks open in the workstream editor tabs
-  const handleFileClick = useCallback((filePath: string) => {
+  const handleFileClick = useCallback((filePath: string, location?: TranscriptFileLocation) => {
     if (editorTabsRef.current) {
       // Editor is mounted, open the file directly
-      editorTabsRef.current.openFile(filePath);
+      editorTabsRef.current.openFile(filePath, location);
     } else {
       // Editor not mounted (transcript mode), switch to split and queue file open
       // Set flag to prevent auto-collapse during this transition
       justOpenedFileRef.current = true;
-      pendingFileOpenRef.current = filePath;
+      pendingFileOpenRef.current = { filePath, location };
       setLayoutMode({ workstreamId, mode: 'split' });
     }
   }, [workstreamId, setLayoutMode]);
@@ -1349,10 +1354,19 @@ export const AgentWorkstreamPanel = React.memo(React.forwardRef<AgentWorkstreamP
     [showEditorTabs, activeEditorFile]
   );
 
+  // #1375: report the visible document to macOS as this window's AXDocument.
+  // Lives here, not in WorkstreamEditorTabs, because that unmounts entirely in
+  // the transcript-only layout and so could never clear what it had set.
+  usePushRepresentedFile(
+    isActive,
+    showEditorTabs ? resolveRepresentedFile(activeEditorFile) : null
+  );
+
   // Open pending file once editor mounts after layout mode change
   useEffect(() => {
-    if (pendingFileOpenRef.current && showEditorTabs && editorTabsRef.current) {
-      editorTabsRef.current.openFile(pendingFileOpenRef.current);
+    const pending = pendingFileOpenRef.current;
+    if (pending && showEditorTabs && editorTabsRef.current) {
+      editorTabsRef.current.openFile(pending.filePath, pending.location);
       pendingFileOpenRef.current = null;
     }
   }, [showEditorTabs]); // Re-run when editor becomes visible
@@ -1439,7 +1453,7 @@ export const AgentWorkstreamPanel = React.memo(React.forwardRef<AgentWorkstreamP
   // Trigger find in the active editor. Two strategies based on editor type:
   // - Monaco: dispatch synthetic Cmd+F keydown to its internal textarea, which
   //   Monaco's keybinding system processes to open its built-in find widget.
-  // - Lexical: use SearchReplaceStateManager.toggle() directly (same as Files mode).
+  // - Lexical: use SearchReplaceStateManager.openAndFocus() directly (same as Files mode).
   //   We can't use synthetic keydown because Lexical's SearchReplacePlugin checks
   //   isEditorActive (based on React state), which won't be true synchronously
   //   after focusing the contenteditable.
@@ -1463,8 +1477,8 @@ export const AgentWorkstreamPanel = React.memo(React.forwardRef<AgentWorkstreamP
       // Lexical or other editor - use SearchReplaceStateManager
       const activeFilePath = editorTabsRef.current?.getActiveFilePath();
       if (activeFilePath) {
-        console.log('[AgentWorkstreamPanel] triggerEditorFind: toggling SearchReplaceStateManager for', activeFilePath);
-        SearchReplaceStateManager.toggle(activeFilePath);
+        console.log('[AgentWorkstreamPanel] triggerEditorFind: opening SearchReplaceStateManager for', activeFilePath);
+        SearchReplaceStateManager.openAndFocus(activeFilePath);
       } else {
         console.log('[AgentWorkstreamPanel] triggerEditorFind: no active file path');
       }
@@ -1541,8 +1555,15 @@ export const AgentWorkstreamPanel = React.memo(React.forwardRef<AgentWorkstreamP
         editorTabsRef.current.closeActiveTab();
       }
       // If transcript has focus, do nothing - we don't want to close AI sessions with CMD+W
-    }
-  }), []);
+    },
+    // Menu/shortcut path for the same action as double-clicking a tab. With no
+    // editor tab open, maximizing would force layoutMode 'editor' only for the
+    // auto-collapse effect to bounce it back to the transcript, so only the
+    // restore direction stays live.
+    toggleEditorMaximized: () => {
+      if (isEditorMaximized || hasTabs) toggleEditorMaximized();
+    },
+  }), [isEditorMaximized, hasTabs, toggleEditorMaximized]);
 
   return (
     <div ref={panelRef} className="agent-workstream-panel flex flex-row h-full overflow-hidden">

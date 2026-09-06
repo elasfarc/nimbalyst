@@ -13,6 +13,10 @@ export const DIALOG_IDS = {
   // Navigation group: one tabbed dialog combines Files, In Files, Sessions,
   // Prompts, and Projects. Opened with an initialTab (defaults to Files).
   UNIFIED_QUICK_OPEN: 'unified-quick-open',
+  // Resolves an existing file or shared document to put on a project canvas.
+  // Same group as quick open: both are "pick a document", and two of them on
+  // screen at once is never what the user meant.
+  CANVAS_CARD_PICKER: 'canvas-card-picker',
 
   // Help group
   KEYBOARD_SHORTCUTS: 'keyboard-shortcuts',
@@ -52,8 +56,11 @@ export const DIALOG_IDS = {
 
   // Collaboration group
   SHARE_TO_TEAM: 'share-to-team',
+  SHARE_FOLDER_TO_TEAM: 'share-folder-to-team',
+  FEEDBACK_DESTINATION: 'feedback-destination',
   ORG_CREATION_WIZARD: 'org-creation-wizard',
   ORG_MANAGEMENT: 'org-management',
+  ORG_PROJECT_WALK: 'org-project-walk',
 } as const;
 
 export type DialogId = (typeof DIALOG_IDS)[keyof typeof DIALOG_IDS];

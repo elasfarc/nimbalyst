@@ -55,6 +55,12 @@ export interface SharedDocsListViewProps {
    * the only filter.
    */
   folderId?: string | null;
+  /**
+   * Creates a shared document. Supplied by the host so this view reuses the one
+   * creation path (sidebar -> title bar) rather than carrying a second copy of
+   * the descriptor and name-conflict handling.
+   */
+  onCreateDocument?: () => void;
 }
 
 type Segment = 'all' | 'favorites' | 'review' | 'recent' | 'sharedWithMe' | 'sharedByMe';
@@ -120,7 +126,7 @@ function memberName(
   return 'Unknown';
 }
 
-export const SharedDocsListView: React.FC<SharedDocsListViewProps> = ({ folderId }) => {
+export const SharedDocsListView: React.FC<SharedDocsListViewProps> = ({ folderId, onCreateDocument }) => {
   const { scope, host, session } = useCollabDocsUI();
 
   const documentTypesRevision = useSyncExternalStore(
@@ -192,6 +198,9 @@ export const SharedDocsListView: React.FC<SharedDocsListViewProps> = ({ folderId
   ]);
 
   // --- Team member directory (createdBy / last-edited resolution) ---
+  // Fetched AND subscribed: the directory arrives with the team room's sync
+  // reply, which always lands after this mounts, so a one-shot fetch resolved
+  // every author to 'Unknown' for the life of the view (#3716).
   const [members, setMembers] = useState<Map<string, MemberInfo>>(new Map());
   useEffect(() => {
     if (!orgId) {
@@ -199,7 +208,7 @@ export const SharedDocsListView: React.FC<SharedDocsListViewProps> = ({ folderId
       return;
     }
     let cancelled = false;
-    (async () => {
+    const load = async () => {
       try {
         const result = await host.getMembers(orgId);
         if (cancelled) return;
@@ -208,11 +217,19 @@ export const SharedDocsListView: React.FC<SharedDocsListViewProps> = ({ folderId
           next.set(member.memberId, { name: member.name ?? undefined, email: member.email ?? undefined });
         }
         setMembers(next);
-      } catch {
+      } catch (error) {
+        // Swallowing this is what made the empty directory look like a
+        // rendering bug rather than a failed fetch.
+        console.warn('[SharedDocsListView] Failed to load the team member directory:', error);
         if (!cancelled) setMembers(new Map());
       }
-    })();
-    return () => { cancelled = true; };
+    };
+    void load();
+    const unsubscribe = host.onMembersChanged?.(() => { void load(); });
+    return () => {
+      cancelled = true;
+      unsubscribe?.();
+    };
   }, [host, orgId]);
 
   // --- Current user's email, used to join to the team member id(s) that
@@ -498,6 +515,18 @@ export const SharedDocsListView: React.FC<SharedDocsListViewProps> = ({ folderId
           />
           <kbd className="shrink-0 text-[10.5px] text-[var(--nim-text-faint)] border border-[var(--nim-border)] rounded px-1 py-0.5">⌘K</kbd>
         </div>
+        {onCreateDocument ? (
+          <button
+            type="button"
+            className="shared-docs-list-new flex items-center gap-1.5 shrink-0 px-2.5 py-1.5 rounded-md border border-[var(--nim-border)] bg-transparent text-[12px] text-[var(--nim-text)] cursor-pointer hover:bg-[var(--nim-bg-hover)]"
+            data-testid="shared-docs-new-document"
+            onClick={onCreateDocument}
+            title="New doc"
+          >
+            <MaterialSymbol icon="add" size={17} />
+            New doc
+          </button>
+        ) : null}
         <div className="shared-docs-view-toggle flex items-center rounded-md border border-[var(--nim-border)] overflow-hidden shrink-0">
           <button
             type="button"

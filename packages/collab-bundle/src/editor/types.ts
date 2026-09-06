@@ -1,5 +1,15 @@
 import type { TextFormatType } from 'lexical';
-import type { TeamJwt, TeamMemberId } from '@nimbalyst/runtime/auth/jwtScopes';
+import {
+  asTeamJwt,
+  asTeamMemberId,
+  type TeamJwt,
+  type TeamMemberId,
+} from '@nimbalyst/runtime/auth/jwtScopes';
+import type {
+  CommentMember,
+  CommentMentionPayload,
+  CommentReplyPayload,
+} from '@nimbalyst/runtime/editor/commenting/types';
 import type { TeamMemberSummary } from '@nimbalyst/collab-client/core';
 import type { Doc } from 'yjs';
 
@@ -14,6 +24,7 @@ export type TeamDocumentId = string & { readonly [teamDocumentIdBrand]: true };
 export const asTeamOrgId = (value: string): TeamOrgId => value as TeamOrgId;
 export const asTeamProjectId = (value: string): TeamProjectId => value as TeamProjectId;
 export const asTeamDocumentId = (value: string): TeamDocumentId => value as TeamDocumentId;
+export { asTeamJwt, asTeamMemberId };
 
 export interface TeamRoomIdentity {
   orgId: TeamOrgId;
@@ -69,8 +80,8 @@ export interface CollabEditorWriteRejection {
 }
 
 export interface CollabEditorTermination {
-  reason: 'removed-from-org' | 'document-access-revoked';
-  closeCode: 4002 | 4003;
+  reason: 'removed-from-org' | 'document-access-revoked' | 'deleted-document';
+  closeCode: 4002 | 4003 | 4004;
   message: string;
 }
 
@@ -86,7 +97,8 @@ export type CollabEditorFlushResult =
         | 'disconnected'
         | 'server-read-only'
         | 'removed-from-org'
-        | 'document-access-revoked';
+        | 'document-access-revoked'
+        | 'deleted-document';
     }
   | { status: 'timed-out'; timeoutMs: number }
   | { status: 'failed'; message: string };
@@ -129,11 +141,43 @@ export interface CollabEditorPresence {
   participants: CollabEditorParticipant[];
 }
 
+/** Browser-owned inputs that the bundle expands into the runtime comments config. */
+export interface CollabEditorCommentsOptions {
+  currentUser: { id: string; name: string };
+  getMembers(): CommentMember[];
+  documentTitle: string;
+  documentId: string;
+  documentUri: string;
+  /**
+   * Whether this user's role permits authoring comments, answered by the host.
+   *
+   * The bundle cannot work this out. Comment threads live in the document's
+   * Y.Doc, so authoring one requires the same server write authority as editing
+   * the prose, and the transport learns that only by having a write accepted or
+   * refused. A host that knows the answer up front -- the web console reads it
+   * off the org roster it already fetches -- supplies it here, and the bundle
+   * ANDs it with what the transport has observed.
+   *
+   * Resolved as a function, never captured: the roster is asynchronous, so the
+   * first answer on a cold open is "not yet known" (`false`, fail closed), and
+   * access can be withdrawn mid-session. Call {@link CollabEditorHandle.refreshCommentAccess}
+   * after the answer changes so the mounted editor re-renders with it.
+   *
+   * Omitted means "this host does not model per-role comment access" and the
+   * bundle treats it as permitted, matching the runtime's default for a host
+   * that supplies no capability resolver at all.
+   */
+  canComment?: () => boolean;
+  onMention?: (recipientUserIds: string[], payload: CommentMentionPayload) => void;
+  onReply?: (recipientUserIds: string[], payload: CommentReplyPayload) => void;
+}
+
 export interface CollabEditorMountOptions {
   element: HTMLElement;
   source: CollabEditorSource;
   user: CollabEditorUser;
   readOnly?: boolean;
+  comments?: CollabEditorCommentsOptions;
   onStateChange?: (state: CollabEditorState) => void;
   onPresenceChange?: (presence: CollabEditorPresence) => void;
   onWriteRejected?: (rejection: CollabEditorWriteRejection) => void;
@@ -160,6 +204,16 @@ export interface CollabEditorHandle {
   /** Wait for the room's persisted docUpdateAck, never merely a socket write. */
   flush(options?: { timeoutMs?: number }): Promise<CollabEditorFlushResult>;
   setReadOnly(readOnly: boolean): void;
+  /**
+   * Re-read `comments.canComment` and re-render if the answer changed.
+   *
+   * The runtime resolves comment capability on every render and never caches
+   * it, but the bundle owns its own React root: a host answer that resolves
+   * after mount reaches nothing until something renders again. Hosts whose
+   * answer can change -- a roster request that lands, a role that is edited --
+   * call this; a host with a fixed answer never needs to.
+   */
+  refreshCommentAccess(): void;
   markClean(): void;
   focus(): void;
   insertText(text: string): void;
@@ -168,6 +222,7 @@ export interface CollabEditorHandle {
 }
 
 export type {
+  CommentMember,
   TeamJwt,
   TeamMemberId,
   TextFormatType,

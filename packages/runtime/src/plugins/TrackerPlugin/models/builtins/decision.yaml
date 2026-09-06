@@ -8,9 +8,8 @@ modes:
   inline: true
   fullDocument: true
 
-sync:
-  mode: shared
-  scope: project
+sharing: team
+draftByDefault: false
 
 idPrefix: dec
 idFormat: ulid
@@ -33,15 +32,19 @@ fields:
       - value: to-do
         label: To Decide
         icon: help
+        category: unstarted
       - value: in-progress
         label: Evaluating
         icon: psychology
+        category: started
       - value: decided
         label: Decided
         icon: check_circle
+        category: done
       - value: implemented
         label: Implemented
         icon: done_all
+        category: done
 
   - name: chosen
     type: string
@@ -69,6 +72,24 @@ fields:
     type: array
     itemType: string
     displayInline: false
+
+  # Dependency pair. `dependsOn` records work this item waits on; `blocks` records
+  # work waiting on this item. Writing either side materializes the other.
+  - name: dependsOn
+    type: relationship
+    relationshipTypeKey: depends-on
+    inverseRelationshipTypeKey: blocks
+    inverseFieldId: blocks
+    targetTrackerTypes: "*"
+    multiValue: true
+
+  - name: blocks
+    type: relationship
+    relationshipTypeKey: blocks
+    inverseRelationshipTypeKey: depends-on
+    inverseFieldId: dependsOn
+    targetTrackerTypes: "*"
+    multiValue: true
 
   # Collection membership. Written directly, or by inverse propagation when an
   # item is added to a milestone/release from the collection side.

@@ -3,6 +3,7 @@ import * as Y from "yjs";
 import { DocumentSyncProvider } from "../../DocumentSync";
 import { LocalDocumentReplica } from "../../LocalDocumentReplica";
 import { OutboxDrainer } from "../../OutboxDrainer";
+import { asTeamJwt, asTeamMemberId } from "../../../auth/jwtScopes";
 import type {
   AppendLocalReplicaUpdateInput,
   AppendRemoteReplicaUpdatesInput,
@@ -180,12 +181,14 @@ class HarnessReplicaStore implements LocalReplicaStore {
   async recordOutboxError(
     _identity: LocalReplicaIdentity,
     batchIds: string[],
-    errorCode: string
+    errorCode: string,
+    options?: { countAttempt?: boolean }
   ): Promise<void> {
     const ids = new Set(batchIds);
     for (const entry of this.loaded?.outbox ?? []) {
       if (!ids.has(entry.batchId)) continue;
       entry.lastErrorCode = errorCode;
+      if (options?.countAttempt) entry.attemptCount += 1;
       entry.updatedAt = Date.now();
     }
   }
@@ -278,7 +281,8 @@ class HarnessReplicaStore implements LocalReplicaStore {
   }
 
   async listPendingOutboxes(
-    accountId?: string
+    accountId?: string,
+    options?: { states?: LocalReplicaOutboxState[] }
   ): Promise<LocalReplicaPendingOutbox[]> {
     if (
       !this.loaded ||
@@ -288,13 +292,28 @@ class HarnessReplicaStore implements LocalReplicaStore {
     ) {
       return [];
     }
+    const states = options?.states;
+    const visible = states
+      ? this.loaded.outbox.filter((entry) => states.includes(entry.state))
+      : this.loaded.outbox;
+    if (visible.length === 0) return [];
     return [
       {
         identity: { ...this.loaded.identity },
         documentType: this.loaded.documentType,
-        queuedCount: this.loaded.outbox.filter((entry) => entry.state === "queued").length,
-        inflightCount: this.loaded.outbox.filter((entry) => entry.state === "inflight").length,
-        rejectedCount: this.loaded.outbox.filter((entry) => entry.state === "rejected").length,
+        queuedCount: visible.filter((entry) => entry.state === "queued").length,
+        inflightCount: visible.filter((entry) => entry.state === "inflight").length,
+        rejectedCount: visible.filter((entry) => entry.state === "rejected").length,
+        maxAttemptCount: visible.reduce((max, entry) => Math.max(max, entry.attemptCount), 0),
+        lastAttemptAt: visible.reduce<number | null>(
+          (latest, entry) => (latest === null ? entry.updatedAt : Math.max(latest, entry.updatedAt)),
+          null
+        ),
+        lastErrorCode: visible.find((entry) => entry.lastErrorCode)?.lastErrorCode ?? null,
+        oldestCreatedAt: visible.reduce<number | null>(
+          (oldest, entry) => (oldest === null ? entry.createdAt : Math.min(oldest, entry.createdAt)),
+          null
+        ),
       },
     ];
   }
@@ -328,6 +347,10 @@ class HarnessReplicaStore implements LocalReplicaStore {
 
   outboxErrors(): Array<string | null> {
     return (this.loaded?.outbox ?? []).map((entry) => entry.lastErrorCode);
+  }
+
+  outboxAttemptCounts(): number[] {
+    return (this.loaded?.outbox ?? []).map((entry) => entry.attemptCount);
   }
 
   async acknowledgeOldestOutboxExternally(serverSequence: number): Promise<void> {
@@ -496,6 +519,8 @@ export class HarnessDocumentServer {
   rejectNextLiveWith: string | null = null;
   rejectNextLiveClientUpdateId: string | null = null;
   rejectNextDrainWith: string | null = null;
+  /** Stands in for a room that is permanently unreachable (e.g. HTTP 404). */
+  failEveryDrainWith: string | null = null;
   readonly syncRequests: Array<{ userId: string; sinceSeq: number }> = [];
   readonly syncResponses: Array<{
     userId: string;
@@ -613,6 +638,9 @@ export class HarnessDocumentServer {
       this.nextDrainGate = null;
       gate.started();
       await gate.wait;
+    }
+    if (this.failEveryDrainWith) {
+      throw new Error(this.failEveryDrainWith);
     }
     if (this.rejectNextDrainWith) {
       const errorCode = this.rejectNextDrainWith;
@@ -845,8 +873,8 @@ export class HarnessClient {
     );
   }
 
-  drainOutboxOnce() {
-    return this.outboxDrainer.drainOnce(`account-${this.userId}`);
+  drainOutboxOnce(options?: { respectBackoff?: boolean }) {
+    return this.outboxDrainer.drainOnce(`account-${this.userId}`, options);
   }
 
   persistedOutboxStates(): LocalReplicaOutboxState[] {
@@ -855,6 +883,10 @@ export class HarnessClient {
 
   persistedOutboxErrors(): Array<string | null> {
     return this.replicaStore.outboxErrors();
+  }
+
+  outboxAttemptCounts(): number[] {
+    return this.replicaStore.outboxAttemptCounts();
   }
 
   async acknowledgeOldestOutboxExternally(_serverSequence: number): Promise<void> {
@@ -1016,10 +1048,10 @@ export class HarnessClient {
     });
     this.provider = new DocumentSyncProvider({
       serverUrl: "ws://document-harness.test",
-      getJwt: async () => "harness-token",
+      getJwt: async () => asTeamJwt("harness-token"),
       orgId: "org-harness",
       documentId: "doc-harness",
-      userId: this.userId,
+      teamMemberId: asTeamMemberId(this.userId),
       replica: this.replica,
       initialPendingUpdateBase64:
         this.persisted.pendingUpdateBase64 ?? undefined,

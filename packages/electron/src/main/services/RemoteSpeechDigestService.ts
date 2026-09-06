@@ -26,7 +26,7 @@ import {
 import { getPersonalDocSyncConfig, getSyncProvider } from './SyncManager';
 import { resolveSessionCwd } from './RemoteTerminalService';
 import { resolveClaudeExecutablePath, isClaudeExecutableInstalled } from './ai/claudeExecutableResolver';
-import { getEnhancedPath } from './CLIManager';
+import { getEnhancedPath } from './shellEnvironment';
 import { logger } from '../utils/logger';
 
 const log = logger.main;

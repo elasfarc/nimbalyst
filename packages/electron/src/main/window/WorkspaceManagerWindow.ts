@@ -1,12 +1,14 @@
 import { BrowserWindow, dialog, app } from 'electron';
 import { join, basename } from 'path';
 import { getPreloadPath } from '../utils/appPaths';
+import { createUnresponsiveHandler } from './unresponsiveHandler';
 import { existsSync, mkdirSync, statSync } from 'fs';
 import { readdir } from 'fs/promises';
 import { resolveEntryType } from '../utils/FileTree';
 import { shouldExcludeDir, shouldExcludePath } from '../utils/fileFilters';
 import { getRecentItems, addToRecentItems, store, getWorkspaceWindowState, getTheme } from '../utils/store';
-import { createWindow, findWindowByWorkspace, windows, windowStates } from './WindowManager';
+import { createWindow, findWorkspaceWindowMatch, windows, windowStates } from './WindowManager';
+import { reuseWorkspaceWindow, type WorkspaceWindowReuseOutcome } from './workspaceWindowMatch';
 import { safeHandle } from '../utils/ipcRegistry';
 import { getBackgroundColor } from '../theme/ThemeManager';
 import { AnalyticsService } from '../services/analytics/AnalyticsService';
@@ -18,10 +20,16 @@ import {
   broadcastWorkspaceOrgChanged,
 } from '../services/TeamService';
 import { initializeTrackerSync } from '../services/TrackerSyncManager';
+import { ensureWorkspaceLocalNumbersInBackground } from '../services/tracker/ensureWorkspaceLocalNumbers';
 import { updateTrackerSchemaWorkspace } from '../services/TrackerSchemaService';
 import { getDialogDefaultPath, rememberDialogSelection } from '../utils/dialogPaths';
 import { windowReferencesWorkspace } from './windowState';
+import { formatScannedCount, isMarkdownFile, summarizeWorkspaceScan } from './workspaceScanCounts';
 import { TutorialProjectService } from '../services/tutorial/TutorialProjectService';
+import {
+  normalizeTutorialEntryPoint,
+  type TutorialEntryPoint,
+} from '../services/tutorial/tutorialAnalytics';
 import type { TutorialStartResult } from '../../shared/tutorial';
 import { windowControlsOverlayOptions } from './windowChrome';
 import {
@@ -29,6 +37,11 @@ import {
   createWorkspaceManagerRendererQuery,
   type WorkspaceManagerWindowOptions,
 } from './workspaceManagerRendererQuery';
+import {
+  isStartupCohortWindow,
+  notifyStartupWindowRevealed,
+  registerStartupWindow,
+} from './StartupActivation';
 
 let workspaceManagerWindow: BrowserWindow | null = null;
 
@@ -79,12 +92,28 @@ function findWindowReferencingWorkspace(workspacePath: string): BrowserWindow | 
 }
 
 /**
+ * Bring an existing window forward on this workspace, switching it to the
+ * project if it is currently showing a different one. Returns null when no
+ * window in the rail can host the request, so the caller opens a new one.
+ */
+function reuseExistingWorkspaceWindow(workspacePath: string): WorkspaceWindowReuseOutcome | null {
+  const match = findWorkspaceWindowMatch(workspacePath);
+  if (!match) return null;
+  const outcome = reuseWorkspaceWindow(match.window, match);
+  return outcome === 'unavailable' ? null : outcome;
+}
+
+/**
  * Focus the window already showing a workspace, or open one for it. Shared by
  * the two "open this project" channels so they cannot drift apart on recents or
  * saved bounds.
  */
 function openOrFocusWorkspaceWindow(workspacePath: string): void {
   addToRecentItems('workspaces', workspacePath, basename(workspacePath));
+  if (reuseExistingWorkspaceWindow(workspacePath)) return;
+  // Rail lookup missed but a window may still show this path as a folder
+  // attached to one of its projects; that window is not switchable, so focus is
+  // all we can do.
   const existingWindow = findWindowReferencingWorkspace(workspacePath);
   if (existingWindow) {
     existingWindow.focus();
@@ -98,8 +127,10 @@ function openOrFocusWorkspaceWindow(workspacePath: string): void {
  * Materializes (or reopens) the tutorial project and opens it in a window.
  * Shared by the `tutorial:start` IPC channel and the Help menu entry.
  */
-export function startTutorialProject(): Promise<TutorialStartResult> {
-  return tutorialProjectService.startTutorial();
+export function startTutorialProject(
+  entryPoint: TutorialEntryPoint = 'unknown'
+): Promise<TutorialStartResult> {
+  return tutorialProjectService.startTutorial(entryPoint);
 }
 
 async function hasSubfolders(workspacePath: string): Promise<boolean> {
@@ -196,9 +227,22 @@ export function createWorkspaceManagerWindow(options: WorkspaceManagerWindowOpti
     }, 1000);
   });
 
+  if (options.startupReveal) {
+    registerStartupWindow(workspaceManagerWindow, { frontmost: true });
+  }
+
   // Show window when ready
   workspaceManagerWindow.once('ready-to-show', () => {
-    workspaceManagerWindow?.show();
+    const window = workspaceManagerWindow;
+    if (!window || window.isDestroyed()) return;
+    if (isStartupCohortWindow(window)) {
+      // Launch reveals without activating; the app is foregrounded once, at
+      // the end of startup.
+      window.showInactive();
+      notifyStartupWindowRevealed(window);
+    } else {
+      window.show();
+    }
   });
 
   // Handle renderer process crashes
@@ -211,20 +255,11 @@ export function createWorkspaceManagerWindow(options: WorkspaceManagerWindowOpti
   });
 
   // Handle unresponsive renderer
-  workspaceManagerWindow.webContents.on('unresponsive', () => {
-    console.warn('[WorkspaceManager] Window became unresponsive');
-    const choice = dialog.showMessageBoxSync(workspaceManagerWindow!, {
-      type: 'warning',
-      buttons: ['Reload', 'Keep Waiting'],
-      defaultId: 0,
-      message: 'Project Manager is not responding',
-      detail: 'Would you like to reload the window?'
-    });
-
-    if (choice === 0 && workspaceManagerWindow && !workspaceManagerWindow.isDestroyed()) {
-      workspaceManagerWindow.reload();
-    }
-  });
+  workspaceManagerWindow.webContents.on('unresponsive', createUnresponsiveHandler({
+    message: 'Project Manager is not responding',
+    logLabel: '[WorkspaceManager]',
+    getWindow: () => workspaceManagerWindow
+  }));
 
   // Handle responsive again
   workspaceManagerWindow.webContents.on('responsive', () => {
@@ -259,8 +294,8 @@ export function setupWorkspaceManagerHandlers() {
     return tutorialProjectService.getStatus();
   });
 
-  safeHandle('tutorial:start', async () => {
-    return startTutorialProject();
+  safeHandle('tutorial:start', async (_event, entryPoint?: unknown) => {
+    return startTutorialProject(normalizeTutorialEntryPoint(entryPoint));
   });
 
   // Get recent workspaces with additional info
@@ -273,16 +308,14 @@ export function setupWorkspaceManagerHandlers() {
         try {
           if (existsSync(workspace.path)) {
             const stats = statSync(workspace.path);
-            const { files, limited } = await getWorkspaceFiles(workspace.path, '', 1000, 5);
+            const scan = await getWorkspaceFiles(workspace.path, '', 1000, 5);
 
             return {
               ...workspace,
               lastOpened: workspace.timestamp, // Use the timestamp from the recent items
               lastModified: stats.mtime.getTime(),
-              fileCount: limited ? `${files.length}+` : files.length,
-              markdownCount: files.filter(f => f.endsWith('.md') || f.endsWith('.markdown')).length,
-              exists: true,
-              limited
+              ...summarizeWorkspaceScan(scan),
+              exists: true
             };
           }
         } catch (error) {
@@ -325,7 +358,7 @@ export function setupWorkspaceManagerHandlers() {
           const stats = statSync(filePath);
           totalSize += stats.size;
 
-          if (file.endsWith('.md') || file.endsWith('.markdown')) {
+          if (isMarkdownFile(file)) {
             markdownFiles.push(file);
           }
         } catch (error) {
@@ -337,8 +370,8 @@ export function setupWorkspaceManagerHandlers() {
       const recentFiles = store.get(`workspaceRecentFiles.${workspacePath}`, []) as string[];
 
       return {
-        fileCount: limited ? `${files.length}+` : files.length,
-        markdownCount: markdownFiles.length,
+        fileCount: formatScannedCount(files.length, limited),
+        markdownCount: formatScannedCount(markdownFiles.length, limited),
         totalSize,
         recentFiles: recentFiles.slice(0, 5),
         limited
@@ -410,19 +443,19 @@ export function setupWorkspaceManagerHandlers() {
     // Add to recent workspaces
     addToRecentItems('workspaces', workspacePath, basename(workspacePath));
 
-    // Check if this workspace is already open in an existing window
-    const existingWindow = findWindowByWorkspace(workspacePath);
-    if (existingWindow && !existingWindow.isDestroyed()) {
-      // Focus the existing window instead of creating a new one
-      existingWindow.focus();
-
-      // Close workspace manager after focusing existing workspace
+    // Reuse the window that already hosts this workspace. It may have switched
+    // to a different project since it was created, in which case focusing it
+    // alone leaves the user looking at the wrong project (#1427) -- the reuse
+    // helper sends the navigation message that actually switches it back.
+    const reuse = reuseExistingWorkspaceWindow(workspacePath);
+    if (reuse) {
+      // Close workspace manager after handing off to the existing workspace
       if (workspaceManagerWindow && !workspaceManagerWindow.isDestroyed()) {
         workspaceManagerClosingForProject = true;
         workspaceManagerWindow.close();
       }
 
-      return { success: true };
+      return { success: true, action: reuse };
     }
 
     // Check for saved workspace window state
@@ -477,6 +510,10 @@ export function setupWorkspaceManagerHandlers() {
       // we've yielded the main thread; both paths may probe git remotes.
       void autoMatchTeamForWorkspace(workspacePath).catch(() => {});
       void initializeTrackerSync(workspacePath).catch(() => {});
+      // Sibling, not a step inside tracker sync: that path returns early for a
+      // workspace with no team, which is exactly the workspace whose items have
+      // nothing but a local number.
+      ensureWorkspaceLocalNumbersInBackground(workspacePath);
       updateTrackerSchemaWorkspace(workspacePath);
     }, 0);
 
@@ -504,7 +541,7 @@ export function setupWorkspaceManagerHandlers() {
       workspaceManagerWindow.close();
     }
 
-    return { success: true };
+    return { success: true, action: 'created' as const };
   });
 
   safeHandle('team:open-project-workspace', async (_event, workspacePath: string) => {

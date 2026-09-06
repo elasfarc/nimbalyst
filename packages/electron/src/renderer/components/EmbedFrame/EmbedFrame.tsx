@@ -53,16 +53,20 @@ import { useTheme } from '../../hooks/useTheme';
 import { createEmbeddedFileHost } from './createEmbeddedFileHost';
 import { CollaborativeEmbedEditor } from './CollaborativeEmbedEditor';
 import {
-  FileSaveRejectedError,
-  assertFileSaveSucceeded,
-  getSaveFailureMessage,
-} from '../../utils/fileSaveResult';
+  openFileInTab,
+  readFileFromDisk,
+  workspaceRelativePath,
+  writeFileToDisk,
+} from './embeddedFileIo';
+import { getSaveFailureMessage } from '../../utils/fileSaveResult';
+import { createEmbeddedAutosaveController } from './embeddedAutosave';
 import {
   parseCollaborativeEmbedReference,
   type CollaborativeEmbedProviderRequest,
   type CollaborativeEmbedReference,
 } from '../../services/CollaborativeEmbedProviderCache';
 import { resolveSharedSpaceEmbedReference } from './sharedSpaceEmbedResolution';
+import { resolveCollaborativeEmbedRequest } from './resolveCollaborativeEmbedRequest';
 import {
   activeCollabScopeAtom,
   activeTeamOrgIdAtom,
@@ -72,8 +76,9 @@ import {
 } from '../../store/atoms/collabDocuments';
 import { activeWorkspacePathAtom } from '../../store/atoms/openProjects';
 import { setWindowModeAtom } from '../../store/atoms/windowMode';
+import { openSharedDocumentInTab as openSharedDocument } from '../../utils/openSharedDocumentInTab';
 import { getCollaborativeDocumentTypeCatalog } from '../../services/CollaborativeDocumentTypeCatalog';
-import { isCollabUri, parseCollabUri } from '../../utils/collabUri';
+import { isCollabUri, parseCollabUri } from '@nimbalyst/collab-protocol';
 
 import './EmbedFrame.css';
 
@@ -82,8 +87,6 @@ const MIN_EMBED_HEIGHT_PX = 120;
 const MIN_EMBED_WIDTH_PX = 200;
 const MAX_EMBED_WIDTH_PX = 4000;
 const MAX_EMBED_HEIGHT_PX = 4000;
-const EMBED_AUTOSAVE_FAILURE_RETRY_DELAYS_MS = [5_000, 30_000] as const;
-const EMBED_AUTOSAVE_MAX_ATTEMPTS = EMBED_AUTOSAVE_FAILURE_RETRY_DELAYS_MS.length + 1;
 
 function parsePx(value: string | undefined, fallback: number, min: number): number {
   if (!value) return fallback;
@@ -161,103 +164,9 @@ class EmbedErrorBoundary extends Component<
   }
 }
 
-function openFileInTab(absolutePath: string): void {
-  const workspacePath = (window as unknown as { __workspacePath?: string }).__workspacePath;
-  if (!workspacePath) {
-    console.error('[EmbedFrame] __workspacePath not set -- cannot open embed in a tab');
-    return;
-  }
-  const api = (window as unknown as {
-    electronAPI?: {
-      invoke?: (channel: string, payload: unknown) => Promise<unknown>;
-    };
-  }).electronAPI;
-  if (!api?.invoke) return;
-  api
-    .invoke('workspace:open-file', { workspacePath, filePath: absolutePath })
-    .catch((error: unknown) => {
-      console.error('[EmbedFrame] Failed to open embed in tab:', error);
-    });
-}
-
-function openSharedDocumentInTab(documentId: string): void {
-  const scope = store.get(activeCollabScopeAtom);
-  if (!scope) return;
-  store.set(setWindowModeAtom, 'collab');
-  store.set(pendingCollabDocumentAtom, {
-    documentId,
-    scopeKey: scope.scopeKey,
-    orgId: scope.orgId,
-    analyticsSource: 'embedded_document',
-  });
-}
-
-type ReadFileResult =
-  | null
-  | { success: true; content: string; isBinary: boolean; detectedEncoding?: string }
-  | { success: false; error: string };
-
-async function readFileFromDisk(absolutePath: string): Promise<string> {
-  const api = (window as unknown as {
-    electronAPI?: {
-      readFileContent?: (
-        path: string,
-        opts?: { binary?: boolean },
-      ) => Promise<ReadFileResult>;
-    };
-  }).electronAPI;
-  if (!api?.readFileContent) {
-    throw new Error('readFileContent IPC not available');
-  }
-  const result = await api.readFileContent(absolutePath);
-  // null = file missing on disk (or virtual:// stub).
-  if (!result) {
-    throw new Error(`File not found: ${absolutePath}`);
-  }
-  if (result.success === false) {
-    throw new Error(result.error || `Failed to read ${absolutePath}`);
-  }
-  return result.content;
-}
-
-async function writeFileToDisk(
-  absolutePath: string,
-  content: string | ArrayBuffer,
-): Promise<void> {
-  const api = (window as unknown as {
-    electronAPI?: {
-      saveFile?: (
-        content: string,
-        filePath: string,
-        lastKnownContent?: string,
-        saveSource?: 'auto' | 'manual',
-      ) => Promise<{
-        success: boolean;
-        conflict?: boolean;
-        deleted?: boolean;
-        errorType?: string;
-        errorCode?: string;
-      } | null>;
-    };
-  }).electronAPI;
-  if (!api?.saveFile) throw new Error('saveFile IPC not available');
-  const text =
-    typeof content === 'string'
-      ? content
-      : new TextDecoder().decode(content);
-  const result = await api.saveFile(text, absolutePath, undefined, 'auto');
-  assertFileSaveSucceeded(result);
-}
-
-function workspaceRelativePath(absolutePath: string): string {
-  const workspacePath = (window as unknown as { __workspacePath?: string }).__workspacePath;
-  if (!workspacePath) return absolutePath;
-  if (absolutePath.startsWith(workspacePath)) {
-    const rest = absolutePath.slice(workspacePath.length);
-    return rest.replace(/^[/\\]/, '');
-  }
-  return absolutePath;
-}
+const openSharedDocumentInTab = (documentId: string): void => {
+  openSharedDocument(documentId, 'embedded_document');
+};
 
 // ---- Resize handles --------------------------------------------------------
 
@@ -389,7 +298,7 @@ function useEmbedResize(
 // ----------------------------------------------------------------------------
 
 export const EmbedFrame: React.FC<EmbedFrameProps> = (props) => {
-  const { src, label, attrs, nodeKey } = props;
+  const { src, label, attrs, nodeKey, detached = false } = props;
   const { documentDir, documentPath } = useDocumentPath();
   const { theme } = useTheme();
   const sharedDocuments = useAtomValue(sharedDocumentsAtom);
@@ -482,51 +391,27 @@ export const EmbedFrame: React.FC<EmbedFrameProps> = (props) => {
       return { error: 'This embedded document belongs to a different team.' };
     }
 
-    const catalog = getCollaborativeDocumentTypeCatalog();
-    const hintedExtension = attrs.embedType?.trim().toLowerCase();
-    const metadataResolution = sharedDocumentType
-      ? catalog.resolveMetadata(
-          sharedDocumentType,
-          sharedFileExtension ?? undefined,
-          sharedEditorId ?? undefined,
-        )
-      : hintedExtension
-        ? catalog.resolveShareability(`embedded${hintedExtension}`)
-        : null;
-    if (!metadataResolution || metadataResolution.state !== 'ready') {
-      return { error: 'The collaborative editor for this embed is unavailable.' };
-    }
-    const descriptor = metadataResolution.descriptor;
-    if (descriptor.editor.kind !== 'extension') {
+    const resolution = resolveCollaborativeEmbedRequest({
+      orgId: collaborativeReference.orgId,
+      documentId: collaborativeReference.documentId,
+      workspacePath: activeWorkspacePath,
+      sharedTitle,
+      sharedDocumentType,
+      sharedFileExtension,
+      sharedEditorId,
+      hintedExtension: attrs.embedType,
+      fallbackTitle: label,
+    });
+    if (resolution.status !== 'ready') return { error: resolution.error };
+    // Unreachable without `allowLexical`, which this caller deliberately does
+    // not pass: an in-document embed is already inside a Lexical editor.
+    if (resolution.editor.kind !== 'extension') {
       return { error: 'Only collaborative custom-editor documents can be embedded.' };
     }
-    const fileExtension = sharedFileExtension
-      ?? hintedExtension
-      ?? descriptor.defaultExtension;
-    const editorId = sharedEditorId
-      ?? catalog.editorIdForDescriptor(descriptor);
-    const registration = customEditorRegistry.findRegistrationForFile(
-      `embedded${fileExtension}`,
-    );
-    if (!registration || registration.collaboration?.supported !== true) {
-      return { error: 'The installed editor does not support collaborative embeds.' };
-    }
-    const displayName = sharedTitle || label || collaborativeReference.documentId;
     return {
-      displayName,
-      registration,
-      request: {
-        workspacePath: activeWorkspacePath,
-        orgId: collaborativeReference.orgId,
-        documentId: collaborativeReference.documentId,
-        title: displayName,
-        documentType: sharedDocumentType ?? descriptor.documentType,
-        metadata: {
-          metadataVersion: 2,
-          fileExtension,
-          editorId,
-        },
-      },
+      displayName: resolution.displayName,
+      registration: resolution.editor.registration,
+      request: resolution.request,
     };
   }, [
     activeWorkspacePath,
@@ -553,7 +438,8 @@ export const EmbedFrame: React.FC<EmbedFrameProps> = (props) => {
   // editor takes over directly. Clicking elsewhere creates a
   // RangeSelection, `isSelected` flips back to false, and the shield
   // reinstates itself.
-  const [isSelected, setSelected, clearSelection] = useLexicalNodeSelection(nodeKey);
+  const [nodeSelected, setSelected, clearSelection] = useLexicalNodeSelection(nodeKey);
+  const isSelected = detached || nodeSelected;
 
   const handleShieldClick = useCallback(
     (event: React.MouseEvent<HTMLDivElement>) => {
@@ -607,10 +493,6 @@ export const EmbedFrame: React.FC<EmbedFrameProps> = (props) => {
   const [isDirty, setIsDirty] = useState(false);
   const isDirtyRef = useRef(false);
   const saveRequestListeners = useRef(new Set<() => void | Promise<void>>());
-  const autosaveRequestInFlightRef = useRef(false);
-  const autosaveFailureCountRef = useRef(0);
-  const nextAutosaveAttemptAtRef = useRef(0);
-  const autosaveBlockedRef = useRef(false);
   // Content of our most recent save -- used to dedupe the file-watcher
   // event that fires when our own save hits disk (we don't want to round-
   // trip the bytes back through the extension's onFileChanged callback).
@@ -621,58 +503,37 @@ export const EmbedFrame: React.FC<EmbedFrameProps> = (props) => {
   // memory -- the dirty dot alone reads as "saving shortly".
   const [saveBlockedErrorType, setSaveBlockedErrorType] = useState<string | null>(null);
 
-  const resetAutosaveFailureState = useCallback(() => {
-    autosaveFailureCountRef.current = 0;
-    nextAutosaveAttemptAtRef.current = 0;
-    autosaveBlockedRef.current = false;
-    setSaveBlockedErrorType(null);
-  }, []);
-
-  const requestEmbedSave = useCallback(async (explicitRetry = false) => {
-    if (explicitRetry) resetAutosaveFailureState();
-    if (autosaveRequestInFlightRef.current || autosaveBlockedRef.current) return;
-    if (Date.now() < nextAutosaveAttemptAtRef.current) return;
-
-    autosaveRequestInFlightRef.current = true;
-    try {
-      for (const cb of saveRequestListeners.current) {
-        await cb();
-      }
-      resetAutosaveFailureState();
-    } catch (error) {
-      autosaveFailureCountRef.current += 1;
-      const retryDelay =
-        EMBED_AUTOSAVE_FAILURE_RETRY_DELAYS_MS[autosaveFailureCountRef.current - 1];
-      if (retryDelay === undefined) {
-        autosaveBlockedRef.current = true;
-        setSaveBlockedErrorType(
-          error instanceof FileSaveRejectedError ? error.errorType : 'unknown',
-        );
-        console.error(
-          `[EmbedFrame] Autosave blocked after ${EMBED_AUTOSAVE_MAX_ATTEMPTS} failed attempts`,
-          error,
-        );
-      } else {
-        nextAutosaveAttemptAtRef.current = Date.now() + retryDelay;
-        console.error(`[EmbedFrame] Autosave failed; retrying in ${retryDelay}ms`, error);
-      }
-    } finally {
-      autosaveRequestInFlightRef.current = false;
-    }
-  }, [resetAutosaveFailureState]);
+  // In-flight guard, bounded retry, blocked latch, and the exit-path flush --
+  // all shared with the canvas card host, which grew its own thinner copy and
+  // lost edits with it. See `embeddedAutosave.ts`.
+  const autosave = useMemo(
+    () =>
+      createEmbeddedAutosaveController({
+        label: '[EmbedFrame]',
+        isDirty: () => isDirtyRef.current,
+        onBlockedChange: setSaveBlockedErrorType,
+        save: async () => {
+          for (const cb of saveRequestListeners.current) {
+            await cb();
+          }
+        },
+      }),
+    [],
+  );
 
   const toggleReadOnly = useCallback(() => {
     setIsReadOnly((prev) => {
       const next = !prev;
-      // Switching back to view mode while dirty -- ask the extension to
-      // flush before we drop the editing UI. Saves are async; the user
-      // will see the dot clear as the write completes.
+      // Switching back to view mode while dirty -- flush before we drop the
+      // editing UI. `flush` is what lets the write past the host's read-only
+      // guard, which this transition is about to close. Saves are async; the
+      // user will see the dot clear as the write completes.
       if (next && isDirtyRef.current) {
-        void requestEmbedSave(true);
+        void autosave.flush('view-mode');
       }
       return next;
     });
-  }, [requestEmbedSave]);
+  }, [autosave]);
 
   // Autosave: while in edit mode and dirty, ask the extension to save on
   // a 2s cadence. The extension's `onSaveRequested` handler is what
@@ -680,11 +541,22 @@ export const EmbedFrame: React.FC<EmbedFrameProps> = (props) => {
   useEffect(() => {
     if (isReadOnly) return;
     const interval = setInterval(() => {
-      if (!isDirtyRef.current) return;
-      void requestEmbedSave();
+      void autosave.tick();
     }, 2000);
-    return () => clearInterval(interval);
-  }, [isReadOnly, requestEmbedSave]);
+    return () => {
+      clearInterval(interval);
+      void autosave.flush('left-edit-mode');
+    };
+  }, [isReadOnly, autosave]);
+
+  // An embed unmounts when its host document closes or the node is deleted,
+  // and neither waits for the debounce.
+  useEffect(
+    () => () => {
+      void autosave.flush('unmounted');
+    },
+    [autosave],
+  );
 
   const host = useMemo(() => {
     if (!absolutePath) return null;
@@ -737,9 +609,13 @@ export const EmbedFrame: React.FC<EmbedFrameProps> = (props) => {
         // state stays (we don't catch here).
         isDirtyRef.current = false;
         setIsDirty(false);
-        resetAutosaveFailureState();
+        autosave.reset();
       },
       getReadOnly: () => isReadOnlyRef.current,
+      // Lets the exit-path flush through the guard above -- the write that
+      // carries the edits from the edit session that just ended is not a
+      // view-mode write. See `embeddedAutosave.ts`.
+      allowSaveWhileReadOnly: () => autosave.isFlushing(),
       subscribeToReadOnlyChanges(cb) {
         readOnlyListeners.current.add(cb);
         return () => {
@@ -750,7 +626,7 @@ export const EmbedFrame: React.FC<EmbedFrameProps> = (props) => {
         if (next === isDirtyRef.current) return;
         isDirtyRef.current = next;
         setIsDirty(next);
-        if (!next) resetAutosaveFailureState();
+        if (!next) autosave.reset();
       },
       subscribeToSaveRequests(cb) {
         saveRequestListeners.current.add(cb);
@@ -763,7 +639,7 @@ export const EmbedFrame: React.FC<EmbedFrameProps> = (props) => {
     // toggles) flow to the mounted extension via `host.onFileChanged(...)`
     // / `host.onReadOnlyChanged(...)` rather than re-mount, which preserves
     // the extension's view-state (pan / zoom / scroll).
-  }, [absolutePath, resetAutosaveFailureState]);
+  }, [absolutePath, autosave]);
 
   const handleEditClick = useCallback(() => {
     if (collaborativeReference) {
@@ -882,7 +758,7 @@ export const EmbedFrame: React.FC<EmbedFrameProps> = (props) => {
                 fallback={<div className="embed-frame__loading">Loading shared embed...</div>}
               >
                 <CollaborativeEmbedEditor
-                  registration={registration}
+                  editor={{ kind: 'extension', registration }}
                   request={request}
                 />
               </React.Suspense>
@@ -907,16 +783,19 @@ export const EmbedFrame: React.FC<EmbedFrameProps> = (props) => {
           className="embed-frame__resizer embed-frame__resizer--e"
           data-testid="embed-frame-resize-e"
           onPointerDown={(event) => onResizeStart(event, DIRECTION.east)}
+          hidden={detached}
         />
         <div
           className="embed-frame__resizer embed-frame__resizer--s"
           data-testid="embed-frame-resize-s"
           onPointerDown={(event) => onResizeStart(event, DIRECTION.south)}
+          hidden={detached}
         />
         <div
           className="embed-frame__resizer embed-frame__resizer--se"
           data-testid="embed-frame-resize-se"
           onPointerDown={(event) => onResizeStart(event, DIRECTION.south | DIRECTION.east)}
+          hidden={detached}
         />
       </div>
     );
@@ -999,7 +878,7 @@ export const EmbedFrame: React.FC<EmbedFrameProps> = (props) => {
           <button
             type="button"
             onClick={() => {
-              void requestEmbedSave(true);
+              void autosave.retry();
             }}
             className="px-2 py-1 rounded border border-nim text-nim hover:bg-nim-active"
             data-testid="embed-save-failure-retry"
@@ -1067,16 +946,19 @@ export const EmbedFrame: React.FC<EmbedFrameProps> = (props) => {
         className="embed-frame__resizer embed-frame__resizer--e"
         data-testid="embed-frame-resize-e"
         onPointerDown={(e) => onResizeStart(e, DIRECTION.east)}
+        hidden={detached}
       />
       <div
         className="embed-frame__resizer embed-frame__resizer--s"
         data-testid="embed-frame-resize-s"
         onPointerDown={(e) => onResizeStart(e, DIRECTION.south)}
+        hidden={detached}
       />
       <div
         className="embed-frame__resizer embed-frame__resizer--se"
         data-testid="embed-frame-resize-se"
         onPointerDown={(e) => onResizeStart(e, DIRECTION.south | DIRECTION.east)}
+        hidden={detached}
       />
     </div>
   );

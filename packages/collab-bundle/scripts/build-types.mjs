@@ -9,8 +9,10 @@ import { spawnSync } from 'node:child_process';
 const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const typesRoot = path.join(packageRoot, 'types');
 const internalRoot = path.join(typesRoot, 'internal');
-const generatedEntry = path.join(internalRoot, 'collab-bundle/src/docs-ui.d.ts');
-const publicEntry = path.join(typesRoot, 'docs-ui.d.ts');
+const publicEntries = ['commenting-ui', 'docs-ui', 'feedback-ui', 'trackers-ui', 'quick-open', 'inbox'].map((entryName) => ({
+  generated: path.join(internalRoot, `collab-bundle/src/${entryName}.d.ts`),
+  public: path.join(typesRoot, `${entryName}.d.ts`),
+}));
 const require = createRequire(import.meta.url);
 
 fs.rmSync(internalRoot, { recursive: true, force: true });
@@ -31,8 +33,20 @@ function declarationFiles(directory) {
   });
 }
 
+/**
+ * Extension-SDK subpaths whose published name differs from the source filename
+ * (see the `exports` map in packages/extension-sdk/package.json). Without these
+ * the rewrite below looks for `src/file-tree.d.ts`, finds nothing, and the
+ * whole types build fails on any bundled module that imports one. Mirrored in
+ * the `paths` block of tsconfig.json so tsc resolves them the same way.
+ */
+const EXTENSION_SDK_SOURCE_NAMES = {
+  'file-tree': 'fileDirectoryTree',
+  'file-mask': 'fileMask',
+};
+
 function internalTarget(specifier) {
-  const collabClient = specifier.match(/^@nimbalyst\/collab-client\/(core|docs|docs-ui)$/);
+  const collabClient = specifier.match(/^@nimbalyst\/collab-client\/(core|docs|docs-ui|feedback|feedback-ui|trackers|trackers-ui|quick-open)$/);
   if (collabClient) {
     return path.join(internalRoot, 'collab-client/src', collabClient[1], 'index.d.ts');
   }
@@ -42,6 +56,16 @@ function internalTarget(specifier) {
     return fs.existsSync(direct)
       ? direct
       : path.join(internalRoot, 'runtime/src', runtime[1], 'index.d.ts');
+  }
+  // The extension SDK reaches the published types the same way, so the public
+  // `EditorHost` is the SDK's own declaration rather than a hand-kept copy.
+  const extensionSdk = specifier.match(/^@nimbalyst\/extension-sdk\/(.+)$/);
+  if (extensionSdk) {
+    const subpath = EXTENSION_SDK_SOURCE_NAMES[extensionSdk[1]] ?? extensionSdk[1];
+    const direct = path.join(internalRoot, 'extension-sdk/src', `${subpath}.d.ts`);
+    return fs.existsSync(direct)
+      ? direct
+      : path.join(internalRoot, 'extension-sdk/src', subpath, 'index.d.ts');
   }
   return null;
 }
@@ -54,10 +78,10 @@ function relativeDeclarationSpecifier(fromFile, targetFile) {
 }
 
 for (const declarationFile of declarationFiles(internalRoot)) {
-  if (declarationFile === generatedEntry) continue;
+  if (publicEntries.some((entry) => entry.generated === declarationFile)) continue;
   const source = fs.readFileSync(declarationFile, 'utf8');
   const rewritten = source.replace(
-    /(['"])(@nimbalyst\/(?:collab-client|runtime)\/[^'"]+)\1/g,
+    /(['"])(@nimbalyst\/(?:collab-client|runtime|extension-sdk)\/[^'"]+)\1/g,
     (match, quote, specifier) => {
       const target = internalTarget(specifier);
       if (!target || !fs.existsSync(target)) {
@@ -69,16 +93,18 @@ for (const declarationFile of declarationFiles(internalRoot)) {
   fs.writeFileSync(declarationFile, rewritten);
 }
 
-let publicTypes = fs.readFileSync(generatedEntry, 'utf8');
-publicTypes = publicTypes.replace(
-  /(['"])(@nimbalyst\/(?:collab-client|runtime)\/[^'"]+)\1/g,
-  (match, quote, specifier) => {
-    const target = internalTarget(specifier);
-    if (!target || !fs.existsSync(target)) {
-      throw new Error(`No emitted declaration target for ${specifier} imported by ${generatedEntry}`);
-    }
-    return `${quote}${relativeDeclarationSpecifier(publicEntry, target)}${quote}`;
-  },
-);
-fs.writeFileSync(publicEntry, publicTypes);
+for (const entry of publicEntries) {
+  let publicTypes = fs.readFileSync(entry.generated, 'utf8');
+  publicTypes = publicTypes.replace(
+    /(['"])(@nimbalyst\/(?:collab-client|runtime|extension-sdk)\/[^'"]+)\1/g,
+    (match, quote, specifier) => {
+      const target = internalTarget(specifier);
+      if (!target || !fs.existsSync(target)) {
+        throw new Error(`No emitted declaration target for ${specifier} imported by ${entry.generated}`);
+      }
+      return `${quote}${relativeDeclarationSpecifier(entry.public, target)}${quote}`;
+    },
+  );
+  fs.writeFileSync(entry.public, publicTypes);
+}
 fs.rmSync(path.join(internalRoot, 'collab-bundle'), { recursive: true, force: true });

@@ -6,6 +6,10 @@ import { settingAtom } from '../../../store/atoms/settingAtomFamily';
 import { CommentThread } from '../../Comments/CommentThread';
 import { createConversationCommentAdapter } from '../../Comments/ConversationCommentAdapter';
 import type { CommentCapabilities } from '../../Comments/commentTypes';
+import { FeedbackRequestSurface } from '../../FeedbackRequest/FeedbackRequestSurface';
+import { useOrgRoster } from '../../../hooks/useOrgRoster';
+import { useResourcePreviewResolver } from '../../../hooks/useResourcePreviewResolver';
+import { toMentionDirectory } from '../roomViewModel';
 import { openActionLabel } from './inboxViewModel';
 import type { InboxRowView, InboxSubscriptionState } from './inboxTypes';
 
@@ -20,12 +24,14 @@ import type { InboxRowView, InboxSubscriptionState } from './inboxTypes';
  */
 export function InboxContextPane({
   row,
+  workspacePath,
   conversationTransport = false,
   canChangeSubscription = false,
   onSubscriptionChange,
   onOpenSource,
 }: {
   row: InboxRowView | null;
+  workspacePath?: string;
   conversationTransport?: boolean;
   /**
    * The provider can actually change the follow state. False hides the mute
@@ -38,7 +44,7 @@ export function InboxContextPane({
   if (!row) {
     return (
       <aside
-        className="inbox-context-pane inbox-context-pane-empty flex min-w-0 flex-col items-center justify-center gap-2 border-l border-[var(--nim-border)] p-8 text-center"
+        className="inbox-context-pane inbox-context-pane-empty flex min-h-0 min-w-0 flex-1 flex-col items-center justify-center gap-2 border-l border-[var(--nim-border)] p-8 text-center"
         data-testid="inbox-context-pane"
         data-component="InboxContextPane"
       >
@@ -67,7 +73,10 @@ export function InboxContextPane({
 
   return (
     <aside
-      className="inbox-context-pane flex min-w-0 flex-col border-l border-[var(--nim-border)]"
+      // `min-h-0 flex-1` is what makes the scroll regions below actually
+      // scroll: they are `min-h-0 flex-1 overflow-y-auto`, so the pane itself
+      // has to end at the bottom of its slot instead of growing with content.
+      className="inbox-context-pane flex min-h-0 min-w-0 flex-1 flex-col border-l border-[var(--nim-border)]"
       data-testid="inbox-context-pane"
       data-component="InboxContextPane"
     >
@@ -101,7 +110,7 @@ export function InboxContextPane({
           {row.projectName ? ` · ${row.projectName}` : ''}
           {` · ${row.timestampLabel}`}
         </p>
-        {!unavailable && (
+        {!unavailable && row.sourceKind !== 'feedbackRequest' && (
           // The only control on this surface that moves you, and it says where
           // to. Selecting a row is free; leaving is always deliberate.
           <button
@@ -116,7 +125,15 @@ export function InboxContextPane({
         )}
       </header>
 
-      {conversationId
+      {row.sourceKind === 'feedbackRequest' && !unavailable && row.sourceId && workspacePath
+        ? (
+          <InboxFeedbackRequest
+            workspacePath={workspacePath}
+            row={row}
+            requestId={row.sourceId}
+          />
+        )
+        : conversationId
         ? <InboxConversationThread row={row} conversationId={conversationId} />
         : <div className="inbox-context-body min-h-0 flex-1 overflow-y-auto p-4">
         {unavailable
@@ -185,7 +202,7 @@ export function InboxContextPane({
           )}
       </div>}
 
-      {!conversationId && <footer className="inbox-context-composer border-t border-[var(--nim-border)] p-3" data-testid="inbox-context-composer">
+      {!conversationId && row.sourceKind !== 'feedbackRequest' && <footer className="inbox-context-composer border-t border-[var(--nim-border)] p-3" data-testid="inbox-context-composer">
         {row.canReply
           ? (
             <div className="inbox-composer-placeholder rounded-md border border-dashed border-[var(--nim-border)] px-3 py-2 text-[12px] text-[var(--nim-text-faint)]">
@@ -203,6 +220,34 @@ export function InboxContextPane({
           )}
       </footer>}
     </aside>
+  );
+}
+
+function InboxFeedbackRequest({
+  workspacePath,
+  row,
+  requestId,
+}: {
+  workspacePath: string;
+  row: InboxRowView;
+  requestId: string;
+}) {
+  return (
+    <div className="inbox-feedback-request min-h-0 flex-1 overflow-y-auto p-3">
+      {/* Pinned to the recipient card: a delivery is an ask addressed to this
+          reader, and it stays that shape after they answer. The shared area's
+          feedback list is where a request is met as a resource and flips to
+          tallies once nothing is owed. */}
+      <FeedbackRequestSurface
+        workspacePath={workspacePath}
+        orgId={row.orgId}
+        requestId={requestId}
+        teamMemberId={row.teamMemberId}
+        title={row.sourceTitle}
+        canComment={row.canReply}
+        view="respond"
+      />
+    </div>
   );
 }
 
@@ -225,9 +270,9 @@ function InboxConversationThread({
   }), [row.canReply]);
   const viewerActor = useMemo(() => ({
     kind: 'user' as const,
-    userId: row.viewerUserId,
-    onBehalfOfUserId: row.viewerUserId,
-  }), [row.viewerUserId]);
+    userId: row.teamMemberId,
+    onBehalfOfUserId: row.teamMemberId,
+  }), [row.teamMemberId]);
   // Same org-window preference the room view reads: the inbox shows the same
   // messages and must not disagree with the room about how they look.
   const density = useAtomValue(settingAtom('team.messages.density'));
@@ -254,16 +299,17 @@ function InboxConversationThread({
       viewerActor,
     ],
   );
-  const directory = useMemo(() => ({
-    people: [{
-      userId: row.viewerUserId,
-      displayName: 'You',
-      handle: 'you',
-      avatarInitials: 'YO',
-    }],
-    agents: [],
-    displayNames: { [row.viewerUserId]: 'You' },
-  }), [row.viewerUserId]);
+  // The org roster, not just the viewer: a directory holding one person
+  // attributed every teammate's message to "Unknown member" and mislabelled
+  // their @-mentions with it (#3729). Same directory the room view builds, so
+  // the two surfaces agree. Pass the row's member id as the viewer rather than
+  // the roster's own email-resolved one, so "You" matches `viewerActor`.
+  const { members } = useOrgRoster(row.orgId);
+  const directory = useMemo(
+    () => toMentionDirectory(members, row.teamMemberId),
+    [members, row.teamMemberId],
+  );
+  const resourceResolver = useResourcePreviewResolver(row.orgId);
 
   return (
     <div
@@ -273,6 +319,7 @@ function InboxConversationThread({
       <CommentThread
         adapter={adapter}
         capabilities={capabilities}
+        resolver={resourceResolver}
         context={{
           conversationId,
           conversationTitle: row.sourceTitle,
@@ -286,7 +333,7 @@ function InboxConversationThread({
         }}
         directory={directory}
         orgId={row.orgId}
-        viewerUserId={row.viewerUserId}
+        viewerUserId={row.teamMemberId}
         viewerActor={viewerActor}
         density={density}
       />

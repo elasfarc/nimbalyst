@@ -21,6 +21,7 @@
 import { atom } from 'jotai';
 import { atomFamily } from '../debug/atomFamilyRegistry';
 import { resolveProviderFromModel } from '../../utils/modelUtils';
+import type { SessionLaunchSource } from '../../../shared/analytics/sessionLaunch';
 import { errorNotificationService } from '../../services/ErrorNotificationService';
 import {
   store,
@@ -38,6 +39,7 @@ import {
   markSessionReadAtom,
 } from '../index';
 import { activeWorkspacePathAtom } from '../atoms/openProjects';
+import { activeFileRepoPathAtom } from '../atoms/workspaceRepos';
 import { defaultAgentModelAtom, worktreesFeatureAvailableAtom, alphaFeatureEnabledAtom } from '../atoms/appSettings';
 import {
   workstreamStateAtom,
@@ -76,11 +78,16 @@ export const sessionQuickOpenRequestedAtom = atom<number>(0);
 export const blitzDialogOpenAtom = atom<boolean>(false);
 
 /**
- * Per-workspace git-repo flag. Populated by AgentMode from an IPC check on
- * workspace mount; consumed by SessionHistory and the New Worktree / New
- * Blitz action atoms to gate worktree creation.
+ * Per-workspace git-repo flag, `undefined` until the IPC answers. Populated
+ * by `useGitRepoProbe`, which every consumer mounts for itself; consumed by
+ * SessionHistory and the New Worktree / New Blitz action atoms to gate
+ * worktree creation.
+ *
+ * Gate on an explicit `false`. A falsy check cannot tell "not a repository"
+ * apart from "nobody has asked yet", which is how the worktree actions used
+ * to end up permanently disabled inside a repository.
  */
-export const isGitRepoAtom = atomFamily((_workspacePath: string) => atom<boolean>(false));
+export const isGitRepoAtom = atomFamily((_workspacePath: string) => atom<boolean | undefined>(undefined));
 
 export interface CreateNewWorktreeSessionOptions {
   baseBranch?: string;
@@ -98,6 +105,12 @@ export interface CreateNewSessionOptions {
   title?: string;
   /** Select the new session in Agent mode. Defaults to true for existing callers. */
   selectSession?: boolean;
+  /**
+   * Which surface asked for this session, for `create_ai_session` analytics.
+   * Optional: a caller that omits it is reported as `unknown` rather than being
+   * guessed at, because a wrong attribution is worse than a missing one here.
+   */
+  launchSource?: SessionLaunchSource;
 }
 
 // ============================================================
@@ -422,6 +435,10 @@ export const createNewSessionActionAtom = atom(
           metadata: options.metadata,
         },
         workspaceId: workspacePath,
+        launchSource: options.launchSource,
+        // A boolean, never the draft. The prompt text has no business crossing
+        // into a payload that feeds an analytics emitter.
+        hadPrefilledPrompt: !!options.initialDraft,
       });
 
       if (result.success && result.id) {
@@ -483,13 +500,17 @@ export const createNewWorktreeSessionActionAtom = atom(
     if (!workspacePath || typeof window === 'undefined' || !window.electronAPI) return undefined;
 
     if (!get(worktreesFeatureAvailableAtom)) return undefined;
-    if (!get(isGitRepoAtom(workspacePath))) return undefined;
+    if (get(isGitRepoAtom(workspacePath)) === false) return undefined;
 
     const defaultModel = get(defaultAgentModelAtom);
 
     try {
-      const ipcOptions = options?.baseBranch || options?.name
-        ? { baseBranch: options.baseBranch, name: options.name }
+      // Which root the worktree is branched from. Follows the active file's
+      // repo, so a workspace spanning two repos branches the one being worked
+      // in; a single-folder project resolves to the workspace itself.
+      const sourceFolderPath = get(activeFileRepoPathAtom) ?? undefined;
+      const ipcOptions = options?.baseBranch || options?.name || sourceFolderPath
+        ? { baseBranch: options?.baseBranch, name: options?.name, sourceFolderPath }
         : undefined;
       const worktreeResult: WorktreeCreateResult = await window.electronAPI.invoke(
         'worktree:create',
@@ -512,6 +533,7 @@ export const createNewWorktreeSessionActionAtom = atom(
           worktreeId: worktree.id,
         },
         workspaceId: workspacePath,
+        launchSource: 'worktree' satisfies SessionLaunchSource,
       });
 
       if (result.success && result.id) {
@@ -586,6 +608,7 @@ export const createWorktreeSessionCoreActionAtom = atom(
         worktreeId: worktree.id,
       },
       workspaceId: workspacePath,
+      launchSource: 'worktree' satisfies SessionLaunchSource,
     });
 
     if (result.success && result.id) {
@@ -676,7 +699,7 @@ export const openNewBlitzDialogActionAtom = atom(null, (get, set) => {
   const workspacePath = getWorkspacePath(get);
   if (!workspacePath) return;
   if (!get(alphaFeatureEnabledAtom('blitz'))) return;
-  if (!get(isGitRepoAtom(workspacePath))) return;
+  if (get(isGitRepoAtom(workspacePath)) === false) return;
   set(blitzDialogOpenAtom, true);
 });
 

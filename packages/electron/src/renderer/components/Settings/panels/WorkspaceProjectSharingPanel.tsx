@@ -2,6 +2,7 @@ import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { MaterialSymbol } from '@nimbalyst/runtime/ui/icons/MaterialSymbol';
 import { dialogRef, useDialogState } from '../../../contexts/DialogContext';
 import { DIALOG_IDS } from '../../../dialogs/registry';
+import { requestConfirmation } from '../../../dialogs/requestConfirmation';
 import type { OrgCreationWizardData } from '../../../dialogs/teamDialogs';
 import type { AccountLoginData } from '../../../dialogs/accountDialogs';
 import { AlphaBadge } from '../../common/AlphaBadge';
@@ -878,11 +879,14 @@ export function WorkspaceProjectSharingPanel({ workspacePath }: WorkspaceProject
     const member = team.members.find((m) => m.id === memberId);
     const label = member?.email || member?.name || 'this member';
     const isPending = member?.status === 'pending';
-    const confirmed = window.confirm(
-      isPending
+    const confirmed = await requestConfirmation({
+      title: isPending ? 'Revoke invitation' : 'Remove member',
+      message: isPending
         ? `Revoke the pending invite for ${label}?`
-        : `Remove ${label} from "${team.name}"? They will lose access to this organization's shared trackers and documents. This cannot be undone (you'd need to re-invite them).`
-    );
+        : `Remove ${label} from "${team.name}"? They will lose access to this organization's shared trackers and documents. This cannot be undone (you'd need to re-invite them).`,
+      confirmLabel: isPending ? 'Revoke' : 'Remove',
+      destructive: true,
+    });
     if (!confirmed) return;
     setError(null);
     try {
@@ -959,9 +963,12 @@ export function WorkspaceProjectSharingPanel({ workspacePath }: WorkspaceProject
 
   const handleUnlinkProject = async () => {
     if (!team) return;
-    const confirmed = window.confirm(
-      `Stop syncing this project with "${team.name}"? Its trackers and documents will no longer sync to the team. You can re-link it later.`
-    );
+    const confirmed = await requestConfirmation({
+      title: 'Stop syncing project',
+      message: `Stop syncing this project with "${team.name}"? Its trackers and documents will no longer sync to the team. You can re-link it later.`,
+      confirmLabel: 'Stop syncing',
+      destructive: true,
+    });
     if (!confirmed) return;
     setError(null);
     try {
@@ -1016,9 +1023,12 @@ export function WorkspaceProjectSharingPanel({ workspacePath }: WorkspaceProject
 
   const handleDeleteTeam = async () => {
     if (!team) return;
-    const confirmed = window.confirm(
-      `Permanently delete organization "${team.name}"? This will remove all members, shared documents, and encryption keys. This action cannot be undone.`
-    );
+    const confirmed = await requestConfirmation({
+      title: 'Delete organization',
+      message: `Permanently delete organization "${team.name}"? This will remove all members, shared documents, and encryption keys. This action cannot be undone.`,
+      confirmLabel: 'Delete',
+      destructive: true,
+    });
     if (!confirmed) return;
     setError(null);
     try {

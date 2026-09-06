@@ -20,6 +20,7 @@ const mocks = vi.hoisted(() => ({
   findWindowByWorkspace: vi.fn(),
   createWindow: vi.fn(),
   getMostRecentlyFocusedWorkspaceWindow: vi.fn(),
+  getSession: vi.fn(),
 }));
 
 vi.mock('electron', () => {
@@ -65,6 +66,7 @@ vi.mock('electron', () => {
     },
     app: {
       getPath: () => 'C:\\Program Files\\Nimbalyst\\Nimbalyst.exe',
+      isPackaged: false,
     },
     ipcMain: {
       once: vi.fn(),
@@ -93,13 +95,34 @@ vi.mock('../../utils/store', () => ({
   isSessionBlockedNotificationsEnabled: mocks.sessionBlockedNotificationsEnabled,
 }));
 
+vi.mock('@nimbalyst/runtime/storage/repositories/AISessionsRepository', () => ({
+  AISessionsRepository: { get: mocks.getSession },
+}));
+
 vi.mock('../../window/WindowManager', () => ({
   findWindowByWorkspace: mocks.findWindowByWorkspace,
   createWindow: mocks.createWindow,
   getMostRecentlyFocusedWorkspaceWindow: mocks.getMostRecentlyFocusedWorkspaceWindow,
 }));
 
-import { notificationService } from '../NotificationService';
+// Resolve icons against the real resources/ directory so the assertions below
+// also prove the assets exist on disk.
+vi.mock('../../utils/appPaths', () => ({
+  getPackageRoot: () => fileURLToPath(new URL('../../../../', import.meta.url)),
+}));
+
+import { existsSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+import { notificationService, type BlockingType } from '../NotificationService';
+import {
+  clearNotificationIconCache,
+  getNotificationIconsDir,
+  NOTIFICATION_KINDS,
+  notificationIconFileName,
+  resolveNotificationIcon,
+} from '../notificationIcons';
 
 interface FakeWindow {
   isDestroyed: () => boolean;
@@ -166,6 +189,8 @@ describe('NotificationService agent notifications', () => {
     mocks.findWindowByWorkspace.mockReturnValue(null);
     mocks.getMostRecentlyFocusedWorkspaceWindow.mockReturnValue(null);
     mocks.createWindow.mockReturnValue(makeFakeWindow());
+    mocks.getSession.mockResolvedValue(null);
+    clearNotificationIconCache();
   });
 
   it('reports a skipped result when OS notifications are disabled', async () => {
@@ -316,6 +341,74 @@ describe('NotificationService agent notifications', () => {
       workspacePath: '/workspace/alpha',
       sourceLabel: 'Build release',
     });
+  });
+
+  it('routes a worktree session to the project that owns it', async () => {
+    // Blocking notifications carry the path the agent runs in, which for a
+    // worktree session is the worktree. Sessions are stored under the project
+    // path, so routing on the worktree makes the renderer look the session up
+    // in a workspace that has none and report it as missing.
+    const send = vi.fn();
+    mocks.getSession.mockResolvedValue({
+      id: 'session-worktree',
+      workspacePath: '/workspace/alpha',
+    });
+    mocks.findWindowByWorkspace.mockReturnValue({
+      isDestroyed: () => false,
+      isMinimized: () => false,
+      focus: vi.fn(),
+      show: vi.fn(),
+      webContents: { send },
+    });
+
+    await notificationService.showBlockedNotification(
+      'session-worktree',
+      'Build release',
+      'question',
+      '/workspace/alpha_worktrees/feature',
+    );
+    mocks.notificationListeners.get('click')?.();
+
+    expect(mocks.findWindowByWorkspace).toHaveBeenCalledWith('/workspace/alpha');
+    expect(send).toHaveBeenCalledWith('notification-clicked', {
+      sessionId: 'session-worktree',
+      workspacePath: '/workspace/alpha',
+      sourceLabel: 'Build release',
+    });
+  });
+
+  it('queues an unloaded workspace under the owning project, not the worktree', async () => {
+    // The renderer drains the queue with its own active workspace path, so a
+    // worktree-keyed entry could never be consumed.
+    mocks.getSession.mockResolvedValue({
+      id: 'session-worktree-cold',
+      workspacePath: '/workspace/cold',
+    });
+
+    await clickNotification({
+      sessionId: 'session-worktree-cold',
+      workspacePath: '/workspace/cold_worktrees/feature',
+      sourceLabel: 'Cold task',
+    });
+
+    expect(mocks.createWindow).toHaveBeenCalledWith(false, true, '/workspace/cold');
+    expect(notificationService.consumePendingNavigation('/workspace/cold')).toEqual({
+      sessionId: 'session-worktree-cold',
+      workspacePath: '/workspace/cold',
+      sourceLabel: 'Cold task',
+    });
+  });
+
+  it('falls back to the notified workspace when the session cannot be read', async () => {
+    mocks.getSession.mockRejectedValue(new Error('database is closed'));
+
+    await clickNotification({
+      sessionId: 'session-unreadable',
+      workspacePath: '/workspace/unreadable',
+      sourceLabel: 'Unreadable task',
+    });
+
+    expect(mocks.createWindow).toHaveBeenCalledWith(false, true, '/workspace/unreadable');
   });
 
   it('queues navigation and opens an unloaded workspace once', async () => {
@@ -514,6 +607,77 @@ describe('NotificationService agent notifications', () => {
     const title = mocks.notificationConstructor.mock.calls.at(-1)?.[0]?.title as string;
     expect(title).toHaveLength(120);
     expect(title.endsWith('...')).toBe(true);
+  });
+
+  it('ships artwork on disk for every kind on every platform', () => {
+    // A missing asset degrades to the default app icon silently -- the toast
+    // still shows, so nothing else in the suite would notice it went missing
+    // from resources/ or from the packaged extraResources copy. Windows needs
+    // its own file because the icon replaces the toast logo there, so a
+    // Windows-only gap would never show up on a macOS dev machine.
+    for (const kind of NOTIFICATION_KINDS) {
+      for (const platform of ['darwin', 'win32', 'linux'] as NodeJS.Platform[]) {
+        const file = path.join(
+          getNotificationIconsDir(),
+          notificationIconFileName(kind, platform),
+        );
+        expect(existsSync(file), `${file} does not exist`).toBe(true);
+      }
+      expect(resolveNotificationIcon(kind), `no icon resolved for ${kind}`).toBeDefined();
+    }
+  });
+
+  it('sends the agent-complete artwork with a completion notification', async () => {
+    await notificationService.showNotification({
+      title: 'Build release -- Response Ready',
+      body: 'Ready for review',
+      kind: 'agent-complete',
+      sessionId: 'session-1',
+      workspacePath: '/workspace/alpha',
+    });
+
+    const icon = mocks.notificationConstructor.mock.calls.at(-1)?.[0]?.icon as string;
+    expect(path.basename(icon)).toBe(notificationIconFileName('agent-complete'));
+  });
+
+  it('gives each blocking type the artwork that matches what it wants from the user', async () => {
+    const iconFor = async (blockingType: BlockingType): Promise<string> => {
+      await notificationService.showBlockedNotification(
+        'session-1',
+        'Build release',
+        blockingType,
+        '/workspace/alpha',
+      );
+      return mocks.notificationConstructor.mock.calls.at(-1)?.[0]?.icon as string;
+    };
+
+    // A question wants an answer only the user has; the rest want a yes/no on
+    // work the agent already drafted.
+    expect(path.basename(await iconFor('question')))
+      .toBe(notificationIconFileName('agent-question'));
+    for (const blockingType of ['permission', 'plan_approval', 'git_commit'] as BlockingType[]) {
+      expect(path.basename(await iconFor(blockingType)))
+        .toBe(notificationIconFileName('needs-input'));
+    }
+    expect(await iconFor('question')).not.toBe(resolveNotificationIcon('agent-complete'));
+  });
+
+  it('gives Windows its own logo-bearing artwork', () => {
+    expect(notificationIconFileName('teams-message', 'win32')).toBe('teams-message-win.png');
+    expect(notificationIconFileName('teams-message', 'darwin')).toBe('teams-message.png');
+  });
+
+  it('falls back to the default app icon when the artwork is missing', async () => {
+    vi.resetModules();
+    vi.doMock('../../utils/appPaths', () => ({
+      getPackageRoot: () => '/nonexistent-package-root',
+    }));
+    const { resolveNotificationIcon: resolveMissing } = await import('../notificationIcons');
+
+    expect(resolveMissing('teams-message')).toBeUndefined();
+
+    vi.doUnmock('../../utils/appPaths');
+    vi.resetModules();
   });
 
   it('prefixes blocked notifications with the originating session name', async () => {

@@ -34,6 +34,19 @@ export type {
   CommentMentionPayload,
   CommentReplyPayload,
 } from './commenting/types';
+
+// In-document decisions
+export type { DecisionsConfig, DecisionMember } from './decisions/types';
+export {
+  DecisionsProvider,
+  useDecisionVotes,
+  YDocDecisionRepository,
+  DECISION_VOTES_KEY,
+  DECISION_RECOMMENDATIONS_KEY,
+  type DecisionVotingState,
+  type DecisionRepositorySnapshot,
+} from './decisions';
+
 export type {
   AgentCommentActor,
   Comment,
@@ -49,12 +62,15 @@ export {
 } from './commenting';
 export { CommentCollabProvider } from './commenting/CommentCollabProvider';
 export {
+  classifyCommentAnchorInput,
+  collabCommentAnchorAdapterRegistry,
   collabCommentControllerRegistry,
   CollabCommentControllerError,
   createCollabCommentController,
 } from './commenting/CollabCommentControllerRegistry';
 export type {
   CollabCommentController,
+  CommentAnchorInput,
   CommentAnchorSelector,
   CommentControllerErrorCode,
   CommentControllerListResult,
@@ -191,6 +207,15 @@ export {
   $convertSelectionToEnhancedMarkdownString
 } from './markdown';
 
+// In-place external content replacement (collaborator edit, file watcher,
+// agent write) that preserves the caret instead of remounting the editor.
+export {
+  applyExternalMarkdown,
+  externalContentUpdateTags,
+  mapOffsetAcrossChange,
+  EXTERNAL_CONTENT_UPDATE_TAG,
+} from './applyExternalMarkdown';
+
 // Markdown normalization utilities
 export {
   detectMarkdownIndentSize,
@@ -238,6 +263,7 @@ export { useDiffCommands, APPLY_MARKDOWN_REPLACE_COMMAND, LiveNodeKeyState } fro
 // Diff utilities (now from local plugin)
 export {
   applyMarkdownReplace,
+  applyTextReplacementsToString,
   $approveDiffs,
   $rejectDiffs,
   $hasDiffNodes,
@@ -246,6 +272,7 @@ export {
   scrollToChangeGroup,
   $approveChangeGroup,
   $rejectChangeGroup,
+  $clearResidualDiffMarkers,
   $getDiffState,
   APPROVE_DIFF_COMMAND,
   REJECT_DIFF_COMMAND,

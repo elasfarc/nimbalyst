@@ -1021,7 +1021,7 @@ export function initVoiceModeListeners(): () => void {
           // Run the actual commit, then forward the result so the durable
           // prompt is resolved with the same shape the widget produces.
           window.electronAPI
-            .invoke('git:commit', commitWorkspacePath, commitMessage, filePaths)
+            .invoke('git:commit', commitWorkspacePath, commitMessage, filePaths, payload.sessionId)
             .then((result: any) => {
               window.electronAPI.invoke('messages:respond-to-prompt', {
                 sessionId: payload.sessionId,

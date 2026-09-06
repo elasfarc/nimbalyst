@@ -121,7 +121,7 @@ export interface MigrateOptions {
   sqlite: SQLiteDatabase;
   /** Receives progress events. Called synchronously from the migrator. */
   onProgress?: (progress: MigrationProgress) => void;
-  /** Per-batch row count. Default 1000. */
+  /** Requested per-batch row count. Default 5,000; wide tables may cap it lower. */
   batchSize?: number;
   /** Number of random rows per table to deep-equality check. Default 5. */
   spotCheckPerTable?: number;
@@ -150,6 +150,8 @@ const COPY_TABLES: readonly string[] = [
   'tool_usage_counters',
   'tool_usage_backfill_meta',
   'tool_usage_backfill_sessions',
+  'session_commits',
+  'session_commit_backfill_meta',
   'tracker_items',
   'tracker_body_cache',
   'tracker_transactions',
@@ -163,6 +165,9 @@ const COPY_TABLES: readonly string[] = [
   'collab_document_outbox',
   'collab_document_assets',
   'project_file_sync_baseline',
+  'feedback_request_cache',
+  'feedback_request_index',
+  'feedback_request_index_backfill',
 ];
 
 /**
@@ -172,6 +177,7 @@ const COPY_TABLES: readonly string[] = [
  */
 const SOURCE_AUTHORITATIVE_CONFLICT_KEYS: Readonly<Record<string, readonly string[]>> = {
   tool_usage_backfill_meta: ['singleton'],
+  session_commit_backfill_meta: ['singleton'],
 };
 
 /**
@@ -194,6 +200,22 @@ const CURSOR_COLUMNS: Record<string, string> = {
   // ai_session_wakeups, super_loops, super_iterations, tracker_body_cache,
   // tracker_transactions, collab_local_origins.
 };
+
+const DEFAULT_BATCH_SIZE = 5000;
+
+/**
+ * Row-count batching is unsafe for tables whose rows carry large binary
+ * payloads. `document_history.content` stores complete compressed document
+ * snapshots, so 5,000 rows can exhaust the live PGLite bridge's 30-second
+ * read budget while moving a large payload across worker hops (#1452).
+ */
+const TABLE_BATCH_SIZE_LIMITS: Readonly<Record<string, number>> = {
+  document_history: 500,
+};
+
+function batchSizeForTable(table: string, requestedBatchSize: number): number {
+  return Math.min(requestedBatchSize, TABLE_BATCH_SIZE_LIMITS[table] ?? requestedBatchSize);
+}
 
 const APP_SERVER_NOTIFICATION_METHODS_TO_KEEP = [
   'item/started',
@@ -232,7 +254,7 @@ interface TargetColumn {
 export class PGLiteToSQLiteMigrator {
   async migrate(opts: MigrateOptions): Promise<MigrationSummary> {
     const t0 = performance.now();
-    const batchSize = opts.batchSize ?? 5000;
+    const requestedBatchSize = opts.batchSize ?? DEFAULT_BATCH_SIZE;
     const spotCheckPerTable = opts.spotCheckPerTable ?? 5;
     const log = opts.log ?? (() => {});
     const sqliteHandle = opts.sqlite.getRawHandle();
@@ -283,6 +305,7 @@ export class PGLiteToSQLiteMigrator {
     const manifestPerTable: DryRunManifest['perTable'] = [];
     for (let i = 0; i < pgliteCounts.length; i++) {
       const { name, rows: tableExpected } = pgliteCounts[i];
+      const batchSize = batchSizeForTable(name, requestedBatchSize);
       const { copied, samples, cursorMax } = await this.copyTable({
         sourceTable: name,
         expectedRows: tableExpected,
@@ -556,7 +579,7 @@ export class PGLiteToSQLiteMigrator {
     log?: NonNullable<MigrateOptions['log']>;
   }): Promise<CatchUpResult> {
     const t0 = performance.now();
-    const batchSize = opts.batchSize ?? 5000;
+    const requestedBatchSize = opts.batchSize ?? DEFAULT_BATCH_SIZE;
     const log = opts.log ?? (() => {});
     const sqliteHandle = opts.sqlite.getRawHandle();
     if (!sqliteHandle) throw new Error('SQLiteDatabase must be initialized before catchUp');
@@ -578,6 +601,7 @@ export class PGLiteToSQLiteMigrator {
       const { name, rows: currentTotal } = currentCounts[i];
       const stored = manifestByTable.get(name);
       const cursorColumn = CURSOR_COLUMNS[name];
+      const batchSize = batchSizeForTable(name, requestedBatchSize);
       let added = 0;
 
       opts.onProgress?.({

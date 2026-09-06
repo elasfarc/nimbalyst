@@ -14,6 +14,7 @@ import { getQueuedPromptsStore } from '../RepositoryManager';
 import { getSyncProvider } from '../SyncManager';
 import { submitClaudeCliPromptProduction } from './claudeCliSubmitSingleton';
 import { flushNextClaudeCliQueuedPrompt } from './claudeCliQueueFlush';
+import { publishQueuedPromptClaim } from './queuedPromptClaimEvents';
 import { publishQueuedPromptsToSync } from './queuedPromptSyncPublisher';
 
 /** Per-session guard so two close `idle` events can't double-flush. */
@@ -55,6 +56,7 @@ export async function flushNextClaudeCliQueuedPromptForSession(
         // event, so there is no single target window; broadcasting is safe
         // because the renderer filters by sessionId (NIM-830).
         notifyClaimed: (promptId) => {
+          publishQueuedPromptClaim({ sessionId, promptId });
           for (const win of BrowserWindow.getAllWindows()) {
             if (!win.isDestroyed()) {
               win.webContents.send('ai:promptClaimed', { sessionId, promptId });

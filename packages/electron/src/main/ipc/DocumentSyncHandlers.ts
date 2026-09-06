@@ -15,13 +15,14 @@ import { safeHandle } from '../utils/ipcRegistry';
 import { logger } from '../utils/logger';
 import { getCollabSyncWsUrl, getCollabSyncHttpUrl } from '../utils/collabSyncUrl';
 import { isAuthenticated, getStytchUserId, getUserEmail, getAuthState, getPersonalUserId, getPersonalSessionJwt, refreshPersonalSessionDetailed } from '../services/StytchAuthService';
-import { findTeamForWorkspace, getOrgScopedJwt } from '../services/TeamService';
-import { getOrgIdFromJwt, getJwtExp } from '../services/jwtOrg';
+import { findTeamForWorkspace, resolveTeamForWorkspace, getOrgScopedJwt } from '../services/TeamService';
+import { getOrgIdFromJwt, getJwtExp, getSubFromJwt } from '../services/jwtOrg';
 import { getWorkspaceState, updateWorkspaceState } from '../utils/store';
 import { createSingleFlight } from '../utils/asyncCache';
 import { getDialogDefaultPath, rememberDialogSelection } from '../utils/dialogPaths';
 import { getPersonalDocSyncConfig, isSyncEnabled } from '../services/SyncManager';
 import { resolveCollabDocumentType } from './collabDocumentTypeResolver';
+import { drainLegacyPendingUpdates } from './legacyPendingUpdateDrain';
 import { getSyncId } from '../services/DocSyncService';
 import {
   registerCollabAssetDocument,
@@ -30,7 +31,8 @@ import {
   clearCollabAssetSender,
 } from '../protocols/collabAssetProtocol';
 import { uploadCollabAsset } from '../services/CollabAssetUploader';
-import { MAX_COLLAB_ASSET_BYTES } from '../../shared/collabAssetFormat';
+import { asTeamMemberId } from '@nimbalyst/runtime/auth/jwtScopes';
+import { MAX_COLLAB_ASSET_BYTES } from '@nimbalyst/runtime/sync/collabAssetFormat';
 import {
   scanMarkdownImageRefs,
   resolveAssetRef,
@@ -42,6 +44,7 @@ import {
   getLocalOriginBinding,
   recordLocalOriginShare,
   relinkLocalOriginBinding,
+  pullFromSharedOrigin,
   reuploadFromLocalOrigin,
   seedSharedDocumentFromContent,
 } from '../services/CollabLocalOriginService';
@@ -100,12 +103,12 @@ function assertReplicaAccess(identity: LocalReplicaIdentity): void {
  */
 const senderDestroyedHooked = new Set<number>();
 
-/** Build a human-readable display name from Stytch user data. Falls back to email, then userId. */
-function getUserDisplayName(userId: string): string {
+/** Build a human-readable display name from Stytch user data. Falls back to email, then member id. */
+function getUserDisplayName(memberId: string): string {
   const auth = getAuthState();
   const parts = [auth.user?.name?.first_name, auth.user?.name?.last_name].filter(Boolean);
   if (parts.length > 0) return parts.join(' ');
-  return getUserEmail() || userId;
+  return getUserEmail() || memberId;
 }
 
 export function registerDocumentSyncHandlers(): void {
@@ -114,7 +117,7 @@ export function registerDocumentSyncHandlers(): void {
    * Returns the org key as raw base64 (renderer reconstructs CryptoKey).
    *
    * Payload: { workspacePath: string; documentId: string; title?: string }
-   * Returns: { success: true, config: { orgId, documentId, title, serverUrl, userId } }
+   * Returns: { success: true, config: { orgId, documentId, title, serverUrl, teamMemberId } }
    *       | { success: false, error: string }
    */
   safeHandle('document-sync:open', async (event, payload: {
@@ -141,8 +144,8 @@ export function registerDocumentSyncHandlers(): void {
       return { success: false, error: 'Not authenticated. Sign in first.' };
     }
 
-    const userId = getStytchUserId();
-    if (!userId) {
+    const activeMemberId = getStytchUserId();
+    if (!activeMemberId) {
       return { success: false, error: 'No user ID available.' };
     }
 
@@ -154,6 +157,11 @@ export function registerDocumentSyncHandlers(): void {
       return { success: false, error: 'No team found for this workspace. Create or join a team first.' };
     }
     const orgId = team.orgId;
+    const teamJwt = await getOrgScopedJwt(orgId);
+    const teamMemberId = getSubFromJwt(teamJwt);
+    if (!teamMemberId) {
+      return { success: false, error: 'No team member ID available.' };
+    }
 
     logPhase('total', handlerStart);
 
@@ -174,22 +182,32 @@ export function registerDocumentSyncHandlers(): void {
       documentId: payload.documentId,
     });
 
-    const accountId = getPersonalUserId() ?? userId;
-    if (pendingUpdateBase64) {
-      try {
-        const legacyUpdateCommitted = await getCollabDocumentReplicaStore().migrateLegacyPendingUpdate(
-          { accountId, orgId, documentId: payload.documentId },
-          resolvedDocumentType ?? 'markdown',
-          Buffer.from(pendingUpdateBase64, 'base64'),
-        );
-        if (legacyUpdateCommitted) {
-          updateWorkspaceState(payload.workspacePath, state => {
-            delete state.collabPendingUpdates?.[pendingKey];
-          });
-          pendingUpdateBase64 = undefined;
-        }
-      } catch (error) {
-        logger.main.error('[DocumentSyncHandlers] Failed to migrate legacy pending update:', error);
+    const accountId = getPersonalUserId() ?? activeMemberId;
+    const pendingUpdates = workspaceState.collabPendingUpdates;
+    if (pendingUpdates && Object.keys(pendingUpdates).length > 0) {
+      // Drain every legacy entry, not only the document being opened. Entries for
+      // documents the user never reopens used to accumulate in workspace settings
+      // and inflate the cost of every workspace-state read in the main process.
+      const { migrated } = await drainLegacyPendingUpdates({
+        pending: pendingUpdates,
+        accountId,
+        resolveDocumentType: documentId =>
+          resolveCollabDocumentType({
+            callerDocumentType: documentId === payload.documentId ? payload.documentType : undefined,
+            workspaceState: workspaceState as unknown as { openCollabDocumentEntries?: unknown },
+            documentId,
+          }),
+        migrate: (identity, documentType, update) =>
+          getCollabDocumentReplicaStore().migrateLegacyPendingUpdate(identity, documentType, update),
+        onError: (key, error) =>
+          logger.main.error('[DocumentSyncHandlers] Failed to migrate legacy pending update:', key, error),
+      });
+
+      if (migrated.length > 0) {
+        updateWorkspaceState(payload.workspacePath, state => {
+          for (const key of migrated) delete state.collabPendingUpdates?.[key];
+        });
+        if (migrated.includes(pendingKey)) pendingUpdateBase64 = undefined;
       }
     }
 
@@ -197,7 +215,7 @@ export function registerDocumentSyncHandlers(): void {
     //   orgId,
     //   documentId: payload.documentId,
     //   serverUrl,
-    //   userId,
+    //   teamMemberId,
     // });
 
     // Authorize THIS renderer (webContents) to load this doc's encrypted
@@ -230,8 +248,8 @@ export function registerDocumentSyncHandlers(): void {
         documentType: resolvedDocumentType,
         serverUrl,
         accountId,
-        userId,
-        userName: getUserDisplayName(userId),
+        teamMemberId,
+        userName: getUserDisplayName(teamMemberId),
         userEmail: getUserEmail() || undefined,
         pendingUpdateBase64,
       },
@@ -802,6 +820,23 @@ export function registerDocumentSyncHandlers(): void {
     }
   });
 
+  safeHandle('document-sync:pull-local-origin', async (_event, payload: {
+    workspacePath: string;
+    documentId: string;
+    forceOverwriteLocal?: boolean;
+    conflictToken?: string;
+  }) => {
+    try {
+      return await pullFromSharedOrigin(payload);
+    } catch (err) {
+      return {
+        success: false,
+        status: 'error',
+        message: err instanceof Error ? err.message : String(err),
+      };
+    }
+  });
+
   safeHandle('document-sync:find-local-origin-link', async (_event, payload: {
     workspacePath: string;
     sourceFilePath: string;
@@ -965,34 +1000,41 @@ export function registerDocumentSyncHandlers(): void {
 
   /**
    * Resolve config needed to connect to the org's TeamRoom.
-   * Returns orgId, serverUrl, userId -- the renderer
+   * Returns orgId, serverUrl, teamMemberId -- the renderer
    * creates and manages the TeamSyncProvider instance itself.
    *
    * Payload: { workspacePath: string }
-   * Returns: { success: true, config: { orgId, serverUrl, userId } }
+   * Returns: { success: true, config: { orgId, serverUrl, teamMemberId } }
    *       | { success: false, error: string }
    */
   async function resolveIndexConfig(payload: {
     workspacePath: string;
   }) {
     if (!isAuthenticated()) {
-      return { success: false, error: 'Not authenticated. Sign in first.' };
+      return { success: false, error: 'Not authenticated. Sign in first.', retryable: false };
     }
 
-    const userId = getStytchUserId();
-    if (!userId) {
-      return { success: false, error: 'No user ID available.' };
-    }
-
-    const team = await findTeamForWorkspace(payload.workspacePath);
+    // `complete: false` means the lookup could not be carried out -- the team
+    // directory fetch timed out, or one account's fetch failed. Answering with
+    // the terminal "no team" message makes the renderer mark the scope
+    // permanently unavailable, which hides Shared Docs for the rest of the app
+    // session even though the next request would succeed.
+    const { team, complete } = await resolveTeamForWorkspace(payload.workspacePath);
     if (!team) {
-      return { success: false, error: 'No team found for this workspace.' };
+      return complete
+        ? { success: false, error: 'No team found for this workspace.', retryable: false }
+        : { success: false, error: 'Team lookup did not complete.', retryable: true };
     }
     const orgId = team.orgId;
+    const teamJwt = await getOrgScopedJwt(orgId);
+    const teamMemberId = getSubFromJwt(teamJwt);
+    if (!teamMemberId) {
+      return { success: false, error: 'No team member ID available.', retryable: true };
+    }
 
     const serverUrl = getCollabSyncWsUrl();
 
-    // logger.main.info('[DocumentSyncHandlers] Resolved doc index config', { orgId, serverUrl, userId });
+    // logger.main.info('[DocumentSyncHandlers] Resolved doc index config', { orgId, serverUrl, teamMemberId });
 
     return {
       success: true,
@@ -1004,8 +1046,8 @@ export function registerDocumentSyncHandlers(): void {
         // server's project-partitioned doc index attributes docs correctly.
         teamProjectId: team.teamProjectId ?? null,
         serverUrl,
-        userId,
-        userName: getUserDisplayName(userId),
+        teamMemberId,
+        userName: getUserDisplayName(teamMemberId),
         userEmail: getUserEmail() || undefined,
       },
     };
@@ -1083,10 +1125,10 @@ export function registerDocumentSyncHandlers(): void {
         config: {
           serverUrl: syncConfig.serverUrl,
           orgId: syncConfig.orgId,
-          userId: syncConfig.userId,
+          personalMemberId: syncConfig.personalMemberId,
           encryptionKeyBase64,
           syncId,
-          userName: getUserDisplayName(syncConfig.userId),
+          userName: getUserDisplayName(syncConfig.personalMemberId),
         },
       };
     } catch (err) {
@@ -1145,7 +1187,8 @@ export function registerDocumentSyncHandlers(): void {
     safeHandle('document-sync:open-test', async (_event, payload: {
       serverUrl: string;
       orgId: string;
-      userId: string;
+      // identity-scope-allow: Playwright IPC payload is branded at the test-only handler boundary
+      teamMemberId: string;
       documentId: string;
       title?: string;
     }) => {
@@ -1157,8 +1200,8 @@ export function registerDocumentSyncHandlers(): void {
             documentId: payload.documentId,
             title: payload.title || payload.documentId,
             serverUrl: payload.serverUrl,
-            accountId: payload.userId,
-            userId: payload.userId,
+            accountId: payload.teamMemberId,
+            teamMemberId: asTeamMemberId(payload.teamMemberId),
             userName: 'Test User',
             userEmail: 'test@test.com',
           },

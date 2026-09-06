@@ -52,6 +52,18 @@ Nimbalyst uses PostHog for anonymous usage analytics with two tracking contexts:
 
 All events include `$session_id` property automatically. Dev users are marked with `is_dev_user: true` via `$set_once`.
 
+### Global event properties
+
+Stamped on every event by both processes — main in `AnalyticsService.sendEvent`, renderer via `posthog.register`. Do not add these to individual call sites.
+
+| Property | Values | Why |
+| --- | --- | --- |
+| `nimbalyst_version` | app version | Release attribution |
+| `release_channel` | `stable` / `alpha` | Separates alpha cohorts from stable in any funnel |
+| `build_type` | `official` / `dev` / `local` | Per-event, unlike the `is_dev_user` person property, which is `$set_once` and sticky forever — once a user runs a dev build, every later official-build event of theirs is indistinguishable from a dev one unless the build type is on the event |
+
+The renderer resolves both from the main process rather than re-deriving them from env vars, so the two sides can never disagree.
+
 ## Events Catalog
 
 ### File Operations
@@ -59,7 +71,7 @@ All events include `$session_id` property automatically. Dev users are marked wi
 | Event Name | File(s) | Trigger | Properties | First Added (Public) | Significant Changes |
 | --- | --- | --- | --- | --- | --- |
 | `file_opened` | `FileHandlers.ts:85`<br/>`WorkspaceHandlers.ts:804` | User opens file via dialog or workspace tree | `source` (dialog/workspace)<br/>`fileType`<br/>`hasWorkspace` | v0.45.25 (2025-11-14) |  |
-| `file_saved` | `FileHandlers.ts` | File save operation succeeds | `saveType` (manual/auto)<br/>`fileType`<br/>`hasFrontmatter`<br/>`wordCount` | v0.45.25 (2025-11-14) | (pending release): Propagated the real autosave/manual source through file-save IPC |
+| `file_saved` | REMOVED | ~~File save operation succeeds~~ Removed (pending release): fired on every save including debounced autosave (650,472 events in 30 days, ~177 per user) and nothing consumed the count. `file_save_failed` remains. | — | v0.45.25 (2025-11-14) | (pending release): Removed<br/>(pending release): Propagated the real autosave/manual source through file-save IPC |
 | `file_save_failed` | `FileHandlers.ts` | File save operation fails; a continuous failure is emitted once per file/source/error-code incident until a successful save rearms it | `errorType` (permission/not_found/disk_full/is_directory/resource_limit/io/invalid_path/unknown)<br/>`errorCode` (allowlisted stable Node filesystem code or UNKNOWN)<br/>`fileType`<br/>`isAutoSave` | v0.45.25 (2025-11-14) | (pending release): Classified failures from stable Node error codes, propagated autosave source, and deduplicated continuous failures |
 | `file_created` | `FileHandlers.ts:399`<br/>`WorkspaceHandlers.ts:154` | User creates new file | `creationType` (new_file_menu/ai_tool)<br/>`fileType` (markdown/mockup/text/other) | v0.45.25 (2025-11-14) | v0.47.2 (2025-12-10): Added mockup fileType |
 | `file_renamed` | `WorkspaceHandlers.ts:592` | User renames file in workspace | None | v0.45.25 (2025-11-14) |  |
@@ -110,6 +122,16 @@ All events include `$session_id` property automatically. Dev users are marked wi
 | `tip_all_tips_opened` | `InlineTipDisplay.tsx:143`<br/>`FilesEmptyTipDisplay.tsx` | User opens the All Tips dialog from an inline tip card | `from_tip_id`<br/>`surface` (inline_empty_transcript / files_empty) | v0.56.8 (2026-03-23) | (pending release as of 6ddf1d7): Added files_empty surface |
 | `tip_navigated` | `FilesEmptyTipDisplay.tsx` | User clicks "Next tip" on the Files empty-state tip card | `from_tip_id`<br/>`to_tip_id`<br/>`direction` (next)<br/>`reason` (next_button)<br/>`surface` (files_empty) | (pending release as of 6ddf1d7) |  |
 
+### Tracker Quick Create
+
+The three outcomes are instrumented together so the duplicate thresholds can be tuned from evidence: how often the strip appears, how often it is acted on, and how often an item is created anyway with suggestions on screen (`duplicatesShown > 0`).
+
+| Event Name | File(s) | Trigger | Properties | First Added (Public) | Significant Changes |
+| --- | --- | --- | --- | --- | --- |
+| `tracker_quick_create_duplicates_shown` | `TrackerQuickCreatePopup.tsx` | The duplicate strip surfaces at least one match during a quick-create run (once per run) | `matchCount`<br/>`semanticAvailable` (whether the memory engine contributed) | (pending release) |  |
+| `tracker_quick_create_duplicate_opened` | `TrackerQuickCreatePopup.tsx` | User opens a suggested existing item instead of creating a new one | `matchCount` | (pending release) |  |
+| `tracker_quick_create_item_created` | `TrackerQuickCreatePopup.tsx` | User creates a tracker item from the quick-create popup | `trackerType`<br/>`sharing` (personal/team)<br/>`duplicatesShown` (matches on screen at create time)<br/>`closedAfterCreate` (Cmd+Enter vs Enter) | (pending release) |  |
+
 ### Session Kanban Board
 
 | Event Name | File(s) | Trigger | Properties | First Added (Public) | Significant Changes |
@@ -130,10 +152,27 @@ All events include `$session_id` property automatically. Dev users are marked wi
 
 ### AI Chat & Sessions
 
+#### Session launch context
+
+`create_ai_session` carries where a session came from. The union lives in `packages/electron/src/shared/analytics/sessionLaunch.ts`; `initiator` is derived from `launchSource` through one exhaustive map rather than passed alongside it, so the two can never disagree.
+
+| `initiator` | `launchSource` values |
+| --- | --- |
+| `app` | `app_startup`, `tab_restore`, `workstream_convert`, `unknown` |
+| `user` | `new_session_button`, `launch_popup`, `session_history`, `tray`, `workspace_welcome`, `starter_prompt`, `slash_command`, `worktree`, `commit_flow`, `issue_panel`, `pull_request_panel`, `canvas`, `mobile`, `cli` |
+| `agent` | `meta_agent`, `workstream_child`, `blitz`, `automation` |
+
+`unknown` maps to `app`, not `user`. An uninstrumented path is far more likely to be one the app took on its own, and under-counting deliberate launches is the honest failure.
+
+**Not yet wired, so they will read zero:** `app_startup`, `tab_restore`, `workspace_welcome`, `starter_prompt`, `slash_command`, `blitz`, `automation`, `mobile`, `cli`. The mobile worktree path in `AIService` writes through `AISessionsRepository.create` directly and emits no `create_ai_session` at all, which is pre-existing.
+
 | Event Name | File(s) | Trigger | Properties | First Added (Public) | Significant Changes |
 | --- | --- | --- | --- | --- | --- |
-| `create_ai_session` | `AIService.ts:1860`<br/>`SessionHandlers.ts:323, 672` | User creates new AI chat session | `provider`<br/>`is_worktree_session` (boolean)<br/>`is_workstream_child` (boolean)<br/>`is_meta_agent_session` (boolean) | v0.45.25 (2025-11-14) | v0.52.14: Added is_worktree_session and is_workstream_child properties<br/>(pending release): Also emitted from SessionHandlers so Files and Agent mode session creation paths are tracked<br/>(pending release): Added is_meta_agent_session property |
+| `create_ai_session` | `sessionLaunchAnalytics.ts` (single emitter; called from `AIService.ts` and `SessionHandlers.ts`) | An agent session is created | `provider`<br/>`is_worktree_session` (boolean)<br/>`is_workstream_child` (boolean)<br/>`is_meta_agent_session` (boolean)<br/>`launchSource` (enum, see below)<br/>`initiator` (`user` \| `app` \| `agent`, derived from `launchSource`)<br/>`isFirstEverSession` (boolean)<br/>`sessionOrdinalBucket` (`1` \| `2-4` \| `5-9` \| `10+`)<br/>`hadPrefilledPrompt` (boolean) | v0.45.25 (2025-11-14) | v0.52.14: Added is_worktree_session and is_workstream_child properties<br/>(pending release): Also emitted from SessionHandlers so Files and Agent mode session creation paths are tracked<br/>(pending release): Added is_meta_agent_session property<br/>(pending release): Added launch context; consolidated the two drifted emitters into one |
 | `ai_message_sent` | `AIService.ts:1822` | User sends message in AI chat | `provider`<br/>`hasDocumentContext`<br/>`hasAttachments`<br/>`contentMode` (files/agent/unknown)<br/>`sessionMode` (optional, planning/agent)<br/>`fileExtension` (optional, when document open)<br/>`usedSlashCommand` (optional)<br/>`slashCommandName` (optional)<br/>`slashCommandPackageId` (optional) | v0.45.25 (2025-11-14) | v0.47.2 (2025-12-10): Added usedSlashCommand, slashCommandName, slashCommandPackageId properties<br/>(pending release as of 5698aa25): Added fileExtension property<br/>(pending release): Added sessionMode property |
+| `ai_message_submit_attempted` | `SessionTranscript.tsx`<br/>`SessionLaunchPopup.tsx` | User presses send. Fires at the composer **before every guard**, so it is the denominator for the send funnel — including the Claude CLI path, which returns before `ai:sendMessage` | `surface` (transcript/launch_popup)<br/>`provider`<br/>`promptLengthBucket` (short/medium/long, same scale as `ai_message_sent`)<br/>`isFirstMessageInSession`<br/>`sessionMode` | (pending release as of 9e36920c2) |  |
+| `ai_send_blocked` | `SessionTranscript.tsx`<br/>`SessionLaunchPopup.tsx`<br/>`MessageStreamingHandler.ts` | A send terminated without reaching a provider. One emitter per call path: main reports everything downstream of `ai:sendMessage`, the renderer reports its own guards and stays silent on IPC rejection so blocks are never double-counted | `surface`<br/>`reason` (closed enum: empty_draft, no_session_data, queued_cli_not_ready, cli_submit_failed, queued_while_loading, mode_switch_failed, slash_command_only, slash_command_clear, ipc_error, duplicate_prompt, no_session_id, no_workspace, session_not_found, session_mismatch, no_provider, no_api_key)<br/>`provider` | (pending release as of 9e36920c2) |  |
+| `composer_state_reported` | `SessionTranscript.tsx` | What the composer offered when a session opened. Once per session, not per render | `surface`<br/>`sendEnabled`<br/>`disabledReason` (none/no_provider_selected/no_models_available/session_loading/workspace_untrusted/unknown)<br/>`providerSelected`<br/>`modelSelected`<br/>`provider` | (pending release as of 9e36920c2) |  |
 | `ai_message_queued` | `AIService.ts:2517, 640` | User queues message while AI is busy processing | `provider`<br/>`source` (local/mobile)<br/>`hasDocumentContext`<br/>`hasAttachments`<br/>`fileExtension` (optional, local only when document open) | (pending release as of f891af91) | (pending release as of 5698aa25): Added fileExtension property |
 | `ai_response_received` | `MessageStreamingHandler.ts:1913, 2477` | AI provider returns response | `provider`<br/>`responseType` (text/tool_use/error)<br/>`toolsUsed`<br/>`usedChartTool`<br/>`responseTime`<br/>`chunkCount` (0-9, 10-49, 50-99, 100+, success only)<br/>`totalLength` (0-99, 100-499, 500-999, 1000+, success only) | v0.45.25 (2025-11-14) | (pending release): Merged `ai_response_streamed` fields (`chunkCount`, `totalLength`) into this event to remove the 1:1 duplicate |
 | `ai_stream_interrupted` | `AIService.ts:1024, 1483` | AI streaming stops prematurely | `provider`<br/>`chunksReceived`<br/>`reason` (error/user_cancel)<br/>`errorCategory` (resume_mismatch/stream_closed/network/auth/timeout/rate_limit/overloaded/unknown, only when reason=error) | v0.45.25 (2025-11-14) | (pending release): Added `errorCategory` so NIM-838 resume-mismatch and other Claude Code failures can be separated from the generic error bucket |
@@ -148,8 +187,9 @@ All events include `$session_id` property automatically. Dev users are marked wi
 | `ai_mode_changed` | `SessionTranscript.tsx` | User switches session mode via ModeTag or Shift+Tab | `from` (planning/agent)<br/>`to` (planning/agent)<br/>`provider` (string)<br/>`session_id` (string) | (pending release) | Auto mode is no longer user-selectable; it activates transparently via the "Allow All" trust level for supported providers |
 | `exit_plan_mode_response` | `SessionTranscript.tsx:923, 943, 974, 1060` | User responds to plan completion confirmation | `decision` (approved/denied/start_new_session/cancelled)<br/>`has_feedback` (boolean, for denied only)<br/>`is_worktree` (boolean, for start_new_session only) | (pending release) |  |
 | `ask_user_question_answered` | `SessionTranscript.tsx:1081` | User answers an AskUserQuestion prompt from Claude | `numQuestions` (number of questions answered) | (pending release) |  |
+| `mobile_push_requested` | `mobilePushRequest.ts` | Desktop asks the sync server to notify the user's phone, and the server acknowledges | `reason` (session_complete/cli_turn_complete/agent_error/awaiting_human/notify_urgent/unspecified)<br/>`forced` (boolean)<br/>`accepted` (boolean)<br/>`attemptedCount`<br/>`deliveredCount`<br/>`rejection` (no_registered_tokens/rate_limited/suppressed_active_device/unknown_session/provider_error/no_ack/null) | (pending release) |  |
 | `ask_user_question_cancelled` | `SessionTranscript.tsx:1087` | User cancels an AskUserQuestion prompt | None | (pending release) |  |
-| `git_commit_proposal_response` | `GitCommitConfirmationWidget.tsx:600, 672` | User responds to AI-generated git commit proposal | `action` (committed/cancelled/error)<br/>`file_count` (1-5/6-10/11-20/20+)<br/>`success` (boolean, for committed only) | (pending release) |  |
+| `git_commit_proposal_response` | `GitCommitConfirmationWidget.tsx:600, 672` | User responds to AI-generated git commit proposal | `action` (committed/cancelled/error)<br/>`file_count` (1-5/6-10/11-20/20+)<br/>`success` (boolean, for committed only)<br/>`partial_files` (count of files staged as a hunk subset)<br/>`hunks_deselected` (count of hunks left out across those files) | (pending release) | (pending release): Added partial_files and hunks_deselected for hunk-level staging |
 
 ### Claude Code (MCP)
 
@@ -184,15 +224,21 @@ The canonical property allowlists live in `packages/electron/src/shared/analytic
 
 | Event family | Events | Authoritative success seam |
 | --- | --- | --- |
-| Organization and membership | `team_surface_opened`, `team_organization_created`, `team_organization_switched`, `team_invitation_sent`, `team_invitation_accepted`, `team_member_role_changed`, `team_member_removed`, `team_organization_merged`, `team_organization_deleted`, `team_operation_failed` | Organization service response or explicit surface transition |
+| Organization and membership | `team_surface_opened`, `team_organization_created`, `team_organization_switched`, `team_invitation_sent`, `team_invitation_accepted`, `team_sign_in_completed`, `team_member_role_changed`, `team_member_removed`, `team_organization_merged`, `team_organization_deleted`, `team_operation_failed` | Organization service response, resolved invitation deep link, completed sign-in, or explicit surface transition |
+| Invitation landing | `invite_landing_viewed`, `invite_landing_failed`, `invite_first_open`, `invite_deep_link_followed`, `invite_download_clicked` | Web-console invitation callback, the invitee's first opened document/tracker item/request, or an explicit desktop-offer action |
+| Project walk | `team_project_walk_presented`, `team_project_walk_completed` | Visible desktop project-walk dialog or its completed/skipped outcome |
 | Project sharing and access | `team_project_added`, `team_project_identity_changed`, `team_project_moved`, `team_project_access_changed` | Project-sharing service response |
 | Shared-document discovery | `collab_home_opened`, `collab_home_searched` | Visible Shared Docs home and debounced committed search |
 | Shared-document lifecycle | `collab_document_created`, `collab_document_opened`, `collab_document_first_edited`, `collab_document_action`, `collab_operation_failed` | Creation orchestrator, successful tab open/reuse, first local Yjs mutation, or accepted document action |
 | Shared-folder lifecycle | `collab_folder_created`, `collab_folder_renamed`, `collab_folder_moved`, `collab_folder_deleted`, `collab_folder_link_copied` | Accepted folder mutation or successful link copy |
 | Shared trackers | `tracker_item_clicked`, `tracker_table_sort`, `tracker_item_mutated`, `tracker_item_scope_changed`, `tracker_mutation_rejected` | Tracker service mutation, explicit view interaction, or sync-rejection seam |
-| Collaboration health | `collab_sync_attempt_completed`, `collab_outbox_replay_completed`, `collab_share_asset_migration_completed`, `collab_server_mutation_rejected` | Coalesced client-observed terminal attempt or replay/migration/rejection outcome |
+| Collaboration health | `collab_sync_attempt_completed`, `collab_outbox_replay_completed`, `collab_share_asset_migration_completed`, `collab_server_mutation_rejected`, `tracker_drain_aborted` | Coalesced client-observed terminal attempt or replay/migration/rejection outcome; the drain abort fires when the reconnect drain refuses to run on an unresolved sharing policy |
 
 Common Teams properties are low-cardinality subsets of `surface`, `entryPoint`, `source`, `outcome`, `errorCategory`, `actorType`, `callerRole` (`owner`, `admin`, `member`, `viewer`, or `unknown`), `documentType`, `editorCategory`, `collaborationScope`, `resourceType`, `connectionPath`, `encryptionMode`, `durationCategory`, and the defined count/retry buckets. Event-specific enums and permitted fields are enforced by the shared contract.
+
+The signup funnel uses these bounded properties: `team_invitation_accepted` adds `entryPoint=deep_link`, the exact bounded `status` from invite resolution (`accepted`, `already-member`, `sign-in-required`, `not-found`, or `error`), and `projectMatched`; `team_sign_in_completed` records `membershipState` (`pending`, `active`, or `mixed`) plus `organizationCountBucket`; `team_project_walk_completed` records `folderSource` (`clone`, `bind`, or `not_applicable`) and `skipped`. Console events always set `surface=web_console`. `invite_first_open` adds `kind` (`document`, `tracker`, or `request`) and fires at most once per browser session; the desktop-offer events add `placement` (`welcome`, `empty_org`, or `gutter`). Both are enum-validated by `invitationAnalyticsContract.ts`, which rejects any value outside its declared set — a free string is exactly the shape an email address or org id would arrive as. No console event identifies the Stytch member or includes callback URL data.
+
+`invite_handoff_shown` and `invite_browser_instead_chosen` were retired with the desktop interstitial they measured: once the browser is the default landing, "chose the browser instead" can only ever be zero. `invite_deep_link_followed` lost its `auto` property at the same time — nothing navigates to `nimbalyst://` on the invitee's behalf any more, so every follow is a deliberate click. Historical data for the retired events predates that change and is not comparable to the current funnel.
 
 Never add organization, project, document, folder, member, account, room, or session IDs to these events. Also forbidden are names, email addresses, titles, filenames, paths, git remotes, raw errors, URLs, tokens, content, payloads, and exact values where a bucket exists.
 
@@ -207,6 +253,7 @@ Several of these seams are reached by debounced autosave or by a retrying transp
 | `collab_sync_attempt_completed` | One per resource per 60 seconds (`collaborationHealth.ts`) | A flapping socket can restart an attempt in a tight loop. |
 | `collab_outbox_replay_completed` | One per document per 5 minutes (`CollaborativeTabEditor.tsx`) | Every local edit enqueues an outbox entry, so cycles complete continuously while typing. |
 | `collab_document_first_edited` | Once per open lifecycle | Fired from the Yjs local-update callback, which fires per keystroke. |
+| `tutorial_progressed` | Once per milestone per tutorial workspace per app run (`tutorialAnalytics.ts`) | `prompt_sent` sits on the send path, which a user in the tutorial hits repeatedly. The question is "did they ever get this far", not how often. |
 
 Health-event caps apply to **every outcome equally**. Suppressing only successes (or only failures) would bias the failure-rate alerts these events feed.
 
@@ -308,13 +355,18 @@ Health-event caps apply to **every outcome equally**. Suppressing only successes
 | `database_init_failed_recovery_choice` | `PGLiteDatabaseWorker.ts:343, 399, 408` | User makes a choice in init failure recovery dialog | `choice` (restore_from_backup/start_fresh)<br/>`confirmed` (for start_fresh) | (pending release) |  |
 | `known_error` | Various (see Known Error IDs below) | A recognized error condition occurs that we want to track and monitor | `errorId` (see Known Error IDs)<br/>`context` (where the error occurred)<br/>fixed categorical properties documented per error ID; never raw error text | (pending release as of c597008b) | (pending release): Removed raw `errorMessage` because truncation does not prevent usernames and filesystem paths from reaching PostHog |
 | `feature_first_use` | `AIService.ts:406`<br/>`WindowManager.ts:230`<br/>`AnalyticsHandlers.ts:45` | User uses a feature for the first time | `feature`<br/>`daysSinceInstall` | v0.45.25 (2025-11-14) |  |
-| `migration_completed` | `MigrationOrchestrator.ts` | PGLite → SQLite migration finished successfully | `pglite_dir_size_bytes` (gauge of pre-migration store size)<br/>`target_row_count` (total rows migrated)<br/>`duration_ms`<br/>`tables_migrated`<br/>`spot_check_count`<br/>`foreign_key_violations`<br/>`integrity_check` ("ok") | (pending release) |  |
-| `migration_failed` | `MigrationOrchestrator.ts`<br/>`MigrationHandlers.ts` | PGLite → SQLite migration aborted before cutover | `phase` (optional: closing-pglite/opening-pglite/opening-sqlite/migrating/verifying-*/cutover)<br/>`errorCategory` (fixed enum)<br/>`errorCode` (fixed enum)<br/>`sqlState` (engine code or `none`) | (pending release) | (pending release): Replaced raw error message with privacy-safe category/code |
+| `database_backend_active` | `database/initialize.ts` | Unconditional per-launch heartbeat naming the active storage backend. This is the only event that measures the whole fleet: `database_error` carries a backend but fires only on failure, and `pglite_legacy_dir_present` fires only after a migration. `pglite_dir_size_bytes` sizes the heavy tail of a forced migration | `active_backend` (pglite/sqlite)<br/>`reason` (flag-file-sqlite/flag-file-pglite-rollback/fresh-install-defaults-sqlite/existing-pglite-migration-due)<br/>`pglite_dir_size_bytes` (0 when absent)<br/>`migration_attempts` (consecutive auto-migration failures)<br/>`migration_blocked_reason` (the durable refusal reason code, or `none`)<br/>`cutover_reconcile` (what startup did about an interrupted cutover: `none`/`nothing_moved_yet`/`source_preserved_target_ready`/`source_preserved_no_target`/`source_preserved_live_source_intact`/`backend_committed_target_ready`/`backend_committed_target_missing`/`already_finished`/`source_missing_everywhere`/`live_source_would_be_clobbered`/`reconcile_attempts_exhausted`/`journal_unreadable`/`source_fingerprint_mismatch`) | (pending release) | (pending release): Added `migration_blocked_reason` so a durably-blocked install stays visible after the launch that emitted `migration_refused`; added `cutover_reconcile` so an install stuck on an unfinishable cutover is visible from the next launch onward rather than only in local logs. `cutover_reconcile` also covers the two fail-closed verdicts: `journal_unreadable` (a cutover was running and its journal cannot be parsed, so startup refused to infer a backend) and `source_fingerprint_mismatch` (the preserved copy is no longer the directory the journal recorded, so it was not moved back). Both are bounded reason codes; no path or byte count travels |
+| `migration_completed` | `database/sqlite/migrationEventMapper.ts` | A PGLite → SQLite cutover finished successfully, whether by full migration or by adopting a dry-run. Emitted once per operation id by the main-owned mapper; the worker returns a typed domain result and never names an event | `operation` (migrate/adopt)<br/>`trigger` (auto/manual)<br/>`source_bytes_bucket` (none/lt_32mib/lt_256mib/lt_1gib/lt_3gib/lt_8gib/gte_8gib)<br/>`target_rows_bucket` (unknown/zero/1_9/10_99/100_999/1000_plus)<br/>`duration_ms`<br/>`tables_migrated`<br/>`spot_check_count`<br/>`foreign_key_violations`<br/>`integrity_check` ("ok")<br/>`attempt` / `gave_up` (auto only) | (pending release) | (pending release): Replaced the raw `pglite_dir_size_bytes` with `source_bytes_bucket`; absorbed `migration_adopted_dry_run` via `operation` |
+| `migration_refused` | `database/sqlite/migrationEventMapper.ts` | The product looked at the install and declined to migrate or adopt: the source is missing, unreadable, contradicted by a larger copy on disk, or there is not enough free space. A refusal is a durable verdict recorded in the backend state — it does **not** consume one of the three transient auto-migration attempts, and it clears when the user retries from Settings or the measured facts move to a different bucket. Sizes and counts are bucketed here; the exact figures stay in `main.log` | `operation` (migrate/adopt)<br/>`trigger` (auto/manual)<br/>`reason_code` (backup_dwarfs_live/projects_without_sessions/source_unreadable/source_missing/insufficient_disk)<br/>`live_bytes_bucket`<br/>`largest_backup_bytes_bucket`<br/>`configured_projects_bucket` (unknown/zero/1_9/10_99/100_999/1000_plus)<br/>`source_sessions_bucket`<br/>`free_disk_bytes_bucket` (insufficient_disk only) | (pending release) | (pending release): Replaces `migration_refused_implausible_source` and `migration_auto_preflight_failed`; dropped the free-form `reason` string |
+| `migration_failed` | `database/sqlite/migrationEventMapper.ts` | A migration or adoption broke before cutover. Distinct from `migration_refused`: this one counts against the three auto-migration attempts | `operation` (migrate/adopt)<br/>`trigger` (auto/manual)<br/>`phase` (optional: closing-pglite/opening-pglite/opening-sqlite/migrating/catching-up*/verifying-*/cutover)<br/>`errorCategory` (fixed enum)<br/>`errorCode` (fixed enum)<br/>`sqlState` (engine code or `none`)<br/>`attempt` (1-3, auto only)<br/>`gave_up` (auto only) | (pending release) | (pending release): Absorbed `migration_auto_failed` and `migration_adopt_failed`; added `operation`/`trigger` |
 | `pglite_legacy_dir_present` | `database/initialize.ts` | Heartbeat fired at startup when a `pglite-db.migrated-*` directory still exists; gates the decision to retire the PGLite reader | `active_backend` (sqlite/pglite) | (pending release) |  |
-| `migration_dry_run_completed` | `ipc/MigrationHandlers.ts` | Alpha-grade preview: migration ran against a live PGLite to a throwaway SQLite dir without cutover | `target_row_count`<br/>`duration_ms`<br/>`tables_migrated`<br/>`sqlite_file_bytes` (estimated post-cutover footprint)<br/>`pglite_dir_bytes` (current PGLite footprint)<br/>`foreign_key_violations`<br/>`integrity_check` | (pending release) |  |
+| `database_init_failure_dialog` | `main/index.ts` | The database-failure dialog was shown, and what the user did with it. Previously this dialog was invisible in telemetry, so there was no way to see how many users it sent to delete their database | `backup_count` (restorable copies found on disk)<br/>`largest_backup_bytes`<br/>`action` (restore_succeeded/restore_failed/show_backups/quit) | (pending release) | (pending release): `action` gained the two restore outcomes — the Restore button previously performed a reveal, so `restore_*` could never be reported |
+| `database_recovery_started` | `database/recovery/recoveryEventMapper.ts` | A selected-artifact recovery began, emitted **before** the first destructive operation so a process that dies mid-recovery has still reported that it started. This is the gap that hid #1347 for nine months: the old recovery event was only computed if the same process finished initialization | `trigger` (settings/failure-dialog/backup-restore)<br/>`backend` (pglite/sqlite)<br/>`candidate_size_bucket` / `live_size_bucket` (empty/under-32mb/under-256mb/under-1gb/under-3gb/over-3gb)<br/>`reason_code` (assessment reason, or `none` on the rolling-backup path) | (pending release) |  |
+| `database_recovery_succeeded` | `database/recovery/recoveryEventMapper.ts` | A recovery completed: the replacement was staged, fully verified, swapped in by rename, reopened, and read back the expected content through the production proxy | `trigger`<br/>`backend`<br/>`candidate_size_bucket` | (pending release) |  |
+| `database_recovery_failed` | `database/recovery/recoveryEventMapper.ts` | A recovery refused or broke. Every value is a closed union; no message text or path travels. `rolled_back` distinguishes "the swap was undone and the old database is back" from "both copies are on disk and startup will reconcile from the journal" | `trigger`<br/>`backend`<br/>`code` (unknown_candidate/not_eligible/facts_changed/quiesce_failed/snapshot_failed/stage_failed/verification_failed/candidate_empty/swap_failed/reopen_failed/final_verify_failed)<br/>`failed_step` (reassess/quiesce/snapshot/stage/verify/swap-displace/swap-promote/reopen/final-verify/none)<br/>`rolled_back` | (pending release) |  |
+| `pglite_corruption_backup_present` | `database/initialize.ts` | Heartbeat fired at startup when a `pglite-db.backup-*` directory exists — the worker renamed a database aside as corrupt. Previously this recovery had no fleet signal, so an install could run indefinitely on an empty database unnoticed. A large `backup_dir_bytes` next to a near-empty `live_pglite_dir_bytes` is the fingerprint of a silent wipe with data still recoverable | `active_backend` (pglite/sqlite)<br/>`reason` (backend selector reason)<br/>`backup_dir_count`<br/>`backup_dir_bytes` (largest renamed-aside dir)<br/>`live_pglite_dir_bytes` (0 when absent) | (pending release) |  |
+| `migration_dry_run_completed` | `ipc/MigrationHandlers.ts` | Alpha-grade preview: migration ran against a live PGLite to a throwaway SQLite dir without cutover | `target_rows_bucket` (unknown/zero/1_9/10_99/100_999/1000_plus)<br/>`duration_ms`<br/>`tables_migrated`<br/>`sqlite_file_bytes_bucket` (estimated post-cutover footprint; none/lt_32mib/lt_256mib/lt_1gib/lt_3gib/lt_8gib/gte_8gib)<br/>`pglite_dir_bytes_bucket` (current PGLite footprint; same buckets)<br/>`foreign_key_violations`<br/>`integrity_check` | (pending release) |  |
 | `migration_dry_run_failed` | `ipc/MigrationHandlers.ts` | Dry-run aborted before completion (schema open / read / verification failure) | `errorCategory` (fixed enum)<br/>`errorCode` (fixed enum)<br/>`sqlState` (engine code or `none`) | (pending release) | (pending release): Replaced raw error message with privacy-safe category/code |
-| `migration_adopted_dry_run` | `ipc/MigrationHandlers.ts` | A successful dry-run is adopted as the active SQLite database | `rows_added`<br/>`duration_ms` | (pending release) |  |
-| `migration_adopt_failed` | `MigrationAdopter.ts`<br/>`ipc/MigrationHandlers.ts` | Adopting a successful dry-run fails | `phase` (optional)<br/>`errorCategory` (fixed enum)<br/>`errorCode` (fixed enum)<br/>`sqlState` (engine code or `none`) | (pending release) | (pending release): Replaced raw error message with privacy-safe category/code |
 
 #### Known Error IDs
 
@@ -332,13 +384,15 @@ The `known_error` event uses an `errorId` property to identify specific error co
 
 | Event Name | File(s) | Trigger | Properties | First Added (Public) | Significant Changes |
 | --- | --- | --- | --- | --- | --- |
-| `developer_mode_changed` | `App.tsx`<br/>`AdvancedPanel.tsx` | User changes developer mode setting (initial or subsequent) | `developer_mode` (boolean)<br/>`source` (onboarding/settings)<br/>`is_initial` (boolean) | (pending release) |  |
+| `developer_mode_changed` | `onboardingAnalytics.ts` (initial)<br/>`AdvancedPanel.tsx` (settings) | User changes developer mode setting (initial or subsequent) | `developer_mode` (boolean)<br/>`source` (onboarding/settings)<br/>`is_initial` (boolean) | (pending release) |  |
 | `unified_onboarding_skipped` | `App.tsx` | User skips the unified onboarding flow | None | (pending release) | Replaces `onboarding_skipped` |
 | ~~`feature_walkthrough_completed`~~ | ~~`FeatureWalkthrough.tsx`~~ | ~~User completes or skips the feature walkthrough~~ | ~~`total_time_ms`<br/>`slide_times` (object with editor/mockup/agent keys)<br/>`skipped` (boolean)<br/>`skipped_at_slide` (editor/mockup/agent, only if skipped)~~ | v0.45.25 (2025-11-14) | **DEPRECATED**: No longer sent; walkthrough slides removed in unified onboarding |
 | ~~`onboarding_completed`~~ | ~~`OnboardingDialog.tsx`~~ | ~~User completes the role/email onboarding dialog~~ | ~~`user_role`<br/>`custom_role_provided`<br/>`custom_role_text`<br/>`email_provided`~~ | v0.45.25 (2025-11-14) | **DEPRECATED**: Replaced by `unified_onboarding_completed`, then re-used (see below) |
-| `onboarding_completed` | `useOnboarding.ts` | User completes the unified onboarding dialog (has role or referral data) | `user_role` (raw value, e.g. `developer`, `product_manager`, `other`)<br/>`custom_role_text` (only when user typed a custom role)<br/>`referral_source` (raw value: `search`, `social`, `friend`, `ai`, `ad`, `youtube`, `github`, `course_training`, `podcast`, `newsletter_article`, or `other`)<br/>`referral_search_detail` (only for `search` referral)<br/>`referral_ai_detail` (only for `ai` referral)<br/>`referral_other_detail` (only for `other` referral)<br/>`referral_social_detail` (only for `social` referral)<br/>`developer_mode` (boolean)<br/>`email_provided` (boolean) | (pending release) | Replaces programmatic `survey sent` for the Onboarding Profile Survey. Property names and raw values match the existing `Devs` / `Product Managers` / `role_other` cohorts.<br/>(pending release): Added YouTube, GitHub, Course/Training, Podcast, and Newsletter/Article referral sources and search query details. |
+| `onboarding_completed` | `onboardingAnalytics.ts` (via `persistOnboardingCompletion`) | User completes onboarding on any path — the in-app dialog or the project-manager onboarding window a fresh install sees (has role or referral data) | `user_role` (raw value, e.g. `developer`, `product_manager`, `other`)<br/>`custom_role_text` (only when user typed a custom role)<br/>`referral_source` (raw value: `search`, `social`, `friend`, `ai`, `ad`, `youtube`, `github`, `course_training`, `podcast`, `newsletter_article`, or `other`)<br/>`referral_search_detail` (only for `search` referral)<br/>`referral_ai_detail` (only for `ai` referral)<br/>`referral_other_detail` (only for `other` referral)<br/>`referral_social_detail` (only for `social` referral)<br/>`developer_mode` (boolean)<br/>`email_provided` (boolean) | (pending release) | Replaces programmatic `survey sent` for the Onboarding Profile Survey. Property names and raw values match the existing `Devs` / `Product Managers` / `role_other` cohorts.<br/>(pending release): Added YouTube, GitHub, Course/Training, Podcast, and Newsletter/Article referral sources and search query details. |
 | ~~`onboarding_deferred`~~ | ~~`App.tsx`~~ | ~~User clicks "Ask me later" on onboarding dialog~~ | ~~None~~ | v0.45.25 (2025-11-14) | **DEPRECATED**: Removed in unified onboarding |
 | ~~`onboarding_skipped`~~ | ~~`App.tsx`~~ | ~~User clicks "Never ask again" on onboarding dialog~~ | ~~None~~ | v0.45.25 (2025-11-14) | **DEPRECATED**: Replaced by `unified_onboarding_skipped` |
+| `tutorial_started` | `TutorialProjectService.ts` (via `tutorialAnalytics.ts`) | Tutorial project is opened, from any entry point (fires only when the open succeeds) | `entryPoint` (onboarding/welcome_pane/project_manager_sidebar/help_menu/unknown)<br/>`reused` (boolean — false the first time, when the project is materialized) | (pending release) |  |
+| `tutorial_progressed` | `tutorialAnalytics.ts`, called from `AIService.ts` and `MessageStreamingHandler.ts` | User does something inside the tutorial project — separates "opened it" from "used it" | `milestone` (session_opened/prompt_sent) | (pending release) |  |
 | `claude_commands_toast_shown` | `App.tsx:894` | Claude commands install toast is displayed | None | v0.47.2 (2025-12-10) |  |
 | `claude_commands_toast_install_all` | `App.tsx:1654` | User clicks "Install All" on commands toast | None | v0.47.2 (2025-12-10) |  |
 | `claude_commands_toast_settings` | `App.tsx:1663` | User clicks "Settings" on commands toast | None | v0.47.2 (2025-12-10) |  |
@@ -379,7 +433,7 @@ The `known_error` event uses an `errorId` property to identify specific error co
 | Event Name | File(s) | Trigger | Properties | First Added (Public) | Significant Changes |
 | --- | --- | --- | --- | --- | --- |
 | `user_created` | `index.ts:736` | Very first app launch only (launchCount === 1) - fires once per user | `$set_once: first_seen_version` | (pending release) |  |
-| `nimbalyst_session_start` | `AnalyticsService.ts:154` | Application starts (sent even for opted-out users) | `$session_id`<br/>`has_git_installed`<br/>`$set: nimbalyst_version`<br/>`$set: cpu_arch`<br/>`$set_once: is_dev_user`<br/>`$set_once: is_dev_install` | v0.45.25 (2025-11-14) |  |
+| `nimbalyst_session_start` | `AnalyticsService.ts:154` | Application starts (sent even for opted-out users) | `$session_id`<br/>`has_git_installed`<br/>`nimbalyst_version`<br/>`release_channel`<br/>`build_type`<br/>`launch_number` (1/2/3-5/6-20/20+)<br/>`days_since_install` (0/1/2-7/8-30/31-90/90+)<br/>`$set: nimbalyst_version`<br/>`$set: cpu_arch`<br/>`$set_once: is_dev_user`<br/>`$set_once: is_dev_install` | v0.45.25 (2025-11-14) | (pending release as of 9e36920c2): Stamped `nimbalyst_version` as an **event** property (it was `$set`-only, so this event could not be attributed to a release), and added `release_channel`, `build_type`, `launch_number`, `days_since_install` |
 | `analytics_opt_out` | `AnalyticsService.ts:89` | User opts out of analytics in settings | None | v0.45.25 (2025-11-14) |  |
 | `first_launch_claude_check` | `index.ts:114` | Very first app launch only - checks if Claude Code is installed | `hasClaudeInstalled` (boolean) | v0.47.2 (2025-12-10) |  |
 | `quit_confirmation_shown` | `index.ts:757` | User attempts quit with active AI session | `reason` (active_ai_session) | v0.45.25 (2025-11-14) |  |
@@ -492,18 +546,52 @@ All events MUST follow these privacy rules:
 - **Official builds**: Created by GitHub release workflow with `OFFICIAL_BUILD=true`
 - **Filtering**: Use `WHERE is_dev_user != true` in PostHog to exclude dev users
 
+## A server-side allow-list drops unknown events
+
+**Capturing an event in code is not enough to get data. Read this before adding one.**
+
+Since 2026-09-04, PostHog project 234047 runs an ingestion transformation named **`Cost control allow-list`** (hog function `01a06d5f-4e7f-0000-e72c-e157df4146b8`, execution order 1) that **drops every event whose name is not on an explicit allow-list, before ingestion**. A new `sendEvent('my_event')` will be constructed, serialized, sent, and then silently discarded at the far end. Nothing errors, nothing logs, and the event simply never appears in PostHog.
+
+It exists because the org was ingesting ~6.5M events/month against a 1M/month free tier. The allow-list is the reason the bill is zero, so it is not going away — but it means the source of truth for "will this event arrive" lives in PostHog, not in this repo.
+
+**When adding an event you must also add its name to the allow-list**, at Data pipeline → Transformations → `Cost control allow-list` in project 234047. The repo-side mirror is `packages/electron/src/shared/analytics/posthogIngestAllowList.ts`; keep the two in sync and run `npm run check:analytics-allowlist` to verify.
+
+Two further behaviours worth knowing:
+
+- **High-volume events are sampled onto a 12.5% distinct-id panel**, not dropped. The panel is `sha256Hex(distinct_id)` first hex character in `['0','1']`, so the *same* users are kept across every sampled event and per-user rates stay exact — but absolute totals must be multiplied by 8. See `SAMPLED_EVENTS` in the mirror file for the current list.
+- **Transformations run before person resolution**, so they cannot read person properties such as `is_dev_user`. Any future filter on dev traffic has to put the flag on the event payload itself.
+
+If an event you expected is missing, check the transformation before you debug the client.
+
+### `update_toast_shown` is currently unreachable in production
+
+Verified 2026-09-04. The renderer only emits it from the `update-toast:show-available` handler, and the sole sender of that channel is inside the `NODE_ENV === 'test' || PLAYWRIGHT === '1'` block at the bottom of `autoUpdater.ts`. In production the "Update Available" toast was deliberately removed (per maintainer direction on #327, `autoDownload = true` means only the "Ready to install" toast is shown), and nothing in the renderer listens to the production `update-available` broadcast at all.
+
+Two consequences:
+
+- The 201,350 events measured in the 30 days to 2026-09-04 came from **older shipped builds**, where the event fired from `autoUpdater.ts` in main on every hourly `update-available` callback. The move to the renderer is still marked "(pending release)" below. Once it ships, this event goes to zero.
+- The toast users *do* see (`update-toast:show-ready` → `handleUpdateReady`) has **no instrumentation**, so `update_toast_action` currently has no denominator. If a shown/acted conversion rate is wanted, that is where the event needs to move — and it would need adding to the ingestion allow-list, since `update_toast_shown` is currently in `INTENTIONALLY_DROPPED`.
+
+The per-window duplication has been fixed regardless: dedup now lives in `AnalyticsHandlers.ts` (main), because `initUpdateListeners()` runs once per window and each renderer window is a separate JS context, so no renderer-side guard can dedup across windows.
+
+### Accepted cost: the hourly updater re-hash
+
+`update_download_completed` fires once per `update-downloaded` event, and `electron-updater` re-emits that from cache on every hourly poll while an update is downloaded but not yet installed. The event is now deduped per version, but the underlying poll still calls `hashFile()` on the cached installer each hour (`DownloadedUpdateHelper.js`), a full sha512 read of a ~150–250MB file. This is a **known and accepted cost** — skipping the poll would stop the app noticing a newer version superseding the pending one until restart. Do not re-file it as a bug.
+
 ## Adding New Events
 
 When adding new events:
 
-1. **Choose the right context**: Main process (AnalyticsService) or renderer (usePostHog)
-2. **Follow naming conventions**: Use `snake_case`, `noun_verb` pattern
-3. **Use categorical properties**: Bucket values instead of exact numbers
-4. **Update this document**: Add the event to the appropriate table with version columns:
+1. **Add the event name to the server-side allow-list** — see the section above. Without this the event is silently dropped and you will collect nothing.
+2. **Choose the right context**: Main process (AnalyticsService) or renderer (usePostHog)
+3. **Follow naming conventions**: Use `snake_case`, `noun_verb` pattern
+4. **Use categorical properties**: Bucket values instead of exact numbers
+5. **Budget the volume**: a single user should not emit more than a few hundred events in a day across *all* events. If your event can fire on autosave, a poll, a render, or a websocket callback, throttle it through `AnalyticsEmissionThrottle` (`packages/electron/src/shared/analytics/analyticsThrottle.ts`) before shipping it.
+6. **Update this document**: Add the event to the appropriate table with version columns:
   - Set "First Added (Public)" to `(pending release as of <commit-hash>)` until publicly released
   - Leave "Significant Changes" empty for new events
-5. **Document in code**: Add comment explaining what the event tracks
-6. **When modifying events**: Add entry to "Significant Changes" column (see Version Tracking section)
+7. **Document in code**: Add comment explaining what the event tracks
+8. **When modifying events**: Add entry to "Significant Changes" column (see Version Tracking section)
 
 ## Reference Documentation
 

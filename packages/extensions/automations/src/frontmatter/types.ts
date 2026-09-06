@@ -58,7 +58,11 @@ export interface AutomationOutput {
   mode: OutputMode;
   /** Relative path from workspace root to output directory or file */
   location: string;
-  /** Template for new-file mode. Supports {{date}}, {{time}}, {{id}} */
+  /**
+   * Names the output file in every mode. Supports {{date}}, {{time}}, {{id}}.
+   * Defaults to `{{date}}-output.md` for new-file and `output.md` for
+   * append/replace.
+   */
   fileNameTemplate?: string;
 }
 
@@ -89,6 +93,11 @@ export interface ExecutionRecord {
   error?: string;
   sessionId?: string;
   outputFile?: string;
+  /**
+   * The agent wrote outputFile itself, so the automation kept that content and
+   * did not save its final message over it.
+   */
+  outputWrittenByAgent?: boolean;
 }
 
 /**

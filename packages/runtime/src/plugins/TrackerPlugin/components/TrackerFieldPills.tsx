@@ -46,6 +46,23 @@ const DEFAULT_TEST_ID_BASE = 'tracker-field';
 /** How long a text-like edit sits before it is written through. */
 const TEXT_SAVE_DEBOUNCE_MS = 500;
 
+/**
+ * Field types whose value never says which field it belongs to. A date reads
+ * "May 29, 2026" and a URL reads "drive.google.com" whether it is the shoot
+ * date or the delivery date, the brief or the final cut — so a schema with two
+ * of them produces two chips a reader can only tell apart by opening them
+ * (#1166). These carry their label in the chip; select and boolean values are
+ * already their own label, and text and number chips read as themselves.
+ */
+const SELF_ANONYMOUS_FIELD_TYPES = new Set([
+  'date',
+  'datetime',
+  'url',
+  'user',
+  'relationship',
+  'reference',
+]);
+
 export interface TrackerFieldPillsProps {
   /** Fields to render, already ordered — see `useTrackerFieldLayout`. */
   fields: FieldDefinition[];
@@ -67,6 +84,14 @@ export interface TrackerFieldPillsProps {
    * existing collections.
    */
   onCreateCollection?: (title: string, type: string) => Promise<RelationshipCandidate | null>;
+  /**
+   * Fields whose value was carried over rather than chosen for this item —
+   * they render with a distinct treatment. The quick-create popup's rapid-fire
+   * loop reuses the previous item's priority/assignee/milestone, and a run that
+   * silently inherits `critical` from the first item is the failure this marking
+   * exists to prevent.
+   */
+  carriedFieldNames?: ReadonlySet<string>;
   /** Extra class on the chip row for surface-specific layout. */
   className?: string;
   /**
@@ -85,6 +110,8 @@ export interface TrackerFieldPillProps {
   onOpenItem?: (itemId: string) => void;
   onCreateCollection?: (title: string, type: string) => Promise<RelationshipCandidate | null>;
   onSave: (fieldName: string, value: unknown) => void | Promise<void>;
+  /** See `TrackerFieldPillsProps.carriedFieldNames`. */
+  carried?: boolean;
   testIdBase?: string;
 }
 
@@ -187,6 +214,7 @@ export const TrackerFieldPill: React.FC<TrackerFieldPillProps> = ({
   onOpenItem,
   onCreateCollection,
   onSave,
+  carried = false,
   testIdBase = DEFAULT_TEST_ID_BASE,
 }) => {
   const [isOpen, setIsOpen] = useState(false);
@@ -208,6 +236,8 @@ export const TrackerFieldPill: React.FC<TrackerFieldPillProps> = ({
   const isCollectionField = isCollectionRelationshipField(field);
   const label = formatTrackerFieldLabel(field.name);
   const displayValue = fieldDisplayValue(field, localValue, members, relationshipCandidates);
+  // An empty chip already reads as its label, so only a filled one needs one.
+  const showLabel = !empty && SELF_ANONYMOUS_FIELD_TYPES.has(field.type);
 
   useEffect(() => {
     if (!hasPendingSaveRef.current) {
@@ -318,7 +348,7 @@ export const TrackerFieldPill: React.FC<TrackerFieldPillProps> = ({
         ref={floating.refs.setReference}
         {...getReferenceProps()}
         type="button"
-        className={`tracker-field-pill ${empty ? 'tracker-field-pill-empty' : 'tracker-field-pill-set'}`}
+        className={`tracker-field-pill ${empty ? 'tracker-field-pill-empty' : 'tracker-field-pill-set'}${showLabel ? ' tracker-field-pill-labeled' : ''}${carried ? ' tracker-field-pill-carried' : ''}`}
         disabled={!editable}
         onClick={() => {
           if (togglesDirectly) {
@@ -352,6 +382,9 @@ export const TrackerFieldPill: React.FC<TrackerFieldPillProps> = ({
             className="tracker-field-pill-icon"
             style={selectedOption?.color ? { color: selectedOption.color } : undefined}
           />
+        )}
+        {showLabel && (
+          <span className="tracker-field-pill-label">{label}</span>
         )}
         <span className="tracker-field-pill-value">{displayValue}</span>
       </button>
@@ -454,6 +487,7 @@ export const TrackerFieldPills: React.FC<TrackerFieldPillsProps> = ({
   onSave,
   onOpenItem,
   onCreateCollection,
+  carriedFieldNames,
   className,
   testIdBase = DEFAULT_TEST_ID_BASE,
 }) => {
@@ -475,6 +509,7 @@ export const TrackerFieldPills: React.FC<TrackerFieldPillsProps> = ({
           onOpenItem={onOpenItem}
           onCreateCollection={onCreateCollection}
           onSave={onSave}
+          carried={carriedFieldNames?.has(field.name) ?? false}
           testIdBase={testIdBase}
         />
       ))}

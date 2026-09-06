@@ -1,5 +1,7 @@
+// @vitest-environment node
 import { afterEach, describe, expect, it } from 'vitest';
 import { store } from '@nimbalyst/runtime/store';
+import { asTeamMemberId } from '@nimbalyst/runtime/auth/jwtScopes';
 import {
   activeCollabScopeAtom,
   allSharedDocumentsAtom,
@@ -16,12 +18,13 @@ import {
   sharedDocumentsAtom as packageSharedDocumentsAtom,
   trashedSharedDocumentsAtom as packageTrashedSharedDocumentsAtom,
 } from '@nimbalyst/collab-client/docs';
+import { getSharedDocumentVisibility } from '../../../services/mcpCollabReadHandlers';
 
 const WORKSPACE = '/workspace/collab-trash';
 const SCOPE: CollabScope = {
   scopeKey: WORKSPACE,
   orgId: 'org-trash',
-  indexConfig: { serverUrl: 'wss://example.test', userId: 'user-trash' },
+  indexConfig: { serverUrl: 'wss://example.test', teamMemberId: asTeamMemberId('user-trash') },
 };
 
 function doc(documentId: string, trashedAt: number | null = null): SharedDocument {
@@ -58,6 +61,19 @@ describe('shared document Trash projections', () => {
     expect(store.get(allSharedDocumentsAtom)).toHaveLength(2);
   });
 
+  it('reports a document genuinely absent from the shared index as not shared', () => {
+    store.set(activeCollabScopeAtom, SCOPE);
+    store.set(allSharedDocumentsAtom, [doc('shared-doc')]);
+
+    expect(getSharedDocumentVisibility('local-only-doc')).toEqual({
+      kind: 'document',
+      sourceId: 'local-only-doc',
+      teamVisible: false,
+      orgId: null,
+      reason: 'notShared',
+    });
+  });
+
   it('moves, restores, and permanently removes rows without a connected provider', () => {
     store.set(activeCollabScopeAtom, SCOPE);
     store.set(allSharedDocumentsAtom, [doc('one')]);
@@ -79,7 +95,7 @@ describe('shared document Trash projections', () => {
     const other: CollabScope = {
       scopeKey: '/workspace/other-trash',
       orgId: 'org-other',
-      indexConfig: { serverUrl: 'wss://example.test', userId: 'user-other' },
+      indexConfig: { serverUrl: 'wss://example.test', teamMemberId: asTeamMemberId('user-other') },
     };
     store.set(activeCollabScopeAtom, SCOPE);
     store.set(allSharedDocumentsAtom, [doc('scope-one')]);

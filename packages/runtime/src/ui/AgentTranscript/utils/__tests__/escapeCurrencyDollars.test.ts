@@ -47,9 +47,39 @@ describe('escapeCurrencyDollars', () => {
     expect(out).toBe('the cost was \\$5 to \\$10 and $x = 5$ is true');
   });
 
-  it('does not collapse currency across lines', () => {
-    const input = 'line one ends with $5\nline two starts with $10';
-    expect(escapeCurrencyDollars(input)).toBe(input);
+  // #1385: remark-math pairs two `$` anywhere in the same paragraph, so a soft
+  // line break between two amounts is still one math span to the renderer.
+  describe('soft line breaks (#1385)', () => {
+    it('escapes a pair split across a soft line break', () => {
+      const input = 'the plan is $990/mo.\nand comes with a $1,500 freebie';
+      expect(escapeCurrencyDollars(input)).toBe(
+        'the plan is \\$990/mo.\nand comes with a \\$1,500 freebie',
+      );
+    });
+
+    it('leaves a pair separated by a blank line alone', () => {
+      const input = 'the plan is $990/mo.\n\nand comes with a $1,500 freebie';
+      expect(escapeCurrencyDollars(input)).toBe(input);
+    });
+
+    it('leaves a pair separated by a whitespace-only line alone', () => {
+      const input = 'the plan is $990/mo.\n  \nand comes with a $1,500 freebie';
+      expect(escapeCurrencyDollars(input)).toBe(input);
+    });
+
+    it('does not span two line breaks', () => {
+      const input = 'costs $5\nper seat\nplus $10 setup';
+      expect(escapeCurrencyDollars(input)).toBe(input);
+    });
+
+    it('leaves inline math unchanged', () => {
+      expect(escapeCurrencyDollars('we have $x = 5$ as a fact')).toBe('we have $x = 5$ as a fact');
+    });
+
+    it('leaves a soft-line-break pair inside a fenced code block alone', () => {
+      const input = "```sh\necho $1\necho $2\n```";
+      expect(escapeCurrencyDollars(input)).toBe(input);
+    });
   });
 
   it('returns empty string unchanged', () => {
@@ -62,5 +92,43 @@ describe('escapeCurrencyDollars', () => {
 
   it('preserves a lone unpaired $ (no closing pair on the line)', () => {
     expect(escapeCurrencyDollars('the price is $5')).toBe('the price is $5');
+  });
+
+  // #1373: a backslash is literal inside code, so escaping there is visible on
+  // screen and travels with any copy, breaking the copied command.
+  describe('code is exempt (#1373)', () => {
+    const identity = (label: string, input: string) => {
+      it(label, () => {
+        expect(escapeCurrencyDollars(input)).toBe(input);
+      });
+    };
+
+    identity('fenced code', "```sh\nawk '{print $1, $2}'\n```");
+    identity('inline code span', "run `awk '{print $1, $2}'` now");
+    identity('fence inside a blockquote', "> ```sh\n> jq '.a[$1] + $2'\n> ```");
+    identity('nested fence', "````md\n```sh\nawk '{print $1, $2}'\n```\n````");
+    identity('indented code', "    awk '{print $1, $2}'");
+
+    it('escapes prose but not the fence between it', () => {
+      const input = 'prose $7 to $40 then\n```sh\necho $1 $2\n```\nand $3 to $50';
+      expect(escapeCurrencyDollars(input)).toBe(
+        'prose \\$7 to \\$40 then\n```sh\necho $1 $2\n```\nand \\$3 to \\$50',
+      );
+    });
+
+    it('escapes around an inline span on the same line', () => {
+      expect(escapeCurrencyDollars('paid $5 to $10 running `echo $1 $2` daily')).toBe(
+        'paid \\$5 to \\$10 running `echo $1 $2` daily',
+      );
+    });
+  });
+
+  // The escape runs on the source, before the document is parsed, so inline
+  // markup spanning a currency pair still renders. Reverting `inlineMath`
+  // nodes after the fact would flatten this to literal asterisks.
+  it('preserves markdown that crosses the currency span', () => {
+    expect(escapeCurrencyDollars('grew from $7M to **$40M** total')).toBe(
+      'grew from \\$7M to **\\$40M** total',
+    );
   });
 });

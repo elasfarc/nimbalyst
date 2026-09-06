@@ -29,11 +29,11 @@ const {
     orgs: [] as Array<{ id: string; flavor: string }>,
     members: [] as Array<{ org_id: string; user_id: string; email: string | null; role: string }>,
   },
-  canAccessMock: vi.fn(async (_db: unknown, viewerUserId: string) => ({
-    allowed: viewerUserId === 'team-member-bound',
-    orgRole: viewerUserId === 'team-member-bound' ? 'member' : null,
+  canAccessMock: vi.fn(async (_db: unknown, viewer: { teamMemberId?: string; personalMemberId?: string }) => ({
+    allowed: viewer.teamMemberId === 'team-member-bound',
+    orgRole: viewer.teamMemberId === 'team-member-bound' ? 'member' : null,
     projectRole: null,
-    reason: viewerUserId === 'team-member-bound' ? 'org-member' : 'not-a-member',
+    reason: viewer.teamMemberId === 'team-member-bound' ? 'org-member' : 'not-a-member',
   })),
   getPersonalSessionJwtForAccountMock: vi.fn((personalOrgId: string) => `personal-jwt:${personalOrgId}`),
   getSessionTokenForAccountMock: vi.fn((personalOrgId: string) => `session-token:${personalOrgId}`),
@@ -65,7 +65,16 @@ vi.mock('../../utils/ipcRegistry', () => ({
 vi.mock('../../utils/logger', () => ({
   logger: { main: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } },
 }));
-vi.mock('../../utils/gitUtils', () => ({ getNormalizedGitRemote: vi.fn() }));
+const gitRemoteFnMock = vi.hoisted(() => vi.fn());
+vi.mock('../../utils/gitUtils', () => ({
+  getNormalizedGitRemote: gitRemoteFnMock,
+  getRawGitRemote: gitRemoteFnMock,
+  normalizeGitRemote: (url: string | null) => url,
+  getGitRemoteIdentities: async (workspacePath: string) => {
+    const remote = await gitRemoteFnMock(workspacePath);
+    return remote ? { canonical: remote, legacy: remote } : null;
+  },
+}));
 vi.mock('../teamProjectResolver', () => ({ resolveTeamForRemoteHash: vi.fn() }));
 vi.mock('../../utils/collabSyncUrl', () => ({ getCollabSyncHttpUrl: () => 'https://sync.test' }));
 vi.mock('../jwtOrg', () => ({
@@ -100,10 +109,12 @@ vi.mock('@nimbalyst/runtime', () => ({
   asPersonalJwt: (jwt: string) => jwt,
   asPersonalMemberId: (id: string) => id,
   asTeamJwt: (jwt: string) => jwt,
+  asTeamMemberId: (id: string) => id,
 }));
 vi.mock('../../utils/store', () => ({
   getSessionSyncConfig: vi.fn(() => ({ serverUrl: 'https://sync.example' })),
   setSessionSyncConfig: vi.fn(),
+  clearOrgWalkPreferences: vi.fn(),
   getWorkspaceState: (workspacePath: string) => workspaceStates.get(workspacePath) ?? {},
   updateWorkspaceState: (workspacePath: string, updater: (state: any) => void) => {
     const state = workspaceStates.get(workspacePath) ?? {};
@@ -242,7 +253,7 @@ describe('TeamService account-to-org viewer binding', () => {
     expect(result.allowed).toBe(true);
     expect(canAccessMock).toHaveBeenCalledWith(
       expect.anything(),
-      'team-member-bound',
+      { teamMemberId: 'team-member-bound' },
       { orgId: 'team-org', action: 'view' },
     );
   });

@@ -1,10 +1,22 @@
+import { execFile } from 'child_process';
 import log from 'electron-log/main';
 import { existsSync, readdirSync, rmSync, statSync } from 'fs';
 import { isAbsolute, join, relative, resolve, sep } from 'path';
 import simpleGit, { SimpleGit } from 'simple-git';
+import {
+  filterPatchToHunks,
+  matchHunkRefs,
+  parseUnifiedDiffToHunks,
+  supportsHunkSelection,
+  type HunkRef,
+  type HunkSelection,
+} from '@nimbalyst/runtime/ui/git/unifiedDiffModel';
 import { gitOperationLock } from './GitOperationLock';
+import { groupFilesByRepo } from './workspaceRepos';
 import { GIT_INHERITED_ENV_UNSAFE } from './gitInheritedEnvUnsafe';
 import { sanitizeGitRepositoryEnv } from './gitRepositoryEnv';
+
+export type { HunkRef, HunkSelection };
 
 export interface GitCommitExecutionResult {
   success: boolean;
@@ -18,6 +30,27 @@ export interface GitCommitExecutionResult {
    * callers should not report a spotless working tree.
    */
   indexRefreshFailed?: boolean;
+  /**
+   * Per-repo detail when the file list spanned more than one repository and the
+   * commit was split. Absent for the ordinary single-repo commit. The top-level
+   * fields summarize: `success` is true only if every repo committed, and
+   * `commitHash` is the first repo's, so existing single-repo UI still has
+   * something to show.
+   */
+  repoResults?: Array<{ repoPath: string } & GitCommitExecutionResult>;
+  /**
+   * Files that belong to no repository. They were not committed anywhere;
+   * surfaced rather than dropped so the user is not told a file was committed
+   * when it was not.
+   */
+  uncommittableFiles?: string[];
+  /**
+   * The caller's own path strings for the files that actually landed in a
+   * commit. Present whenever the commit was resolved across repos, so a caller
+   * can leave everything else selected instead of clearing the whole selection
+   * after a partial failure. Absent when the repo was given explicitly.
+   */
+  committedFiles?: string[];
 }
 
 export interface GitCommitProposalResponse {
@@ -27,6 +60,17 @@ export interface GitCommitProposalResponse {
   error?: string;
   filesCommitted?: string[];
   commitMessage?: string;
+  /**
+   * Files that belong to no repository. Never committed, and excluded from
+   * `filesCommitted` so a partial result is not reported as a complete one.
+   */
+  uncommittableFiles?: string[];
+  /**
+   * Per-repo outcome when the proposal spanned several repositories. Present on
+   * a partial failure so the caller can retry only the repos that did not
+   * commit rather than re-proposing the whole file list.
+   */
+  repoResults?: Array<{ repoPath: string; success: boolean; commitHash?: string; error?: string }>;
 }
 
 function isGitRepository(workspacePath: string): boolean {
@@ -225,6 +269,66 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * Global options pinned so a user's diff config cannot produce a patch that
+ * `git apply` then rejects: `diff.noprefix` strips the `a/`/`b/` prefixes that
+ * `-p1` expects, and a textconv filter yields a rendering of the file rather
+ * than its bytes. `@@` numbering is unaffected by any of these, so hunk refs
+ * captured from the widget's (unpinned) diff still match.
+ */
+function hunkDiffArgs(relPath: string): string[] {
+  return [
+    '--literal-pathspecs',
+    '-c',
+    'diff.noprefix=false',
+    '-c',
+    'diff.mnemonicPrefix=false',
+    'diff',
+    '--no-ext-diff',
+    '--no-textconv',
+    '--no-color',
+    'HEAD',
+    '--',
+    relPath,
+  ];
+}
+
+/**
+ * Apply a filtered patch to the private index via stdin.
+ *
+ * simple-git has no stdin channel for raw commands, and writing the patch to
+ * disk would leave an artifact to sweep after a crash. The callback form of
+ * `execFile` is used deliberately rather than `promisify` -- `promisify.custom`
+ * bypasses a mocked `execFile`, which silently turns a spied subprocess
+ * boundary into a no-op.
+ *
+ * `--whitespace=nowarn` because the patch is git's own description of content
+ * the user already has on disk; a strict `core.whitespace` must not veto
+ * committing it.
+ */
+function applyPatchToIndex(
+  patch: string,
+  cwd: string,
+  env: NodeJS.ProcessEnv
+): Promise<void> {
+  return new Promise((resolvePromise, reject) => {
+    const child = execFile(
+      'git',
+      ['--literal-pathspecs', 'apply', '--cached', '--whitespace=nowarn', '-'],
+      { cwd, env },
+      (error, _stdout, stderr) => {
+        if (error) {
+          const detail = (typeof stderr === 'string' ? stderr : '').trim();
+          reject(new Error(detail || error.message));
+          return;
+        }
+        resolvePromise();
+      }
+    );
+    child.stdin?.end(patch);
+  });
+}
+
 const DEFAULT_LOCK_MAX_RETRIES = 5;
 const DEFAULT_LOCK_BASE_DELAY_MS = 100;
 /**
@@ -252,6 +356,12 @@ export async function executeGitCommit(
     env?: Record<string, string>;
     /** Stream git and hook output while the commit workflow is running. */
     onOutput?: (stream: 'stdout' | 'stderr', chunk: string) => void;
+    /**
+     * Stage only the listed hunks for these files instead of the whole file.
+     * Every path must also appear in `filesToStage`. Files not named here keep
+     * the whole-file path unchanged.
+     */
+    hunkSelections?: HunkSelection[];
   }
 ): Promise<GitCommitExecutionResult> {
   const logContext = options?.logContext || '[git:commit]';
@@ -312,6 +422,65 @@ export async function executeGitCommit(
         // proposal cannot disturb the caller's existing staging state.
         const filesToStageRelative = filesToStage.map(toGitPath);
 
+        // Resolve hunk selections against a freshly generated diff *before* any
+        // index work. A ref that no longer matches means the file changed since
+        // the proposal was built (typically a sibling session writing it), and
+        // the selection no longer describes what the user approved.
+        const partialPatches = new Map<string, string>();
+        if (options?.hunkSelections?.length) {
+          const stageable = new Set(filesToStageRelative);
+
+          for (const selection of options.hunkSelections) {
+            if (!selection?.hunks?.length) continue;
+            const relPath = toGitPath(selection.path);
+
+            if (!stageable.has(relPath)) {
+              return {
+                success: false,
+                error: `Hunk selection references ${relPath}, which is not in the commit's file list.`,
+              };
+            }
+            if (!repoHasCommits) {
+              return {
+                success: false,
+                error: `Cannot stage individual hunks for ${relPath}: the repository has no commits to diff against.`,
+              };
+            }
+
+            const rawDiff = await git.raw(hunkDiffArgs(relPath));
+            const parsed = parseUnifiedDiffToHunks(rawDiff);
+
+            if (!supportsHunkSelection(parsed)) {
+              return {
+                success: false,
+                error: `Cannot stage individual hunks for ${relPath}: only modifications to existing text files support hunk selection.`,
+              };
+            }
+
+            const { indices, unmatched } = matchHunkRefs(parsed, selection.hunks);
+            if (unmatched.length > 0) {
+              log.warn(
+                `${logContext} Stale hunk selection for ${relPath}: ${unmatched.length} of ${selection.hunks.length} refs no longer match`
+              );
+              return {
+                success: false,
+                error: `The selected hunks for ${relPath} are out of date because the file changed after the proposal was created. Refresh the diff and choose again.`,
+              };
+            }
+
+            const patch = filterPatchToHunks(parsed, indices);
+            if (!patch) {
+              return {
+                success: false,
+                error: `No hunks resolved for ${relPath}. Commit aborted.`,
+              };
+            }
+            partialPatches.set(relPath, patch);
+          }
+        }
+
+        const wholeFileRelative = filesToStageRelative.filter((f) => !partialPatches.has(f));
+
         const gitDir = await resolveGitDir(git);
         sweepStaleTempIndexes(gitDir, logContext);
         tempIndexPath = createTempIndexPath(gitDir);
@@ -334,7 +503,28 @@ export async function executeGitCommit(
         // `--literal-pathspecs` stops Git from interpreting globs or pathspec
         // magic in a proposal. Keep it before the command: it is a global Git
         // option, not an `add` option.
-        await stagingGit.raw(['--literal-pathspecs', 'add', '--all', '--', ...filesToStageRelative]);
+        if (wholeFileRelative.length > 0) {
+          await stagingGit.raw(['--literal-pathspecs', 'add', '--all', '--', ...wholeFileRelative]);
+        }
+
+        // Partially-staged files go in as patches against the private index,
+        // which was just seeded from HEAD. The working tree is never touched,
+        // so the hunks the user left behind stay exactly as they are on disk.
+        for (const [relPath, patch] of partialPatches) {
+          try {
+            await applyPatchToIndex(patch, workspacePath, {
+              ...gitEnv,
+              GIT_INDEX_FILE: tempIndexPath,
+            });
+          } catch (applyError) {
+            const detail = applyError instanceof Error ? applyError.message : String(applyError);
+            log.error(`${logContext} Failed to apply hunk selection for ${relPath}: ${detail}`);
+            return {
+              success: false,
+              error: `Failed to stage the selected hunks for ${relPath}: ${detail}`,
+            };
+          }
+        }
 
         // No longer a time-of-check/time-of-use gap: the index checked here is
         // private to this operation, so nothing can restage between now and the
@@ -343,7 +533,7 @@ export async function executeGitCommit(
         // log.info(`${logContext} After staging - staged files: [${[...stagedFiles].join(', ')}]`);
 
         if (stagedFiles.size === 0) {
-          log.warn(`${logContext} No files were staged despite add() succeeding. Requested: [${filesToStage.join(', ')}], git-relative: [${filesToStageRelative.join(', ')}]`);
+          log.warn(`${logContext} No files were staged despite staging succeeding. Requested: [${filesToStage.join(', ')}], git-relative: [${filesToStageRelative.join(', ')}]`);
           return { success: false, error: 'No files were staged. The files may not exist or have no changes.' };
         }
 
@@ -461,17 +651,150 @@ export function createGitCommitProposalResponse(
   commitMessage: string
 ): GitCommitProposalResponse {
   if (result.success) {
-    return {
+    // A successful commit can still have left files behind: anything in no
+    // repository was never staged anywhere. Reporting the caller's full input
+    // as `filesCommitted` would tell the user those files are committed.
+    const skipped = new Set(result.uncommittableFiles ?? []);
+    const response: GitCommitProposalResponse = {
       action: 'committed',
       commitHash: result.commitHash,
       commitDate: result.commitDate,
-      filesCommitted: files,
+      filesCommitted: skipped.size > 0 ? files.filter((file) => !skipped.has(file)) : files,
       commitMessage,
     };
+    if (skipped.size > 0) {
+      response.uncommittableFiles = [...skipped];
+    }
+    // A selection spanning repos makes N commits, and `commitHash` is only the
+    // first. Without this the user is told one commit landed when several did,
+    // and the others have no hash anywhere in the UI.
+    if (result.repoResults) {
+      response.repoResults = result.repoResults.map(({ repoPath, success, commitHash, error }) => ({
+        repoPath, success, commitHash, error,
+      }));
+    }
+    return response;
   }
 
   return {
     action: 'error',
     error: result.error || 'No changes were committed',
+    // Whatever DID commit before the failure, so the caller can retry only the
+    // rest instead of re-proposing files that are already in history.
+    ...(result.repoResults ? { repoResults: result.repoResults.map(({ repoPath, success, commitHash, error }) => ({ repoPath, success, commitHash, error })) } : {}),
+    ...(result.uncommittableFiles ? { uncommittableFiles: result.uncommittableFiles } : {}),
+  };
+}
+
+/**
+ * Commit a file list that may span several repositories.
+ *
+ * A multi-root workspace can hand the user a proposal touching two checkouts;
+ * git has no notion of a commit across repos, so this splits by owning
+ * repository and commits each in turn with the same message. Sequential rather
+ * than parallel: each `executeGitCommit` takes that repo's operation lock and
+ * runs its hooks, and interleaving two hook runs is how you get confusing,
+ * half-attributable output.
+ *
+ * The single-repo case -- everything real users hit today -- delegates straight
+ * to `executeGitCommit` against the resolved repo root and returns its result
+ * untouched, so nothing about an ordinary commit changes shape.
+ */
+export async function executeGitCommitAcrossRepos(
+  workspacePath: string,
+  message: string,
+  filesToStage: string[],
+  options?: Parameters<typeof executeGitCommit>[3] & {
+    /** Commit only this repo, skipping resolution. Set by an explicit repoPath. */
+    repoPath?: string;
+    /**
+     * Roots to consider besides `workspacePath`'s own. Set when committing from
+     * a worktree session: attached folders are keyed by the PARENT workspace, so
+     * without them every attached-folder file resolves to no repo, lands in
+     * `uncommittableFiles`, and is silently dropped from the commit.
+     */
+    extraRoots?: string[];
+  }
+): Promise<GitCommitExecutionResult> {
+  if (options?.repoPath) {
+    return executeGitCommit(options.repoPath, message, filesToStage, options);
+  }
+
+  // Relative paths are workspace-relative by contract, and repo resolution
+  // compares against absolute root paths -- so resolve before grouping.
+  // `executeGitCommit` takes absolute paths and makes them repo-relative itself.
+  const absoluteFiles = filesToStage.map((filePath) =>
+    isAbsolute(filePath) ? filePath : resolve(workspacePath, filePath),
+  );
+  // Callers select by their own path strings and expect to hear back in the
+  // same terms, so map resolved paths back before reporting what committed.
+  const originalByAbsolute = new Map<string, string>();
+  absoluteFiles.forEach((absolute, index) => {
+    if (!originalByAbsolute.has(absolute)) originalByAbsolute.set(absolute, filesToStage[index]);
+  });
+  const toOriginal = (paths: string[]) => paths.map((p) => originalByAbsolute.get(p) ?? p);
+
+  const groups = groupFilesByRepo(workspacePath, absoluteFiles, options?.extraRoots);
+  const uncommittableFiles = groups.get(null) ?? [];
+  groups.delete(null);
+
+  const repoPaths = [...groups.keys()].filter((repo): repo is string => repo !== null);
+
+  if (repoPaths.length === 0) {
+    return {
+      success: false,
+      error: uncommittableFiles.length > 0
+        ? 'None of the selected files are in a git repository'
+        : 'No files to commit',
+      uncommittableFiles: uncommittableFiles.length > 0 ? toOriginal(uncommittableFiles) : undefined,
+      committedFiles: [],
+    };
+  }
+
+  if (repoPaths.length === 1) {
+    const repoFiles = groups.get(repoPaths[0])!;
+    const result = await executeGitCommit(repoPaths[0], message, repoFiles, options);
+    return {
+      ...result,
+      committedFiles: result.success ? toOriginal(repoFiles) : [],
+      ...(uncommittableFiles.length > 0 ? { uncommittableFiles: toOriginal(uncommittableFiles) } : {}),
+    };
+  }
+
+  const repoResults: Array<{ repoPath: string } & GitCommitExecutionResult> = [];
+  for (const repoPath of repoPaths) {
+    const files = groups.get(repoPath)!;
+    // Hunk selections are per file, so each repo only gets the ones it owns.
+    // Resolved the same way as the file list, since a selection may name the
+    // file relative to the workspace while `files` is absolute.
+    const repoFiles = new Set(files);
+    const hunkSelections = options?.hunkSelections?.filter((selection) =>
+      repoFiles.has(
+        isAbsolute(selection.path) ? selection.path : resolve(workspacePath, selection.path),
+      ),
+    );
+    const result = await executeGitCommit(repoPath, message, files, {
+      ...options,
+      hunkSelections,
+      logContext: `${options?.logContext ?? '[git:commit]'} ${repoPath}`,
+    });
+    repoResults.push({ repoPath, ...result });
+  }
+
+  const failed = repoResults.filter((result) => !result.success);
+  const committedFiles = toOriginal(
+    repoResults.filter((result) => result.success).flatMap((result) => groups.get(result.repoPath)!),
+  );
+  return {
+    success: failed.length === 0,
+    commitHash: repoResults[0].commitHash,
+    commitDate: repoResults[0].commitDate,
+    committedFiles,
+    error: failed.length > 0
+      ? `Committed ${repoResults.length - failed.length} of ${repoResults.length} repositories. `
+        + failed.map((result) => `${result.repoPath}: ${result.error ?? 'unknown error'}`).join('; ')
+      : undefined,
+    repoResults,
+    uncommittableFiles: uncommittableFiles.length > 0 ? toOriginal(uncommittableFiles) : undefined,
   };
 }

@@ -68,7 +68,7 @@ function renderGrid(overrides: Record<string, unknown> = {}) {
     <TrackerGridView
       filterType="bug"
       overrideItems={ITEMS}
-      columnConfig={{ visibleColumns: ['title', 'status'], columnWidths: {}, groupBy: null }}
+      columnConfig={{ visibleColumns: ['title', 'status'], columnWidths: {} }}
       {...overrides}
     />,
   );
@@ -133,6 +133,56 @@ describe('TrackerGridView row context menu', () => {
     await waitFor(() => screen.getByText('1 item selected'));
     fireEvent.click(screen.getByTestId('tracker-row-context-copy-link'));
     expect(onCopyDeepLink).toHaveBeenCalledWith('bug-1');
+  });
+
+  /**
+   * Session actions are item-scoped, so a multi-row selection must not offer
+   * them -- launching one session for two items has no meaning, and the submenu
+   * would silently act on whichever id happened to be first.
+   */
+  it('offers session actions only for a single-row selection', async () => {
+    const onLaunchSession = vi.fn();
+    const onOpenSession = vi.fn();
+    const getLinkedSessions = vi.fn().mockReturnValue([
+      { id: 'sess-1', title: 'Fix the crash', provider: 'claude-code', timeLabel: '2h ago' },
+    ]);
+    renderGrid({ onLaunchSession, onOpenSession, getLinkedSessions });
+
+    selectedRange.current = { y: 0, y1: 1 };
+    rightClickRow(0);
+    await waitFor(() => screen.getByText('2 items selected'));
+    expect(screen.queryByTestId('tracker-row-context-launch-session')).toBeNull();
+    expect(screen.queryByText('Sessions (1)')).toBeNull();
+
+    selectedRange.current = null;
+    rightClickRow(0);
+    await waitFor(() => screen.getByText('1 item selected'));
+    expect(getLinkedSessions).toHaveBeenCalledWith('bug-1');
+
+    fireEvent.mouseEnter(screen.getByText('Sessions (1)'));
+    fireEvent.click(await screen.findByTestId('tracker-row-context-open-session'));
+    expect(onOpenSession).toHaveBeenCalledWith('sess-1');
+
+    rightClickRow(0);
+    await waitFor(() => screen.getByText('1 item selected'));
+    fireEvent.click(screen.getByTestId('tracker-row-context-launch-session'));
+    expect(onLaunchSession).toHaveBeenCalledWith('bug-1');
+  });
+
+  /** No linked sessions means no submenu -- Launch Session is the only action. */
+  it('hides the sessions submenu when the item has no linked sessions', async () => {
+    renderGrid({
+      onLaunchSession: vi.fn(),
+      onOpenSession: vi.fn(),
+      getLinkedSessions: () => [],
+    });
+
+    selectedRange.current = null;
+    rightClickRow(0);
+    await waitFor(() => screen.getByText('1 item selected'));
+
+    expect(screen.queryByText(/^Sessions \(/)).toBeNull();
+    screen.getByTestId('tracker-row-context-launch-session');
   });
 
   it('ignores a right-click that is not over a row', async () => {

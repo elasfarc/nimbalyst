@@ -27,6 +27,10 @@ import { OpenAIPanel } from '../GlobalSettings/panels/OpenAIPanel';
 import { OpenAICodexPanel } from '../GlobalSettings/panels/OpenAICodexPanel';
 import { OpenCodePanel } from '../GlobalSettings/panels/OpenCodePanel';
 import { CopilotCLIPanel } from '../GlobalSettings/panels/CopilotCLIPanel';
+
+import { GrokBuildPanel } from '../GlobalSettings/panels/GrokBuildPanel';
+import { CursorAgentPanel } from '../GlobalSettings/panels/CursorAgentPanel';
+import { GeminiPanel } from '../GlobalSettings/panels/GeminiPanel';
 import { LMStudioPanel } from '../GlobalSettings/panels/LMStudioPanel';
 import { AdvancedPanel } from '../GlobalSettings/panels/AdvancedPanel';
 import { DatabasePanel } from '../GlobalSettings/panels/DatabasePanel';
@@ -69,6 +73,20 @@ import {
 } from './panels/AccountSettingsPanel';
 import { ProjectSharingPanel, type ProjectSettingsTarget } from './panels/ProjectSharingPanel';
 import { ProjectAIProvidersPanel } from './panels/ProjectAIProvidersPanel';
+
+/**
+ * Providers whose model catalog comes from their own CLI rather than from a
+ * keyed API call. Their panels have no API-key field and no model list of
+ * their own, so the connection test and the model-count display both take a
+ * different branch.
+ */
+const CLI_CATALOG_PROVIDERS = new Set<string>([
+  'openai-codex',
+  'opencode',
+  'copilot-cli',
+  'grok-build',
+  'cursor-agent',
+]);
 
 // Re-export ProviderConfig for backward compatibility
 export type { ProviderConfig } from '../../store/atoms/appSettings';
@@ -504,7 +522,7 @@ export function SettingsView({
   };
 
   const handleProviderToggle = async (provider: string, enabled: boolean) => {
-    if (enabled && (provider === 'claude-code' || provider === 'openai-codex' || provider === 'opencode' || provider === 'copilot-cli')) {
+    if (enabled && (provider === 'claude-code' || CLI_CATALOG_PROVIDERS.has(provider))) {
       await fetchModels(provider);
     }
 
@@ -520,12 +538,12 @@ export function SettingsView({
 
       posthog?.capture('ai_provider_configured', {
         provider,
-        modelCount: (provider === 'openai-codex' || provider === 'opencode' || provider === 'copilot-cli') ? 0 : models.length,
+        modelCount: CLI_CATALOG_PROVIDERS.has(provider) ? 0 : models.length,
         action: enabled ? 'enabled' : 'disabled'
       });
 
       // OpenAI Codex and OpenCode use dynamic model discovery, not user selection
-      if (provider === 'openai-codex' || provider === 'opencode' || provider === 'copilot-cli') {
+      if (CLI_CATALOG_PROVIDERS.has(provider)) {
         const currentProvider = prev[provider] || { enabled: false };
         return {
           ...prev,
@@ -547,7 +565,7 @@ export function SettingsView({
     });
     debouncedSave();
 
-    if (enabled && provider !== 'claude-code' && provider !== 'openai-codex' && provider !== 'opencode' && provider !== 'copilot-cli') {
+    if (enabled && provider !== 'claude-code' && !CLI_CATALOG_PROVIDERS.has(provider)) {
       fetchModels(provider);
     }
   };
@@ -671,7 +689,7 @@ export function SettingsView({
       onApiKeyChange: handleApiKeyChange,
       onModelToggle: (modelId: string, enabled: boolean) => {
         // OpenAI Codex, OpenCode, and Copilot don't support user model selection - models are discovered dynamically
-        if (selectedCategory === 'openai-codex' || selectedCategory === 'opencode' || selectedCategory === 'copilot-cli') {
+        if (CLI_CATALOG_PROVIDERS.has(selectedCategory)) {
           return;
         }
 
@@ -698,7 +716,7 @@ export function SettingsView({
       },
       onSelectAllModels: (selectAll: boolean) => {
         // OpenAI Codex, OpenCode, and Copilot don't support user model selection - models are discovered dynamically
-        if (selectedCategory === 'openai-codex' || selectedCategory === 'opencode' || selectedCategory === 'copilot-cli') {
+        if (CLI_CATALOG_PROVIDERS.has(selectedCategory)) {
           return;
         }
 
@@ -768,7 +786,7 @@ export function SettingsView({
     };
 
     // Hidden-set (denylist) handlers, parameterized by provider id so the Claude
-    // panel can drive both `claude-code` (SDK) and `claude-code-cli` (subscription)
+    // panel can drive both `claude-code` (SDK) and `claude-code-cli` (terminal CLI)
     // from one place. A model is "visible" when it is NOT in `hiddenModels`.
     const makeVisibilityHandlers = (providerId: string) => ({
       onModelVisibilityToggle: (modelId: string, visible: boolean) => {
@@ -792,6 +810,23 @@ export function SettingsView({
           return {
             ...prev,
             [providerId]: { ...prev[providerId], hiddenModels: hidden },
+          };
+        });
+        debouncedSave();
+      },
+      // Bulk toggle over an explicit subset, so a panel showing a filtered or
+      // dynamically discovered list can act on exactly what the user sees
+      // without a state update per row.
+      onSetVisibilityForModels: (modelIds: string[], visible: boolean) => {
+        setProviders(prev => {
+          const hidden = new Set(prev[providerId]?.hiddenModels || []);
+          for (const modelId of modelIds) {
+            if (visible) hidden.delete(modelId);
+            else hidden.add(modelId);
+          }
+          return {
+            ...prev,
+            [providerId]: { ...prev[providerId], hiddenModels: Array.from(hidden) },
           };
         });
         debouncedSave();
@@ -853,7 +888,7 @@ export function SettingsView({
             {...commonProps}
             {...makeVisibilityHandlers('claude-code')}
             cli={{
-              config: providers['claude-code-cli'] || { enabled: true, testStatus: 'idle' },
+              config: providers['claude-code-cli'] || { enabled: false, testStatus: 'idle' },
               availableModels: availableModels['claude-code-cli'] || [],
               loading: loading['claude-code-cli'] || false,
               onToggle: (enabled: boolean) => handleProviderToggle('claude-code-cli', enabled),
@@ -868,9 +903,35 @@ export function SettingsView({
       case 'openai-codex':
         return wrapWithOverride('openai-codex', 'OpenAI Codex', <OpenAICodexPanel {...commonProps} />);
       case 'opencode':
-        return wrapWithOverride('opencode', 'OpenCode', <OpenCodePanel {...commonProps} />);
+        return wrapWithOverride(
+          'opencode',
+          'OpenCode',
+          <OpenCodePanel
+            {...commonProps}
+            {...makeVisibilityHandlers('opencode')}
+            workspacePath={workspacePath ?? undefined}
+          />,
+        );
       case 'copilot-cli':
         return wrapWithOverride('copilot-cli', 'GitHub Copilot', <CopilotCLIPanel {...commonProps} />);
+      case 'grok-build':
+        return wrapWithOverride(
+          'grok-build',
+          'Grok Build',
+          <GrokBuildPanel config={commonProps.config} onToggle={commonProps.onToggle} />,
+        );
+      case 'cursor-agent':
+        return wrapWithOverride(
+          'cursor-agent',
+          'Cursor Agent',
+          <CursorAgentPanel config={commonProps.config} onToggle={commonProps.onToggle} />,
+        );
+      case 'antigravity-gemini-agent':
+        return wrapWithOverride(
+          'antigravity-gemini-agent',
+          'Gemini',
+          <GeminiPanel config={commonProps.config} onToggle={commonProps.onToggle} />,
+        );
       case 'lmstudio':
         return wrapWithOverride('lmstudio', 'LM Studio', <LMStudioPanel {...commonProps} />);
       case 'advanced':

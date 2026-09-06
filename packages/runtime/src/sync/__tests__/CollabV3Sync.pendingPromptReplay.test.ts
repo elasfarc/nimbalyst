@@ -2,6 +2,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { createCollabV3Sync } from '../CollabV3Sync';
+import { asPersonalJwt, asPersonalMemberId } from '../../auth/jwtScopes';
 import type { SessionChange } from '../types';
 
 /**
@@ -95,8 +96,8 @@ describe('CollabV3 sync_response pending-prompt replay', () => {
     const provider = createCollabV3Sync({
       serverUrl: 'wss://sync.example.test',
       orgId: 'org-1',
-      userId: 'user-1',
-      getJwt: async () => jwtFor('user-1'),
+      personalMemberId: asPersonalMemberId('user-1'),
+      getJwt: async () => asPersonalJwt(jwtFor('user-1')),
       encryptionKey,
     });
     await vi.waitFor(() => expect(FakeWebSocket.instances.length).toBeGreaterThanOrEqual(1));

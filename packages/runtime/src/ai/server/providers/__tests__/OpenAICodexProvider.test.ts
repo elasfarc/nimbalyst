@@ -9,6 +9,16 @@ import * as codexBinaryPath from '../codex/codexBinaryPath';
 import * as codexSdkLoader from '../codex/codexSdkLoader';
 import { AISessionsRepository } from '../../../../storage/repositories/AISessionsRepository';
 
+// getModels() cross-checks the OpenAI model catalogue whenever it is given an
+// API key. Unmocked, that is a real api.openai.com request from the unit suite:
+// it passes only because the 401 is fast, and times the test out whenever the
+// network is slow or the SDK retries.
+vi.mock('openai', () => ({
+  default: class {
+    models = { list: async () => ({ data: [] as Array<{ id: string }> }) };
+  },
+}));
+
 function createAsyncEventStream(events: any[]): AsyncIterable<any> {
   return {
     async *[Symbol.asyncIterator]() {
@@ -242,8 +252,9 @@ describe('OpenAICodexProvider', () => {
     ]));
   });
 
-  it('keeps the static Codex and ACP fallback rosters in parity', async () => {
-    const expectedModelIds = [
+  it('leads the Codex roster with GPT-6 Astra and keeps it out of the ACP roster', async () => {
+    const expectedCodexModelIds = [
+      'gpt-6-astra',
       'gpt-5.6-sol',
       'gpt-5.6-terra',
       'gpt-5.6-luna',
@@ -251,6 +262,10 @@ describe('OpenAICodexProvider', () => {
       'gpt-5.4',
       'gpt-5.4-mini',
     ];
+    // The ACP transport is deprecated for OpenAI and runs a separate, much
+    // older codex build with no gpt-6-astra catalog entry, so offering Astra
+    // there would hand users a model that build cannot start.
+    const expectedAcpModelIds = expectedCodexModelIds.filter((id) => id !== 'gpt-6-astra');
     const codexModels = await OpenAICodexProvider.getModels(undefined, {
       loadSdkModule: async () => {
         throw new Error('sdk unavailable');
@@ -259,10 +274,10 @@ describe('OpenAICodexProvider', () => {
     const acpModels = await OpenAICodexACPProvider.getModels();
 
     expect(codexModels.map((model) => model.id)).toEqual(
-      expectedModelIds.map((modelId) => `openai-codex:${modelId}`)
+      expectedCodexModelIds.map((modelId) => `openai-codex:${modelId}`)
     );
     expect(acpModels.map((model) => model.id)).toEqual(
-      expectedModelIds.map((modelId) => `openai-codex-acp:${modelId}`)
+      expectedAcpModelIds.map((modelId) => `openai-codex-acp:${modelId}`)
     );
   });
 
@@ -339,7 +354,7 @@ describe('OpenAICodexProvider', () => {
         provider: 'openai-codex',
       }),
     ]));
-    expect(models).toHaveLength(6);
+    expect(models).toHaveLength(7);
   });
 
   it('preserves CLI auth when initialized without an API key', async () => {

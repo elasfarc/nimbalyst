@@ -7,6 +7,16 @@ import NimbalystNative
 class AppDelegate: NSObject, UIApplicationDelegate {
     func application(
         _ application: UIApplication,
+        didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
+    ) -> Bool {
+        // Must happen here: iOS delivers the notification tap that launched the
+        // app only to a delegate claimed before launch finishes.
+        NotificationManager.registerAsNotificationCenterDelegate()
+        return true
+    }
+
+    func application(
+        _ application: UIApplication,
         didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data
     ) {
         NotificationManager.shared.didRegisterForRemoteNotifications(withDeviceToken: deviceToken)
@@ -104,6 +114,12 @@ struct NimbalystAppMain: App {
             // Surface the in-app scanner only; the link's payload is never applied.
             NSLog("[DeepLink] Opening in-app pairing scanner (payload ignored)")
             appState.pairingScannerRequested = true
+        case .session(let sessionId):
+            // Same channel a notification tap uses, so the Live Activity gets
+            // the navigation that was already built and tested for pushes
+            // instead of a second path that has to be kept in step with it.
+            NSLog("[DeepLink] Opening session \(sessionId)")
+            NotificationManager.shared.pendingSessionId = sessionId
         case .unsupported:
             NSLog("[DeepLink] Ignored: URL is not allowlisted")
         }

@@ -3,14 +3,17 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const {
   fetchMock, gitRemoteMock, safeHandleMock, handlers, workspaceStates, directories, madeDirectories,
+  directoryContents, ensureTrackerSyncMock,
 } = vi.hoisted(() => {
   const handlers = new Map<string, (...args: any[]) => any>();
   return {
     fetchMock: vi.fn(),
     gitRemoteMock: vi.fn(),
+    ensureTrackerSyncMock: vi.fn(async () => {}),
     handlers,
     workspaceStates: new Map<string, any>(),
     directories: new Set<string>(),
+    directoryContents: new Map<string, string[]>(),
     madeDirectories: [] as string[],
     safeHandleMock: vi.fn((channel: string, handler: (...args: any[]) => any) => {
       handlers.set(channel, handler);
@@ -19,7 +22,7 @@ const {
 });
 
 vi.mock('electron', () => ({
-  BrowserWindow: class {},
+  BrowserWindow: class { static getAllWindows() { return []; } },
   net: { fetch: fetchMock },
 }));
 
@@ -29,7 +32,22 @@ vi.mock('../../utils/logger', () => ({
   logger: { main: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } },
 }));
 
-vi.mock('../../utils/gitUtils', () => ({ getNormalizedGitRemote: gitRemoteMock }));
+// Only the git spawn is mocked; both normalizers stay real, so the legacy-hash
+// test below exercises the identifiers the app actually computes.
+vi.mock('../../utils/gitUtils', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../utils/gitUtils')>();
+  return {
+    ...actual,
+    getNormalizedGitRemote: gitRemoteMock,
+    getRawGitRemote: gitRemoteMock,
+    getGitRemoteIdentities: async (workspacePath: string) => {
+      const raw = await gitRemoteMock(workspacePath);
+      const canonical = actual.normalizeGitRemote(raw);
+      const legacy = actual.legacyNormalizeGitRemote(raw);
+      return canonical && legacy ? { canonical, legacy } : null;
+    },
+  };
+});
 
 vi.mock('fs', () => ({
   existsSync: (path: string) => directories.has(path),
@@ -38,6 +56,7 @@ vi.mock('fs', () => ({
 vi.mock('fs/promises', () => ({
   mkdir: async (path: string) => { madeDirectories.push(path); directories.add(path); },
   stat: async () => ({ isDirectory: () => true }),
+  readdir: async (path: string) => directoryContents.get(path) ?? [],
 }));
 
 vi.mock('../../utils/store', () => ({
@@ -84,13 +103,15 @@ vi.mock('../StytchAuthService', () => ({
 
 vi.mock('@nimbalyst/runtime', () => ({
   asPersonalJwt: (jwt: string) => jwt,
+  asPersonalMemberId: (id: string) => id,
   asTeamJwt: (jwt: string) => jwt,
+  asTeamMemberId: (id: string) => id,
 }));
 
 vi.mock('../../database/initialize', () => ({}));
 vi.mock('../OrgProjectionService', () => ({}));
 vi.mock('../OrgAccessResolver', () => ({}));
-vi.mock('../TrackerSyncManager', () => ({}));
+vi.mock('../TrackerSyncManager', () => ({ ensureTrackerSyncForWorkspace: ensureTrackerSyncMock }));
 vi.mock('../CollabBackupService', () => ({}));
 // createTeamAuthBootstrap is invoked at TeamService module scope (assigned to
 // runAuthenticatedTeamBootstrap), so the mock must return a callable factory
@@ -98,13 +119,21 @@ vi.mock('../CollabBackupService', () => ({}));
 vi.mock('../TeamAuthBootstrap', () => ({ createTeamAuthBootstrap: (fn: unknown) => fn }));
 
 import {
+  autoMatchTeamForWorkspace,
   bindWorkspaceToSharedProject,
   findTeamForWorkspace,
   invalidateListTeamsCache,
+  listTeams,
   registerTeamHandlers,
 } from '../TeamService';
 import { refreshPersonalSessionForAccount } from '../StytchAuthService';
 import { getJwtExp } from '../jwtOrg';
+import {
+  inspectProjectFolder,
+  joinOrgProjectWithFolder,
+  resolveProjectWalkState,
+} from '../OrgProjectWalkService';
+import { windowStates } from '../../window/windowState';
 
 const REMOTE = 'github.com/acme/widgets';
 const REMOTE_HASH = createHash('sha256').update(REMOTE).digest('hex');
@@ -161,7 +190,11 @@ describe('team:find-for-workspace single-flight (RC4)', () => {
     expect(gitRemoteMock).toHaveBeenCalledTimes(1);
     expect(apiTeamsFetchCallCount()).toBe(1);
     for (const result of results) {
-      expect(result).toEqual({ success: true, team: expect.objectContaining({ orgId: 'org-1' }) });
+      expect(result).toEqual({
+        success: true,
+        team: expect.objectContaining({ orgId: 'org-1' }),
+        complete: true,
+      });
     }
   });
 
@@ -186,6 +219,64 @@ describe('team:find-for-workspace single-flight (RC4)', () => {
     // underlying listTeams /api/teams fetch IS TTL-cached, so it stays at 1.
     expect(gitRemoteMock).toHaveBeenCalledTimes(2);
     expect(apiTeamsFetchCallCount()).toBe(1);
+  });
+});
+
+/**
+ * Correcting the normalization changed the identifier for remotes carrying
+ * userinfo -- including `ssh://git@host/...`, which embeds no credential at all
+ * and matched correctly before. Those hashes are already stored server-side and
+ * SHA-256 cannot be migrated, so a lookup has to accept the legacy hash too or
+ * every such workspace silently loses its organization.
+ */
+describe('git remote matching across the normalization change', () => {
+  const SSH_REMOTE = 'ssh://git@github.com/acme/widgets.git';
+  const LEGACY_SSH_HASH = createHash('sha256')
+    .update('ssh///git@github.com/acme/widgets').digest('hex');
+  const CANONICAL_SSH_HASH = createHash('sha256')
+    .update('github.com/acme/widgets').digest('hex');
+
+  function respondWithTeamHash(gitRemoteHash: string) {
+    fetchMock.mockImplementation(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        teams: [{
+          orgId: 'org-ssh',
+          name: 'Widgets Team',
+          gitRemoteHash,
+          createdAt: new Date().toISOString(),
+          role: 'admin',
+        }],
+      }),
+    }));
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    fetchMock.mockReset();
+    gitRemoteMock.mockReset();
+    workspaceStates.clear();
+    invalidateListTeamsCache();
+    gitRemoteMock.mockResolvedValue(SSH_REMOTE);
+  });
+
+  it('resolves a project stored under the legacy hash', async () => {
+    respondWithTeamHash(LEGACY_SSH_HASH);
+
+    expect((await findTeamForWorkspace('/workspace/ssh'))?.orgId).toBe('org-ssh');
+  });
+
+  it('resolves a project stored under the canonical hash', async () => {
+    respondWithTeamHash(CANONICAL_SSH_HASH);
+
+    expect((await findTeamForWorkspace('/workspace/ssh'))?.orgId).toBe('org-ssh');
+  });
+
+  it('still refuses a repository that is genuinely a different one', async () => {
+    respondWithTeamHash(createHash('sha256').update('github.com/acme/other').digest('hex'));
+
+    expect(await findTeamForWorkspace('/workspace/ssh')).toBeNull();
   });
 });
 
@@ -467,5 +558,327 @@ describe('listTeams TTL cache + invalidation (RC4)', () => {
     expect(fetchMock.mock.calls[0]?.[1]).toEqual(expect.objectContaining({
       headers: expect.objectContaining({ Authorization: 'Bearer fresh-personal-jwt' }),
     }));
+  });
+});
+
+/**
+ * `isAuthenticated()` flips as soon as a session exists, but the personal JWT
+ * the team directory needs can arrive a beat later. The old one-shot retry
+ * fired into that gap, read the resulting empty list as "no team", and left
+ * tracker sync off for the entire app session.
+ */
+describe('autoMatchTeamForWorkspace across the JWT arrival gap', () => {
+  const okTeams = (teams: unknown[]) => async () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({ teams }),
+  });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    fetchMock.mockReset();
+    gitRemoteMock.mockReset();
+    workspaceStates.clear();
+    invalidateListTeamsCache();
+    vi.useFakeTimers();
+    gitRemoteMock.mockResolvedValue(REMOTE);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('retries a lookup that could not complete, and starts tracker sync once it does', async () => {
+    fetchMock
+      .mockRejectedValueOnce(new Error('Not authenticated. Sign in first.'))
+      .mockImplementation(okTeams([{
+        orgId: 'org-1', name: 'Widgets Team', gitRemoteHash: REMOTE_HASH,
+        teamProjectId: 'tp-1', createdAt: new Date().toISOString(), role: 'admin',
+      }]));
+
+    await autoMatchTeamForWorkspace('/workspace/jwt-gap');
+    expect(ensureTrackerSyncMock).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    expect(ensureTrackerSyncMock).toHaveBeenCalledWith('/workspace/jwt-gap');
+  });
+
+  // The other half: a complete lookup that found nothing is the truth, and
+  // must not turn into a retry loop against the team API.
+  it('does not retry when the directory came back complete and nothing matched', async () => {
+    fetchMock.mockImplementation(okTeams([]));
+
+    await autoMatchTeamForWorkspace('/workspace/genuinely-solo');
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    expect(apiTeamsFetchCallCount()).toBe(1);
+    expect(ensureTrackerSyncMock).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * The post-sign-in project walk. Org membership is account-level, but the org a
+ * project window shows is resolved per workspace from its git remote -- so an
+ * invited member who opens an unrelated folder reads as having no organization
+ * at all. These cover the two halves of the fix: deciding the walk is needed,
+ * and the folder actually resolving afterwards.
+ */
+describe('post-sign-in project walk', () => {
+  const teamsFixture = () => ({
+    teams: [
+      {
+        orgId: 'org-1',
+        name: 'Widgets Team',
+        gitRemoteHash: REMOTE_HASH,
+        teamProjectId: 'tp-primary',
+        projects: [
+          { projectId: 'p-1', teamProjectId: 'tp-primary', gitRemoteHash: REMOTE_HASH, slug: null, name: 'Widgets', remoteUrl: 'git@github.com:acme/widgets.git' },
+          { projectId: 'p-2', teamProjectId: 'tp-notes', gitRemoteHash: null, slug: 'notes', name: 'Notes' },
+        ],
+        createdAt: new Date().toISOString(),
+        role: 'admin',
+      },
+      { orgId: 'org-invited', name: 'Not Joined', gitRemoteHash: null, teamProjectId: 'tp-other', membershipType: 'invited', createdAt: new Date().toISOString(), role: 'member' },
+    ],
+  });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    fetchMock.mockReset();
+    gitRemoteMock.mockReset();
+    gitRemoteMock.mockResolvedValue(null);
+    workspaceStates.clear();
+    directories.clear();
+    directoryContents.clear();
+    madeDirectories.length = 0;
+    windowStates.clear();
+    invalidateListTeamsCache();
+
+    fetchMock.mockImplementation(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => teamsFixture(),
+    }));
+  });
+
+  afterEach(() => {
+    windowStates.clear();
+  });
+
+  const openWindowOn = (workspacePath: string) => {
+    windowStates.set(windowStates.size + 1, { workspacePath } as never);
+  };
+
+  describe('deciding the walk is needed', () => {
+    it('reports the org as unbound when the only open workspace matches nothing', async () => {
+      openWindowOn('/projects/unrelated');
+
+      await expect(resolveProjectWalkState()).resolves.toEqual({
+        orgs: [{ orgId: 'org-1', name: 'Widgets Team' }],
+        boundOrgIds: [],
+        thisWindowOrgId: null,
+      });
+    });
+
+    it('reports the org as bound once an open workspace resolves to it', async () => {
+      gitRemoteMock.mockResolvedValue(REMOTE);
+      openWindowOn('/projects/widgets');
+
+      await expect(resolveProjectWalkState()).resolves.toEqual({
+        orgs: [{ orgId: 'org-1', name: 'Widgets Team' }],
+        boundOrgIds: ['org-1'],
+        thisWindowOrgId: null,
+      });
+    });
+
+    // Bound in ANY window is what stops the interruption; bound in THIS window
+    // is what stops offering this window a way in. Conflating them told a
+    // member with a second window open that they had no organization at all.
+    it('separates the asking window own org from what any window is bound to', async () => {
+      gitRemoteMock.mockResolvedValue(REMOTE);
+      openWindowOn('/projects/widgets');
+
+      await expect(resolveProjectWalkState('/projects/widgets')).resolves.toMatchObject({
+        boundOrgIds: ['org-1'],
+        thisWindowOrgId: 'org-1',
+      });
+      await expect(resolveProjectWalkState('/projects/unrelated')).resolves.toMatchObject({
+        boundOrgIds: ['org-1'],
+        thisWindowOrgId: null,
+      });
+    });
+
+    // An invitation is not membership; offering to walk someone into a project
+    // they cannot read yet would fail at the first fetch.
+    it('leaves invitations out of the org list', async () => {
+      const state = await resolveProjectWalkState();
+      expect(state.orgs.map((org) => org.orgId)).toEqual(['org-1']);
+    });
+  });
+
+  describe('choosing a folder for a project', () => {
+    it('offers a clone into an empty folder for a repository-backed project', async () => {
+      directories.add('/projects/empty');
+
+      await expect(inspectProjectFolder({
+        orgId: 'org-1', teamProjectId: 'tp-primary', directoryPath: '/projects/empty',
+      })).resolves.toEqual({ kind: 'clonable' });
+    });
+
+    it('recognizes a folder that is already the project’s clone', async () => {
+      directories.add('/projects/widgets');
+      directoryContents.set('/projects/widgets', ['.git', 'README.md']);
+      gitRemoteMock.mockResolvedValue(REMOTE);
+
+      await expect(inspectProjectFolder({
+        orgId: 'org-1', teamProjectId: 'tp-primary', directoryPath: '/projects/widgets',
+      })).resolves.toEqual({ kind: 'alreadyCloned' });
+    });
+
+    it('refuses a non-empty unrelated folder', async () => {
+      directories.add('/projects/notes-scratch');
+      directoryContents.set('/projects/notes-scratch', ['todo.md']);
+
+      await expect(inspectProjectFolder({
+        orgId: 'org-1', teamProjectId: 'tp-primary', directoryPath: '/projects/notes-scratch',
+      })).resolves.toEqual({ kind: 'occupied' });
+    });
+  });
+
+  /**
+   * The end of the walk, and the whole point of it: whatever folder the user
+   * ends up with has to make `findTeamForWorkspace` answer with the org.
+   */
+  describe('the folder resolves to the org afterwards', () => {
+    it('binds a remote-less project and then resolves for that path', async () => {
+      await expect(findTeamForWorkspace('/projects/notes')).resolves.toBeNull();
+
+      const result = await joinOrgProjectWithFolder({
+        orgId: 'org-1', teamProjectId: 'tp-notes', directoryPath: '/projects/notes',
+      });
+
+      expect(result).toEqual({ workspacePath: '/projects/notes', method: 'bind' });
+      await expect(findTeamForWorkspace('/projects/notes')).resolves.toEqual(
+        expect.objectContaining({ orgId: 'org-1', teamProjectId: 'tp-notes' }),
+      );
+    });
+
+    // A repository-backed project is matched by its remote, so an existing
+    // clone needs no binding at all -- recording one would give it two answers.
+    it('accepts an existing clone without writing a binding', async () => {
+      directories.add('/projects/widgets');
+      directoryContents.set('/projects/widgets', ['.git']);
+      gitRemoteMock.mockResolvedValue(REMOTE);
+
+      const result = await joinOrgProjectWithFolder({
+        orgId: 'org-1', teamProjectId: 'tp-primary', directoryPath: '/projects/widgets',
+      });
+
+      expect(result).toEqual({ workspacePath: '/projects/widgets', method: 'existing' });
+      expect(workspaceStates.get('/projects/widgets')?.localOrgBinding).toBeUndefined();
+      await expect(findTeamForWorkspace('/projects/widgets')).resolves.toEqual(
+        expect.objectContaining({ orgId: 'org-1' }),
+      );
+    });
+
+    it('refuses a folder that is not the repository the project is matched by', async () => {
+      directories.add('/projects/unrelated');
+      directoryContents.set('/projects/unrelated', ['notes.md']);
+
+      await expect(joinOrgProjectWithFolder({
+        orgId: 'org-1', teamProjectId: 'tp-primary', directoryPath: '/projects/unrelated',
+      })).rejects.toThrow(/clone/i);
+      expect(workspaceStates.get('/projects/unrelated')?.localOrgBinding).toBeUndefined();
+    });
+  });
+});
+
+describe('listTeams stampede on mid-flight invalidation (NIM-3711)', () => {
+  /** Let queued microtasks (the fetch call, the cache settle handler) run. */
+  const flush = async () => { for (let i = 0; i < 12; i++) await Promise.resolve(); };
+
+  /** A /api/teams response that does not resolve until the test releases it. */
+  function gatedTeamsFetch(): () => void {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    fetchMock.mockImplementation(async () => {
+      await gate;
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          teams: [{
+            orgId: 'org-1', name: 'Widgets Team', gitRemoteHash: REMOTE_HASH,
+            createdAt: new Date().toISOString(), role: 'admin',
+          }],
+        }),
+      };
+    });
+    return release;
+  }
+
+  beforeEach(() => {
+    fetchMock.mockReset();
+    invalidateListTeamsCache();
+  });
+
+  afterEach(async () => {
+    await flush();
+    invalidateListTeamsCache();
+  });
+
+  it('does not open a second request when the cache is invalidated mid-flight', async () => {
+    const release = gatedTeamsFetch();
+
+    const first = listTeams();
+    await flush();
+    expect(apiTeamsFetchCallCount()).toBe(1);
+
+    // What actually happened at startup: fetchTeamApi refreshed an expiring
+    // personal JWT, the refresh emitted an authenticated auth-state change,
+    // and the change handler invalidated the directory cache -- while this
+    // request was still on the wire. The next caller must join it, not race it.
+    invalidateListTeamsCache();
+    const second = listTeams();
+    await flush();
+
+    release();
+    await Promise.all([first, second]);
+
+    expect(apiTeamsFetchCallCount()).toBe(1);
+  });
+
+  it('does not cache an answer that was invalidated while in flight', async () => {
+    const release = gatedTeamsFetch();
+
+    const first = listTeams();
+    await flush();
+    invalidateListTeamsCache();
+    release();
+    await first;
+    await flush();
+
+    // The answer satisfied its joined callers, but it predates the
+    // invalidation, so it must not be served to anyone new.
+    await listTeams();
+    expect(apiTeamsFetchCallCount()).toBe(2);
+  });
+
+  it('opens a fresh request for forceFresh callers even while one is on the wire', async () => {
+    const release = gatedTeamsFetch();
+
+    const background = listTeams();
+    await flush();
+    expect(apiTeamsFetchCallCount()).toBe(1);
+
+    // The manual Refresh affordance asks for state that may have changed since
+    // the outstanding request started, so joining it would defeat the point.
+    const refreshed = listTeams({ forceFresh: true });
+    await flush();
+    expect(apiTeamsFetchCallCount()).toBe(2);
+
+    release();
+    await Promise.all([background, refreshed]);
   });
 });

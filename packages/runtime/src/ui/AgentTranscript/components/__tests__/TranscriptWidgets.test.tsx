@@ -23,7 +23,7 @@ import { createStore, Provider as JotaiProvider } from 'jotai';
 import type { TranscriptViewMessage } from '../../../../ai/server/transcript/TranscriptProjector';
 import type { CustomToolWidgetProps } from '../CustomToolWidgets/index';
 
-const { render, screen, fireEvent } = rtl;
+const { render, screen, fireEvent, waitFor } = rtl;
 
 // Mock clipboard
 vi.mock('../../../../utils/clipboard', () => ({
@@ -1290,6 +1290,143 @@ describe('GitCommitConfirmationWidget', () => {
     );
     expect(container.innerHTML).toBe('');
   });
+
+  // The scenario the feature exists for: two sessions edited one file, and the
+  // user commits only their own hunk. Covers the full widget contract --
+  // pre-selection, banner, tri-state, and the payload handed to the host.
+  describe('hunk-level staging', () => {
+    const TWO_SESSION_DIFF = [
+      'diff --git a/shared.txt b/shared.txt',
+      'index 1111111..2222222 100644',
+      '--- a/shared.txt',
+      '+++ b/shared.txt',
+      '@@ -2,5 +2,5 @@',
+      ' line2',
+      ' line3',
+      ' line4',
+      '-line5',
+      '+SESSION-A-EDIT',
+      ' line6',
+      '@@ -22,5 +22,5 @@',
+      ' line22',
+      ' line23',
+      ' line24',
+      '-line25',
+      '+SESSION-B-EDIT',
+      ' line26',
+    ].join('\n') + '\n';
+
+    /** What this session alone changed: only the first hunk. */
+    const SESSION_OWN_DIFF = [
+      'Index: shared.txt',
+      '--- shared.txt',
+      '+++ shared.txt',
+      '@@ -2,5 +2,5 @@',
+      ' line2',
+      ' line3',
+      ' line4',
+      '-line5',
+      '+SESSION-A-EDIT',
+      ' line6',
+    ].join('\n') + '\n';
+
+    async function renderWithDiffs(overrides: Record<string, unknown> = {}) {
+      const { interactiveWidgetHostAtom } = await import('../../../../store/atoms/interactiveWidgetHost');
+      const message = makeToolMessage('git_commit_proposal', {
+        commitMessage: 'perf: only my hunk',
+        filesToStage: [{ path: 'shared.txt', status: 'modified' }],
+      });
+      const gitCommit = vi.fn().mockResolvedValue({ success: true, commitHash: 'abc1234' });
+      const testStore = createStore();
+      testStore.set(interactiveWidgetHostAtom('hunk-session'), {
+        sessionId: 'hunk-session',
+        workspacePath: '/',
+        worktreeId: null,
+        askUserQuestionSubmit: vi.fn(),
+        askUserQuestionCancel: vi.fn(),
+        requestUserInputSubmit: vi.fn(),
+        requestUserInputCancel: vi.fn(),
+        exitPlanModeApprove: vi.fn(),
+        exitPlanModeStartNewSession: vi.fn(),
+        exitPlanModeDeny: vi.fn(),
+        exitPlanModeCancel: vi.fn(),
+        toolPermissionSubmit: vi.fn(),
+        toolPermissionCancel: vi.fn(),
+        autoCommitEnabled: false,
+        setAutoCommitEnabled: vi.fn(),
+        gitCommit,
+        gitCommitCancel: vi.fn(),
+        gitFileDiff: vi.fn().mockResolvedValue({ unifiedDiff: TWO_SESSION_DIFF, isBinary: false }),
+        sessionFileDiff: vi.fn().mockResolvedValue({ unifiedDiff: SESSION_OWN_DIFF }),
+        superLoopBlockedFeedback: vi.fn(),
+        openFile: vi.fn(),
+        trackEvent: vi.fn(),
+        ...overrides,
+      });
+
+      render(
+        <JotaiProvider store={testStore}>
+          <GitCommitConfirmationWidget
+            message={message}
+            isExpanded={false}
+            onToggle={() => {}}
+            sessionId="hunk-session"
+          />
+        </JotaiProvider>
+      );
+      return { gitCommit };
+    }
+
+    it('pre-selects the session\'s own hunk and says how many it excluded', async () => {
+      await renderWithDiffs();
+
+      const banner = await screen.findByTestId('git-commit-hunk-exclusion-banner');
+      expect(banner.textContent).toContain('1 hunk excluded');
+
+      // The file reads as partially staged, not fully.
+      expect(screen.getByTestId('git-commit-file-checkbox').dataset.checkState).toBe('partial');
+    });
+
+    it('sends only the selected hunk\'s ref to the host', async () => {
+      const { gitCommit } = await renderWithDiffs();
+      await screen.findByTestId('git-commit-hunk-exclusion-banner');
+
+      fireEvent.click(screen.getByTestId('git-commit-confirm'));
+
+      await waitFor(() => expect(gitCommit).toHaveBeenCalled());
+      const [, files, , hunkSelections] = gitCommit.mock.calls[0];
+      expect(files).toEqual(['shared.txt']);
+      expect(hunkSelections).toEqual([
+        { path: 'shared.txt', hunks: [{ oldStart: 2, oldLines: 5, newStart: 2, newLines: 5 }] },
+      ]);
+    });
+
+    it('restores the whole file via Select all hunks, dropping the refs', async () => {
+      const { gitCommit } = await renderWithDiffs();
+      await screen.findByTestId('git-commit-hunk-exclusion-banner');
+
+      fireEvent.click(screen.getByTestId('git-commit-select-all-hunks'));
+      await waitFor(() =>
+        expect(screen.getByTestId('git-commit-file-checkbox').dataset.checkState).toBe('all')
+      );
+
+      fireEvent.click(screen.getByTestId('git-commit-confirm'));
+      await waitFor(() => expect(gitCommit).toHaveBeenCalled());
+      // Whole file again, so no hunk refs are sent at all.
+      expect(gitCommit.mock.calls[0][3]).toBeUndefined();
+    });
+
+    it('stages the whole file when the session cannot be attributed', async () => {
+      const { gitCommit } = await renderWithDiffs({
+        sessionFileDiff: vi.fn().mockResolvedValue(null),
+      });
+
+      fireEvent.click(screen.getByTestId('git-commit-confirm'));
+      await waitFor(() => expect(gitCommit).toHaveBeenCalled());
+      expect(gitCommit.mock.calls[0][3]).toBeUndefined();
+      expect(screen.queryByTestId('git-commit-hunk-exclusion-banner')).toBeNull();
+    });
+  });
 });
 
 // ============================================================================
@@ -1407,7 +1544,7 @@ describe('ContextLimitWidget', () => {
   });
 
   it('shows compact button only on last message', () => {
-    const onCompact = vi.fn();
+    const onCompact = vi.fn(() => new Promise<void>(() => {}));
     render(<ContextLimitWidget isLastMessage={true} onCompact={onCompact} />);
     const compactButton = screen.getByText('Compact');
     expect(compactButton).toBeDefined();
@@ -1421,10 +1558,78 @@ describe('ContextLimitWidget', () => {
   });
 
   it('shows "Compacting..." after clicking compact', () => {
-    const onCompact = vi.fn();
+    const onCompact = vi.fn(() => new Promise<void>(() => {}));
     render(<ContextLimitWidget isLastMessage={true} onCompact={onCompact} />);
     fireEvent.click(screen.getByText('Compact'));
     expect(screen.getByText('Compacting...')).toBeDefined();
+  });
+
+  // #1414: the button used to latch on "Compacting..." forever, so the one
+  // recovery affordance disappeared in exactly the case that needs it -- a
+  // compaction the model refused. SessionTranscript's handler swallows its own
+  // errors and resolves, so the failure looks like a completed call here.
+  it('hands the button back once a failed compaction settles', async () => {
+    let settle!: () => void;
+    const onCompact = vi.fn(() => new Promise<void>((resolve) => { settle = resolve; }));
+    render(
+      <ContextLimitWidget isLastMessage={true} variant="compaction-failed" onCompact={onCompact} />
+    );
+
+    fireEvent.click(screen.getByText('Try again'));
+    expect(screen.getByText('Retrying...')).toBeDefined();
+
+    settle();
+    await waitFor(() => expect(screen.getByText('Try again')).toBeDefined());
+    expect((screen.getByText('Try again') as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  // The widget renders INSTEAD of the message it matched, so for a failed
+  // compaction it has to carry the detail forward -- that string is the only
+  // thing naming who refused (a router, in #1414). A plain context-limit error
+  // says nothing the widget's own copy doesn't, so it stays suppressed.
+  it('surfaces the failure detail only for a failed compaction', () => {
+    const detail = 'Error during compaction: API Error: 400 All target providers failed.';
+    const { rerender } = render(
+      <ContextLimitWidget isLastMessage={true} variant="compaction-failed" detail={detail} />
+    );
+    expect(screen.getByText(detail)).toBeDefined();
+
+    rerender(<ContextLimitWidget isLastMessage={true} variant="context-limit" detail={detail} />);
+    expect(screen.queryByText(detail)).toBeNull();
+  });
+});
+
+// ============================================================================
+// Context failure classification
+// ============================================================================
+
+describe('classifyContextFailure', () => {
+  let classifyContextFailure: (text: string) => string | null;
+  let isCompactionFailureText: (text: string) => boolean;
+
+  beforeEach(async () => {
+    const mod = await import('../contextFailureDetection');
+    classifyContextFailure = mod.classifyContextFailure;
+    isCompactionFailureText = mod.isCompactionFailureText;
+  });
+
+  // The CLI prefixes its automatic-compaction failure with "Prompt is too
+  // long", so a context-limit-first check routes it to the "just compact"
+  // copy -- advice the user has already taken and watched fail.
+  it('prefers the compaction verdict over the context-limit phrase it embeds', () => {
+    expect(classifyContextFailure('Prompt is too long · automatic compaction failed: API Error: 400'))
+      .toBe('compaction-failed');
+    expect(classifyContextFailure('Error during compaction: API Error: 400 All target providers failed.'))
+      .toBe('compaction-failed');
+    expect(classifyContextFailure('Prompt is too long')).toBe('context-limit');
+    expect(classifyContextFailure('the build succeeded')).toBeNull();
+  });
+
+  // The unflagged-text path renders this widget INSTEAD of the message, so a
+  // loose match would hide an agent's own prose behind an error card.
+  it('only matches the CLI framing on unflagged text', () => {
+    expect(isCompactionFailureText('Error during compaction: API Error: 400')).toBe(true);
+    expect(isCompactionFailureText('I checked the logs and compaction failed twice')).toBe(false);
   });
 });
 
@@ -1621,6 +1826,64 @@ describe('InteractivePromptWidget', () => {
     expect(screen.getByText('Blue')).toBeDefined();
     expect(screen.getByText('Warm')).toBeDefined();
     expect(screen.getByText('Cool')).toBeDefined();
+  });
+
+  // Regression test for GitHub issue #1418. The transcript is virtualized, so
+  // scrolling a pending question out of view unmounts this widget. Its answers,
+  // "Other" toggle and "Other" text used to live in component state and were
+  // discarded with it, unrecoverably. They now live in a draft atom keyed by
+  // questionId, so all three survive the remount.
+  it('keeps selections, the Other toggle and the Other text across unmount/remount', () => {
+    const questionContent = {
+      type: 'ask_user_question_request' as const,
+      questionId: 'q-draft-1418',
+      questions: [
+        {
+          question: 'Which areas?',
+          header: 'Areas',
+          options: [
+            { label: 'Editor', description: 'Editing surface' },
+            { label: 'Sync', description: 'Collaboration' },
+          ],
+          multiSelect: true,
+        },
+      ],
+      status: 'pending' as const,
+    };
+    const typed = 'Ten minutes of carefully written user input.';
+
+    const first = render(
+      <InteractivePromptWidget
+        promptType="ask_user_question_request"
+        content={questionContent}
+        onSubmitResponse={() => {}}
+      />
+    );
+
+    fireEvent.click(screen.getByText('Editor'));
+    fireEvent.click(screen.getByText('Other'));
+    fireEvent.change(first.container.querySelector('textarea')!, {
+      target: { value: typed },
+    });
+    expect(first.container.querySelector('textarea')!.value).toBe(typed);
+
+    // Scrolled out of view, then back.
+    first.unmount();
+    const second = render(
+      <InteractivePromptWidget
+        promptType="ask_user_question_request"
+        content={questionContent}
+        onSubmitResponse={() => {}}
+      />
+    );
+
+    expect(second.container.querySelector('textarea')!.value).toBe(typed);
+    expect(
+      screen.getByText('Editor').closest('.interactive-prompt__option')!.className
+    ).toContain('interactive-prompt__option--selected');
+    expect(
+      screen.getByText('Other').closest('.interactive-prompt__option')!.className
+    ).toContain('interactive-prompt__option--selected');
   });
 
   it('calls onSubmitResponse with correct permission response', () => {

@@ -150,6 +150,48 @@ describe('SQLiteStoreAdapter', () => {
     });
   });
 
+  // Regression (#1403): `HistoryManager` retires pending-review tags with a
+  // *literal* jsonb value, `jsonb_set(metadata, '{status}', '"reviewed"')`,
+  // rather than a bound `to_jsonb($1::text)`. Postgres parses that literal as
+  // jsonb and stores the string `reviewed`; SQLite's json_set stores whatever
+  // text it is handed, so the row landed as `{"status":"\"reviewed\""}` — a
+  // value that satisfies neither the pending-review nor the reviewed predicate.
+  // 2,613 rows on one dev machine reached that state before this was caught.
+  // The string-level translator test could not see it: the SQL was
+  // syntactically fine and only the stored value was wrong.
+  it('jsonb_set with a literal value stores parsed JSON, not the raw text (#1403)', async () => {
+    const adapter = createSQLiteStoreAdapter(db);
+    await adapter.query(
+      `INSERT INTO ai_sessions (id, workspace_id, title, provider, metadata)
+       VALUES ($1, $2, $3, $4, $5)`,
+      ['s1', 'ws1', 't', 'claude', JSON.stringify({ status: 'pending-review' })],
+    );
+    await adapter.query(
+      `UPDATE ai_sessions
+       SET metadata = jsonb_set(
+                        jsonb_set(metadata, '{status}', '"reviewed"'),
+                        '{updatedAt}', to_jsonb($1::bigint))
+       WHERE id = $2`,
+      [1234567890, 's1'],
+    );
+
+    const { rows } = await adapter.query<{ metadata: string }>(
+      `SELECT metadata FROM ai_sessions WHERE id = $1`,
+      ['s1'],
+    );
+    expect(JSON.parse(rows[0].metadata)).toEqual({
+      status: 'reviewed',
+      updatedAt: 1234567890,
+    });
+
+    // And the predicate the readers actually use must match it.
+    const { rows: matched } = await adapter.query<{ id: string }>(
+      `SELECT id FROM ai_sessions WHERE metadata->>'status' = $1`,
+      ['reviewed'],
+    );
+    expect(matched.map((r) => r.id)).toEqual(['s1']);
+  });
+
   it('handles RETURNING * on INSERT', async () => {
     const adapter = createSQLiteStoreAdapter(db);
     const { rows } = await adapter.query<{ id: string; title: string }>(
@@ -252,14 +294,15 @@ describe('SQLiteStoreAdapter', () => {
     expect(merged.rows[0].linked).toBe('sess_1'); // system key survived the merge
   });
 
-  // Regression (NIM-454 / NIM-363): the native createTrackerItem path now
-  // persists the type tag (a JS array bound to the type_tags column) and
-  // allocates a NIM-### issue key (MAX(issue_number)+1), matching the MCP path.
-  // This exercises both on real SQLite.
-  it('persists type_tags array and allocates an issue key on native create (NIM-454/363)', async () => {
+  // Native creates persist their type tag but deliberately leave both issue
+  // identity columns empty. Personal items and team drafts never reach the
+  // team's server-side sequence; a published item receives its key from the
+  // TrackerRoom instead of this local SQLite projection.
+  it('persists type_tags and leaves the issue key unassigned on native create', async () => {
     const adapter = createSQLiteStoreAdapter(db);
 
-    // Insert two items the way createTrackerItem does: type_tags bound as a JS array.
+    // Insert the way createTrackerItem does: type_tags bound as a JS array and
+    // no client-side issue identity columns in the statement.
     await adapter.query(
       `INSERT INTO tracker_items (id, type, type_tags, data, workspace, document_path, created, updated, last_indexed, sync_status, archived, source)
        VALUES ($1, $2, $3, $4, $5, '', NOW(), NOW(), NOW(), $6, FALSE, $7)`,
@@ -273,34 +316,11 @@ describe('SQLiteStoreAdapter', () => {
     // type_tags column holds the JSON-encoded array on SQLite.
     expect(JSON.parse(typeRow.rows[0].type_tags)).toEqual(['idea']);
 
-    // Allocate an issue key like createTrackerItem: MAX(issue_number)+1.
-    const allocate = async (id: string) => {
-      const maxResult = await adapter.query<{ max_num: number | null }>(
-        `SELECT MAX(issue_number) as max_num FROM tracker_items WHERE workspace = $1`,
-        ['ws1'],
-      );
-      const nextNum = (maxResult.rows[0]?.max_num ?? 0) + 1;
-      await adapter.query(
-        `UPDATE tracker_items SET issue_number = $1, issue_key = $2 WHERE id = $3`,
-        [nextNum, `NIM-${nextNum}`, id],
-      );
-    };
-    await allocate('idea_1');
-
-    await adapter.query(
-      `INSERT INTO tracker_items (id, type, type_tags, data, workspace, document_path, created, updated, last_indexed, sync_status, archived, source)
-       VALUES ($1, $2, $3, $4, $5, '', NOW(), NOW(), NOW(), $6, FALSE, $7)`,
-      ['idea_2', 'idea', ['idea'], JSON.stringify({ title: 'Another', status: 'to-do' }), 'ws1', 'local', 'native'],
+    const identity = await adapter.query<{ issue_key: string | null; issue_number: number | null }>(
+      `SELECT issue_key, issue_number FROM tracker_items WHERE id = $1`,
+      ['idea_1'],
     );
-    await allocate('idea_2');
-
-    const keyed = await adapter.query<{ id: string; issue_key: string; issue_number: number }>(
-      `SELECT id, issue_key, issue_number FROM tracker_items ORDER BY issue_number`,
-    );
-    expect(keyed.rows).toEqual([
-      { id: 'idea_1', issue_key: 'NIM-1', issue_number: 1 },
-      { id: 'idea_2', issue_key: 'NIM-2', issue_number: 2 },
-    ]);
+    expect(identity.rows[0]).toEqual({ issue_key: null, issue_number: null });
   });
 
   it('FTS searchAgentMessages finds inserted messages via trigger backfill', async () => {

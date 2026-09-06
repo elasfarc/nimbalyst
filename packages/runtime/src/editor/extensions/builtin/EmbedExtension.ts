@@ -216,7 +216,7 @@ function $handleTabToggle(): boolean {
  * set and left links alone. This scan re-runs the upgrade rule against
  * the live tree once the set changes.
  */
-function $rescanForEmbedUpgrade(): void {
+export function $rescanForEmbedUpgrade(): void {
   const stack: LexicalNode[] = [$getRoot()];
   while (stack.length > 0) {
     const node = stack.pop()!;

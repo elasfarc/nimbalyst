@@ -93,7 +93,6 @@ describe('CollabCreateItemDialog', () => {
             sharedCreate: true,
             history: true,
             export: true,
-            embed: false,
           },
         }}
         folders={folders}

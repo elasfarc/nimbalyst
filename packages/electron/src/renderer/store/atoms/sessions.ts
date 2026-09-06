@@ -20,6 +20,8 @@ import { store } from '@nimbalyst/runtime/store';
 import { ModelIdentifier, type ChatAttachment, type SessionData, type TranscriptViewMessage } from '@nimbalyst/runtime/ai/server/types';
 import type { SessionMeta } from '@nimbalyst/runtime';
 import deepEqual from 'fast-deep-equal';
+import { sessionLaunchCountsAtom } from './sessionLaunchCounts';
+import { sessionListMetadata } from './sessionListMetadata';
 import { workstreamStateAtom, setWorkstreamActiveChildAtom } from './workstreamState';
 import { aiInputHistoryAtom } from './aiInputUndo';
 
@@ -187,6 +189,12 @@ export interface AgentSessionAttentionGroups {
 /**
  * Active-workspace sessions that currently need attention, classified by
  * their highest-priority state so a session appears in exactly one group.
+ *
+ * `phase` is self-reported by the agent, and an agent sets `complete` before
+ * it emits its closing output -- the very output that flags the session
+ * unread. Filtering `complete` out up front therefore hid the sessions that
+ * had *just* finished, which is the opposite of what the popover is for. Only
+ * the running bucket honours the phase; unread and awaiting-input outrank it.
  */
 export const agentSessionAttentionAtom = atom<AgentSessionAttentionGroups>((get) => {
   const registry = get(sessionRegistryAtom);
@@ -194,7 +202,6 @@ export const agentSessionAttentionAtom = atom<AgentSessionAttentionGroups>((get)
   const sessions = Array.from(registry.values())
     .filter((session) =>
       !session.isArchived &&
-      session.phase !== 'complete' &&
       (!workspacePath || session.workspaceId === workspacePath)
     )
     .sort((a, b) => b.updatedAt - a.updatedAt);
@@ -209,7 +216,9 @@ export const agentSessionAttentionAtom = atom<AgentSessionAttentionGroups>((get)
     if (get(sessionHasPendingInteractivePromptAtom(session.id))) {
       groups.awaitingInput.push(session);
     } else if (get(sessionProcessingAtom(session.id))) {
-      groups.running.push(session);
+      if (session.phase !== 'complete') {
+        groups.running.push(session);
+      }
     } else if (get(sessionUnreadAtom(session.id))) {
       groups.unread.push(session);
     }
@@ -325,22 +334,46 @@ export function isInteractivePromptTool(toolName: string): boolean {
   return !!match && INTERACTIVE_PROMPT_TOOLS.has(match[1]);
 }
 
+/**
+ * Whether any interactive prompt in this transcript is still answerable.
+ *
+ * "No result yet" is not sufficient on its own. Typing a new prompt while a
+ * prompt widget is up aborts the turn, and the abort leaves the tool_use
+ * permanently unmatched -- no tool_result is ever written for it. Deriving
+ * pending purely from the missing result pinned the amber "waiting for your
+ * response" indicator on sessions that were actively running, because the
+ * derivation re-runs from message history on every transcript mount and kept
+ * rediscovering the dead prompt. (#871 fixed the same symptom on the persisted
+ * `hasPendingPrompt` bit; this is the message-derived twin.)
+ *
+ * A `user_message` after the prompt is the abandonment signal: the user chose
+ * to type instead of answering, so the prompt can never be resolved. Nothing
+ * else is treated as abandonment -- notably not `turn_ended`, because a prompt
+ * backgrounded at the harness's 120s tool timeout outlives its turn and stays
+ * answerable (see #1341 and `isStrandedPromptAck` in TranscriptProjector).
+ */
+export function hasUnansweredInteractivePrompt(
+  messages: Array<{ type?: string; interactivePrompt?: { status?: string }; toolCall?: { toolName?: string; result?: unknown } }>
+): boolean {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    // Everything before the last user message was superseded by it.
+    if (msg.type === 'user_message') return false;
+    // Interactive prompts projected from canonical events
+    if (msg.type === 'interactive_prompt' && msg.interactivePrompt?.status === 'pending') return true;
+    // Interactive tools stored as tool_calls (from TranscriptTransformer)
+    if (msg.toolCall?.toolName && isInteractivePromptTool(msg.toolCall.toolName) && !msg.toolCall.result) return true;
+  }
+  return false;
+}
+
 export const refreshPendingPromptsAtom = atom(
   null,
   (get, set, sessionId: string) => {
     // Pending prompts are now rendered from canonical transcript events via widgets.
     // Update the unified pending interactive prompt state from session messages.
     const messages = get(sessionMessagesAtom(sessionId));
-    const hasPendingPrompt = messages.some(
-      msg => {
-        // Interactive prompts projected from canonical events
-        if (msg.type === 'interactive_prompt' && msg.interactivePrompt?.status === 'pending') return true;
-        // Interactive tools stored as tool_calls (from TranscriptTransformer)
-        if (msg.toolCall?.toolName && isInteractivePromptTool(msg.toolCall.toolName) && !msg.toolCall.result) return true;
-        return false;
-      }
-    );
-    set(sessionHasPendingInteractivePromptAtom(sessionId), hasPendingPrompt);
+    set(sessionHasPendingInteractivePromptAtom(sessionId), hasUnansweredInteractivePrompt(messages));
   }
 );
 
@@ -936,6 +969,15 @@ export const sessionEffortLevelRawAtom = atomFamily((sessionId: string) =>
   })
 );
 
+/** OpenCode session role (an `app.agents` primary agent), or null for its default. */
+export const sessionOpenCodeRoleAtom = atomFamily((sessionId: string) =>
+  atom((get) => {
+    const metadata = get(sessionStoreAtom(sessionId))?.metadata as Record<string, unknown> | undefined;
+    const role = metadata?.opencodeAgent;
+    return typeof role === 'string' && role.trim().length > 0 ? role : null;
+  })
+);
+
 export const sessionThinkingModeRawAtom = atomFamily((sessionId: string) =>
   atom((get) => {
     const metadata = get(sessionStoreAtom(sessionId))?.metadata as Record<string, unknown> | undefined;
@@ -1490,6 +1532,9 @@ export const convertToWorkstreamAtom = atom(
           },
         },
         workspaceId: workspacePath,
+        // The app manufactures this root to hold sessions the user already
+        // made; nobody asked for a new session, so it must not read as one.
+        launchSource: 'workstream_convert',
       });
 
       if (!createResult.success || !createResult.id) {
@@ -2062,6 +2107,16 @@ export const markSessionReadAtom = atom(null, (get, set, sessionId: string) => {
 });
 
 /**
+ * Mark several sessions as read at once (e.g. a whole workstream).
+ * Deduplicates so a parent id that also appears in its child list is only sent once.
+ */
+export const markSessionsReadAtom = atom(null, (get, set, sessionIds: string[]) => {
+  for (const sessionId of new Set(sessionIds)) {
+    set(markSessionReadAtom, sessionId);
+  }
+});
+
+/**
  * Set session as active.
  * Also marks it as read.
  */
@@ -2157,6 +2212,8 @@ export const showArchivedSessionsAtom = atom<boolean>(false);
  *   If provided, uses this value instead of reading from showArchivedSessionsAtom.
  *   This avoids race conditions when the atom is updated but not yet committed.
  */
+let sessionListRefreshVersion = 0;
+
 export const refreshSessionListAtom = atom(
   null,
   async (get, set, includeArchivedOverride?: boolean) => {
@@ -2165,6 +2222,7 @@ export const refreshSessionListAtom = atom(
       return;
     }
 
+    const refreshVersion = ++sessionListRefreshVersion;
     const showArchived = includeArchivedOverride ?? get(showArchivedSessionsAtom);
 
     try {
@@ -2173,36 +2231,13 @@ export const refreshSessionListAtom = atom(
         includeArchived: showArchived,
       });
 
+      if (get(sessionListWorkspaceAtom) !== workspacePath || refreshVersion !== sessionListRefreshVersion) return;
+
       if (result.success && Array.isArray(result.sessions)) {
         // Map IPC results directly into registry (single pass, no intermediate type)
         const registry = new Map<string, SessionMeta>();
         for (const s of result.sessions) {
-          registry.set(s.id, {
-            id: s.id,
-            title: s.title || 'Untitled Session',
-            createdAt: s.createdAt,
-            updatedAt: s.updatedAt,
-            provider: s.provider || 'claude',
-            model: s.model,
-            sessionType: s.sessionType || 'session',
-            agentRole: s.agentRole || 'standard',
-            createdBySessionId: s.createdBySessionId || null,
-            messageCount: s.messageCount || 0,
-            workspaceId: workspacePath,
-            isArchived: s.isArchived || false,
-            isPinned: s.isPinned || false,
-            parentSessionId: s.parentSessionId || null,
-            worktreeId: s.worktreeId || null,
-            childCount: s.childCount || 0,
-            uncommittedCount: s.uncommittedCount || 0,
-            // Kanban board phase and tags from metadata JSONB
-            ...(s.phase && { phase: s.phase }),
-            ...(s.tags && { tags: s.tags }),
-            // Linked tracker item IDs from metadata JSONB
-            ...(s.linkedTrackerItemIds && { linkedTrackerItemIds: s.linkedTrackerItemIds }),
-            ...(s.agentRole && { agentRole: s.agentRole }),
-            ...(s.createdBySessionId !== undefined && { createdBySessionId: s.createdBySessionId }),
-          });
+          registry.set(s.id, sessionListMetadata(s, workspacePath));
 
           // Initialize unread state from database metadata (for cross-device sync)
           if (s.hasUnread) {
@@ -2217,11 +2252,12 @@ export const refreshSessionListAtom = atom(
         }
 
         set(sessionRegistryAtom, registry);
+        set(sessionLaunchCountsAtom, result.launchedSessionCounts ?? {});
       }
     } catch (error) {
       console.error('[sessions] Failed to refresh session list:', error);
     } finally {
-      set(sessionListLoadingAtom, false);
+      if (refreshVersion === sessionListRefreshVersion) set(sessionListLoadingAtom, false);
     }
   }
 );
@@ -2251,6 +2287,7 @@ export async function initSessionList(workspacePath: string): Promise<void> {
   }
 
   lastInitWorkspacePath = workspacePath;
+  if (store.get(sessionListWorkspaceAtom) !== workspacePath) store.set(sessionLaunchCountsAtom, {});
   store.set(sessionListWorkspaceAtom, workspacePath);
 
   // Trigger initial load and track the promise

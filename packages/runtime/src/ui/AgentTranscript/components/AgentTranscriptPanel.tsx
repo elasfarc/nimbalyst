@@ -1,7 +1,9 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import type { SessionData } from '../../../ai/server/types';
+import type { ToolCallDiffLoadResult } from '../../../ai/server/transcript';
 import type { TranscriptSettings, PromptMarker, FileEditSummary } from '../types';
 import { RichTranscriptView } from './RichTranscriptView';
+import type { TranscriptFileLocation } from './MarkdownRenderer';
 import { TranscriptSidebar } from './TranscriptSidebar';
 import { FileEditsSidebar } from './FileEditsSidebar';
 import { FloatingTranscriptActions } from './FloatingTranscriptActions';
@@ -44,7 +46,8 @@ interface AgentTranscriptPanelProps {
   onSettingsChange?: (settings: TranscriptSettings) => void;
   showSettings?: boolean;
   initialSettings?: TranscriptSettings;
-  onFileClick?: (filePath: string) => void;
+  /** `location` is set when the clicked link carried a `:line[:col]` suffix. */
+  onFileClick?: (filePath: string, location?: TranscriptFileLocation) => void;
   /** Optional: Navigate to a session by ID (for @@session reference links) */
   onOpenSession?: (sessionId: string) => void;
   hideSidebar?: boolean;  // Hide the prompts/files sidebar
@@ -96,7 +99,7 @@ interface AgentTranscriptPanelProps {
   /** Optional: Display name for external editor (e.g., "VS Code") */
   externalEditorName?: string;
   /** Optional: Callback to trigger /compact command */
-  onCompact?: () => void;
+  onCompact?: () => void | Promise<void>;
   /** Optional: Prompt additions for debugging (system prompt, user message, and attachments) */
   promptAdditions?: {
     systemPromptAddition: string | null;
@@ -111,6 +114,8 @@ interface AgentTranscriptPanelProps {
   renderEmbeddedFile?: (params: { filePath: string; defaultExpanded?: boolean }) => React.ReactNode;
   /** Optional: Predicate identifying files the host will render via renderEmbeddedFile */
   canEmbedFile?: (filePath: string) => boolean;
+  /** Host callback for lazy, workspace-scoped history diff hydration. */
+  loadToolCallDiffs?: (toolCallItemId: string, toolCallTimestamp?: number) => Promise<ToolCallDiffLoadResult>;
   /** Optional: merged teammate/worker statuses to drive transcript status UI */
   currentTeammates?: Array<{ agentId: string; status: 'running' | 'completed' | 'errored' | 'idle' }>;
   /** Optional: noun used in waiting text when teammates/workers are still running */
@@ -163,6 +168,7 @@ const AgentTranscriptPanelComponent = React.forwardRef<
   appStartTime,
   renderEmbeddedFile,
   canEmbedFile,
+  loadToolCallDiffs,
   currentTeammates,
   waitingForNoun,
   currentPhase,
@@ -332,6 +338,7 @@ const AgentTranscriptPanelComponent = React.forwardRef<
           appStartTime={appStartTime}
           renderEmbeddedFile={renderEmbeddedFile}
           canEmbedFile={canEmbedFile}
+          loadToolCallDiffs={loadToolCallDiffs}
           onSearchBarVisibilityChange={setSearchBarVisible}
         />
 

@@ -22,6 +22,7 @@ function fakeHandle(state: CollabEditorState): CollabEditorHandle {
     flush: vi.fn(async (): Promise<CollabEditorFlushResult> => ({ status: 'acknowledged' })),
     setPresenceActive: vi.fn(),
     setReadOnly: vi.fn(),
+    refreshCommentAccess: vi.fn(),
     markClean: vi.fn(),
     focus: vi.fn(),
     insertText: vi.fn(),

@@ -11,10 +11,19 @@
  * Callers: every place that opens or resolves an interactive prompt
  * (AskUserQuestion, ExitPlanMode, ToolPermission, GitCommitProposal,
  * RequestUserInput / PromptForUserInput).
+ *
+ * This also notifies `TrayManager`, so the menu bar can never disagree with the
+ * sidebar about whether a session is blocked. It used to be a second call every
+ * callsite had to remember, and the MCP AskUserQuestion path made neither call
+ * for SDK sessions -- a session waiting on a question showed as "Running" in the
+ * menu bar panel. Notify here and there is nothing left to forget.
  */
 
 import { AISessionsRepository } from '@nimbalyst/runtime';
 import { getSyncProvider } from '../SyncManager';
+import { requestMobilePush } from './mobilePushRequest';
+import { TrayManager } from '../../tray/TrayManager';
+import type { PromptKind } from '../../tray/fleetSnapshot';
 import { logger } from '../../utils/logger';
 
 /** A tool-permission prompt, with everything a remote device needs to answer it. */
@@ -116,12 +125,33 @@ export function resetPendingPromptTracking(): void {
   sessionsWithPendingPrompt.clear();
 }
 
+/**
+ * `kind` is what the prompt is asking for: `approval` for a tool permission or
+ * commit proposal (a tap), `decision` for a question, a plan, or a structured
+ * input (thinking required). The menu bar strip colours its dot by it -- a
+ * session title does not tell you whether responding costs three seconds or ten
+ * minutes, and this does. Every callsite knows which it is opening; the default
+ * exists only for the clear path, where it is unused.
+ */
 export async function setSessionPendingPrompt(
   sessionId: string,
   hasPendingPrompt: boolean,
+  kind: PromptKind = 'approval',
   promptData?: SyncedPendingPromptData | null,
 ): Promise<void> {
   if (!sessionId) return;
+
+  // A prompt that is already open must not push again -- repeated sets would
+  // burn the server's forced-push budget on a single blocked session.
+  const wasAlreadyPending = sessionsWithPendingPrompt.has(sessionId);
+
+  // Before the awaits: the tray is in-memory, so a slow or failed row update
+  // must not leave the menu bar showing a blocked session as merely running.
+  if (hasPendingPrompt) {
+    TrayManager.getInstance().onPromptCreated(sessionId, kind);
+  } else {
+    TrayManager.getInstance().onPromptResolved(sessionId);
+  }
 
   try {
     await AISessionsRepository.updateMetadata(sessionId, {
@@ -156,6 +186,35 @@ export async function setSessionPendingPrompt(
   } catch (err) {
     logger.main.warn(
       `[pendingPromptPersistence] Failed to push hasPendingPrompt sync change for session ${sessionId}:`,
+      err,
+    );
+  }
+
+  if (hasPendingPrompt && !wasAlreadyPending) {
+    void notifyMobileOfBlockedSession(sessionId);
+  }
+}
+
+/**
+ * Page the user's phone when a session blocks on a human answer.
+ *
+ * Forced (#1268): a blocked agent is the case where "notify me even though I
+ * appear to be at my desk" is the whole point, so the server's presence
+ * suppression is deliberately bypassed and the decision is left to its
+ * targeting rules. Never gate this on local presence -- doing so stops the
+ * `force` flag from ever reaching the server.
+ */
+async function notifyMobileOfBlockedSession(sessionId: string): Promise<void> {
+  try {
+    const session = await AISessionsRepository.get(sessionId);
+    const title = session?.title || 'AI Session';
+    await requestMobilePush(sessionId, title, 'Waiting for your response', {
+      force: true,
+      reason: 'awaiting_human',
+    });
+  } catch (err) {
+    logger.main.warn(
+      `[pendingPromptPersistence] Failed to request mobile push for blocked session ${sessionId}:`,
       err,
     );
   }

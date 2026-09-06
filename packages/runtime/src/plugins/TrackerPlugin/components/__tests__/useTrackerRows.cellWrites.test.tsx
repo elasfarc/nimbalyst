@@ -81,7 +81,8 @@ describe('useTrackerRows cell writes', () => {
     expect(updateTrackerItem).toHaveBeenCalledWith({
       itemId: 'item-1',
       updates: { points: 8 },
-      syncMode: 'local',
+      sharing: 'personal',
+      draftByDefault: false,
     });
 
     await act(async () => {
@@ -90,7 +91,8 @@ describe('useTrackerRows cell writes', () => {
     expect(updateTrackerItem).toHaveBeenLastCalledWith({
       itemId: 'item-1',
       updates: { labels: ['ui', 'sync'] },
-      syncMode: 'local',
+      sharing: 'personal',
+      draftByDefault: false,
     });
 
     await act(async () => {
@@ -99,7 +101,8 @@ describe('useTrackerRows cell writes', () => {
     expect(updateTrackerItem).toHaveBeenLastCalledWith({
       itemId: 'item-1',
       updates: { done: false },
-      syncMode: 'local',
+      sharing: 'personal',
+      draftByDefault: false,
     });
   });
 
@@ -119,7 +122,8 @@ describe('useTrackerRows cell writes', () => {
     expect(updateTrackerItem).toHaveBeenCalledWith({
       itemId: 'item-1',
       updates: { title: 'Renamed', points: 3 },
-      syncMode: 'local',
+      sharing: 'personal',
+      draftByDefault: false,
     });
   });
 
@@ -141,7 +145,11 @@ describe('useTrackerRows cell writes', () => {
   it('applies a bulk field update across every selected item', async () => {
     registerCustomType();
     const updateTrackerItem = vi.fn().mockResolvedValue({ success: true });
-    (window as any).electronAPI = { documentService: { updateTrackerItem } };
+    const updateTrackerItems = vi.fn(async ({ entries }: { entries: Array<{ itemId: string }> }) => ({
+      success: true,
+      results: entries.map(entry => ({ itemId: entry.itemId, success: true })),
+    }));
+    (window as any).electronAPI = { documentService: { updateTrackerItem, updateTrackerItems } };
 
     const items = [makeRecord('item-1'), makeRecord('item-2'), makeRecord('item-3')];
     const { result } = renderHook(() => useTrackerRows({ items, activeTypeFilter: customType }));
@@ -150,11 +158,34 @@ describe('useTrackerRows cell writes', () => {
       await result.current.handleBulkFieldUpdate(items, 'labels', ['triage']);
     });
 
-    expect(updateTrackerItem).toHaveBeenCalledTimes(3);
-    expect(updateTrackerItem.mock.calls.map(c => c[0].itemId).sort()).toEqual(['item-1', 'item-2', 'item-3']);
-    for (const call of updateTrackerItem.mock.calls) {
-      expect(call[0].updates).toEqual({ labels: ['triage'] });
-    }
+    expect(updateTrackerItems).toHaveBeenCalledTimes(1);
+    expect(updateTrackerItems).toHaveBeenCalledWith({
+      entries: [
+        expect.objectContaining({ itemId: 'item-1', storeUpdates: { labels: ['triage'] } }),
+        expect.objectContaining({ itemId: 'item-2', storeUpdates: { labels: ['triage'] } }),
+        expect.objectContaining({ itemId: 'item-3', storeUpdates: { labels: ['triage'] } }),
+      ],
+    });
+    expect(updateTrackerItem).not.toHaveBeenCalled();
+  });
+
+  it('chunks bulk field updates at the 100-entry contract limit', async () => {
+    registerCustomType();
+    const updateTrackerItems = vi.fn(async ({ entries }: { entries: Array<{ itemId: string }> }) => ({
+      success: true,
+      results: entries.map(entry => ({ itemId: entry.itemId, success: true })),
+    }));
+    (window as any).electronAPI = { documentService: { updateTrackerItems } };
+
+    const items = Array.from({ length: 101 }, (_, index) => makeRecord(`item-${index + 1}`));
+    const { result } = renderHook(() => useTrackerRows({ items, activeTypeFilter: customType }));
+
+    await act(async () => {
+      await result.current.handleBulkFieldUpdate(items, 'labels', ['triage']);
+    });
+
+    expect(updateTrackerItems).toHaveBeenCalledTimes(2);
+    expect(updateTrackerItems.mock.calls.map(([call]) => call.entries.length)).toEqual([100, 1]);
   });
 
   it('routes document-backed items through the in-file write path', async () => {
@@ -235,7 +266,8 @@ describe('useTrackerRows cell writes', () => {
     expect(updateTrackerItem).toHaveBeenCalledWith({
       itemId: 'collection-1',
       updates: { members: ['a'] },
-      syncMode: 'local',
+      sharing: 'personal',
+      draftByDefault: false,
     });
   });
 
@@ -290,12 +322,14 @@ describe('useTrackerRows cell writes', () => {
     expect(updateTrackerItem).toHaveBeenCalledWith({
       itemId: 'item-1',
       updates: { labels: [{ itemId: 'old' }] },
-      syncMode: 'local',
+      sharing: 'personal',
+      draftByDefault: false,
     });
     expect(updateTrackerItem).toHaveBeenCalledWith({
       itemId: 'item-3',
       updates: { title: 'Three' },
-      syncMode: 'local',
+      sharing: 'personal',
+      draftByDefault: false,
     });
 
     // The entry is consumed whole -- a second undo has nothing left to write.
@@ -383,7 +417,8 @@ describe('useTrackerRows cell writes', () => {
     expect(updateTrackerItem).toHaveBeenCalledWith({
       itemId: 'item-1',
       updates: { points: 1 },
-      syncMode: 'local',
+      sharing: 'personal',
+      draftByDefault: false,
     });
   });
 
@@ -426,7 +461,8 @@ describe('useTrackerRows cell writes', () => {
     expect(updateTrackerItem).toHaveBeenCalledWith({
       itemId: 'item-2',
       updates: { points: 1 },
-      syncMode: 'local',
+      sharing: 'personal',
+      draftByDefault: false,
     });
 
     // A rejected write is not an applied change, however it resolves: the IPC
@@ -479,7 +515,8 @@ describe('useTrackerRows cell writes', () => {
     expect(updateTrackerItem).toHaveBeenCalledWith({
       itemId: 'item-1',
       updates: { points: 1 },
-      syncMode: 'local',
+      sharing: 'personal',
+      draftByDefault: false,
     });
   });
 });

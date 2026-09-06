@@ -20,6 +20,8 @@ import { getPersonalDocSyncConfig } from './SyncManager';
 import { timeStartupPhase } from '../utils/startupTiming';
 import { database } from '../database/PGLiteDatabaseWorker';
 import { dirtyEditorRegistry } from './DirtyEditorRegistry';
+import { getPersonalSessionJwt } from './StytchAuthService';
+import { hashProjectFiles } from './ProjectManifestHasher';
 
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
 
@@ -73,7 +75,7 @@ export class ProjectFileSyncService {
     this.provider = new ProjectSyncProvider({
       serverUrl: config.serverUrl,
       orgId: config.orgId,
-      userId: config.userId,
+      personalMemberId: config.personalMemberId,
       encryptionKey: config.encryptionKeyRaw,
       getJwt: async () => {
         // Re-fetch config each time to get fresh JWT
@@ -81,8 +83,9 @@ export class ProjectFileSyncService {
         if (!fresh) throw new Error('Sync config unavailable');
         // The config doesn't directly expose a JWT getter, so we need
         // to get it from the SyncManager's auth flow
-        const { getPersonalSessionJwt } = await import('./StytchAuthService');
-        return getPersonalSessionJwt() ?? '';
+        const jwt = getPersonalSessionJwt();
+        if (!jwt) throw new Error('Personal sync JWT unavailable');
+        return jwt;
       },
     });
 
@@ -177,14 +180,25 @@ export class ProjectFileSyncService {
       this.projectStates.set(encryptedProjectId, baseline);
     }
 
-    for (const filePath of mdFiles) {
+    // Read + sha256 every file on a worker thread. This loop used to do both
+    // inline on the main-process event loop (~22s blocked on a 1531-file
+    // project, every startup and every reconnect). Only digests come back, so
+    // file contents never cross the thread boundary.
+    const hashed = await hashProjectFiles(mdFiles);
+
+    for (const entry of hashed) {
+      const filePath = entry.filePath;
       try {
+        if (entry.error || !entry.contentHash || entry.lastModifiedAt == null) {
+          // Same outcome as the previous per-file try/catch: log and skip, so a
+          // single unreadable file never truncates the manifest.
+          logger.main.error(`[ProjectFileSync] Failed to process ${filePath}: ${entry.error ?? 'no hash'}`);
+          continue;
+        }
         const relativePath = path.relative(workspacePath, filePath);
         const syncId = this.syncIdFromPath(relativePath);
-        const content = await fs.readFile(filePath, 'utf-8');
-        const stat = await fs.stat(filePath);
-        const contentHash = this.sha256(content);
-        const lastModifiedAt = Math.floor(stat.mtimeMs);
+        const contentHash = entry.contentHash;
+        const lastModifiedAt = entry.lastModifiedAt;
 
         manifest.push({ syncId, contentHash, lastModifiedAt, hasYjs: false, yjsSeq: 0 });
         cache.fileMap.set(syncId, filePath);
@@ -436,18 +450,40 @@ export class ProjectFileSyncService {
     logger.main.info(`[ProjectFileSync] Deferring remote delete of dirty file: ${path.basename(filePath)}`);
   }
 
-  /** Unlink a file for a remote delete and clear its baseline + file-map entry. */
-  private async applyRemoteDelete(projectId: string, syncId: string, filePath: string): Promise<void> {
-    try {
-      this.suppressFileWatcherEcho(filePath);
-      await fs.unlink(filePath);
-      logger.main.info(`[ProjectFileSync] Remote delete: ${path.basename(filePath)}`);
-    } catch {
-      // File might already be gone.
-    }
-    await this.deleteBaseline(projectId, syncId);
-    const cache = (this as any)._fileMapCache?.get(projectId) as { fileMap: Map<string, string> } | undefined;
-    cache?.fileMap.delete(syncId);
+  /**
+   * Handle a remote delete. Project sync does NOT remove local files.
+   *
+   * This used to `fs.unlink(filePath)`. A workspace is a real directory on a
+   * real disk -- frequently a git working tree -- and a tombstone in the room's
+   * state is not consent to destroy the user's copy of a file. The only guard
+   * was `dirtyEditorRegistry.isDirty()`, which protects an unsaved editor
+   * buffer and nothing else: no git check, no confirmation, no backup, and
+   * `unlink` does not go to the trash. A single stale tombstone therefore
+   * deleted the same path on every client, on every sync, indefinitely --
+   * observed as 91 extension `.md` files (including a command file added the
+   * day before) being removed four times in two days, each time restored from
+   * git and each time deleted again on the next sync burst.
+   *
+   * See `.claude/rules/destructive-data-paths.md`: a destructive path must
+   * verify the damage is real, ask, and leave a recoverable artifact. None of
+   * that was true here, so the delete does not happen at all.
+   *
+   * Consequence, deliberately chosen: a file genuinely deleted on another
+   * device stays on disk here and is re-offered to the server on the next
+   * manifest sweep. Resurrecting a file is recoverable; deleting one is not.
+   */
+  private async applyRemoteDelete(_projectId: string, _syncId: string, filePath: string): Promise<void> {
+    // Keep the baseline and file-map entry: the file is still on disk, so the
+    // conflict guard must keep working and the next sweep must still see it.
+    logger.main.warn(
+      `[ProjectFileSync] Ignoring remote delete for ${path.relative(this.workspacePathFor(_projectId) ?? '', filePath) || path.basename(filePath)} -- project sync does not remove local files`,
+    );
+  }
+
+  /** Workspace root for a project, if the file-map cache knows it. */
+  private workspacePathFor(projectId: string): string | undefined {
+    const cache = (this as any)._fileMapCache?.get(projectId) as { workspacePath: string } | undefined;
+    return cache?.workspacePath;
   }
 
   /**

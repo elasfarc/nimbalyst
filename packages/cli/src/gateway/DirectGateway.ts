@@ -3,13 +3,22 @@
  * directly. Safe to run while the app is live because WAL lets a second process
  * read committed snapshots; we never take a write lock in this gateway.
  *
- * Row -> record conversion goes through the vendored `dbRowToRecord` so a
+ * Row -> record conversion goes through tracker-core's `dbRowToRecord` so a
  * CLI-read row is shaped identically to an app-read one.
  */
 import type { Database as DB } from 'better-sqlite3';
 import * as fs from 'fs';
+import {
+  computeReadinessForItems,
+  createTrackerCoreContext,
+  dbRowToRecord,
+  isLocalKeyReference,
+  READINESS_FILTER_FIELD,
+  type Readiness,
+  type TrackerRecord,
+  type TrackerTypeModel,
+} from '@nimbalyst/tracker-core';
 import { openDatabase } from '../db/openDatabase.js';
-import { dbRowToRecord, type TrackerRecord } from '../vendor/trackerRecord.js';
 import {
   appendActivity,
   buildComment,
@@ -17,7 +26,7 @@ import {
   humanOnlyStatusMessage,
   isHumanOnlyStatus,
   newTrackerId,
-} from '../vendor/trackerWrite.js';
+} from './trackerWrite.js';
 import { resolveSqlitePath, resolveDefaultSqlitePath, resolveAppSettingsPath } from '../config/paths.js';
 import {
   connectionError,
@@ -25,6 +34,7 @@ import {
   schemaError,
   writeNotPermittedError,
 } from '../cli/exitCodes.js';
+import { getTrackerDisplayRef, issueKeyStatus } from '../cli/output.js';
 import { discoverEndpoint } from './endpoint.js';
 import {
   MIN_SUPPORTED_SCHEMA,
@@ -40,7 +50,6 @@ import type {
   TrackerTypeSummary,
   UpdateInput,
 } from './types.js';
-import { deriveIssueKeyPrefix, LOCAL_ISSUE_KEY_PREFIX } from './issueKeyPrefix.js';
 
 const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 250;
@@ -143,14 +152,17 @@ export class DirectGateway implements TrackerGateway {
   async listTrackers(filters: ListFilters): Promise<TrackerRecord[]> {
     if (filters.inbox) {
       // "Untriaged" is defined against each type's initial status and default
-      // priority, and the CLI deliberately does not load tracker schemas (see
-      // src/vendor/trackerReleases.ts). Answering from SQL alone would give a
-      // queue that disagrees with the one the app shows, which is worse than
-      // not answering.
+      // priority. `loadTypeDefs` only sees schemas the app has already
+      // materialized into the local database, so a workspace the app has never
+      // opened has none, and answering from SQL alone would give a queue that
+      // disagrees with the one the app shows -- worse than not answering.
       throw connectionError(
         '--inbox needs the running Nimbalyst app: the triage predicate reads each type\'s schema. ' +
           'Start Nimbalyst, or drop --inbox to list without it.',
       );
+    }
+    if (filters.where?.some((clause) => clause.field === READINESS_FILTER_FIELD)) {
+      return this.listTrackersWithReadiness(filters);
     }
     const where: string[] = ['workspace = @workspace', 'deleted_at IS NULL'];
     const params: Record<string, unknown> = { workspace: filters.workspace };
@@ -253,27 +265,59 @@ export class DirectGateway implements TrackerGateway {
     return rows.map(dbRowToRecord);
   }
 
-  async getTracker(workspace: string, reference: string): Promise<TrackerRecord | null> {
-    const row = this.db
-      .prepare(
-        `SELECT * FROM tracker_items
-         WHERE (id = @ref OR issue_key = @ref) AND workspace = @ws AND deleted_at IS NULL
-         ORDER BY updated DESC LIMIT 1`,
-      )
-      .get({ ref: reference, ws: workspace }) as any;
-    if (!row) {
-      // Fall back to a workspace-agnostic lookup so `nim tracker get BUG-1`
-      // works even when workspace resolution picked a sibling.
-      const any = this.db
-        .prepare(
-          `SELECT * FROM tracker_items
-           WHERE (id = @ref OR issue_key = @ref) AND deleted_at IS NULL
-           ORDER BY updated DESC LIMIT 1`,
-        )
-        .get({ ref: reference }) as any;
-      return any ? dbRowToRecord(any) : null;
+  private listTrackersWithReadiness(filters: ListFilters): TrackerRecord[] {
+    const dateCol = filters.dateField === 'created' ? 'created' : 'updated';
+    const rows = this.db.prepare(
+      `SELECT ti.*, td.model AS __readiness_type_model
+       FROM tracker_items AS ti
+       LEFT JOIN tracker_type_defs AS td
+         ON td.workspace = ti.workspace AND td.type = ti.type AND td.deleted_at IS NULL
+       WHERE ti.workspace = @workspace AND ti.deleted_at IS NULL
+       ORDER BY ti.${dateCol} DESC`,
+    ).all({ workspace: filters.workspace }) as Array<Record<string, unknown>>;
+
+    const typeModels = readReadinessTypeModels(rows);
+    const modeledTypes = new Set(typeModels.map((model) => model.type));
+    const missingTypes = [...new Set(
+      rows.map((row) => String(row.type ?? '')).filter((type) => type && !modeledTypes.has(type)),
+    )].sort();
+    if (missingTypes.length > 0) {
+      throw schemaError(
+        `Cannot compute readiness because these tracker types have no materialized schema: ` +
+          `${missingTypes.join(', ')}. Open this workspace in Nimbalyst once to materialize them.`,
+      );
     }
-    return dbRowToRecord(row);
+    const modelsByType = new Map(typeModels.map((model) => [model.type, model]));
+    const trackerContext = createTrackerCoreContext((type) => modelsByType.get(type));
+    const records = rows.map((row) => dbRowToRecord(row as any));
+    const readiness = computeReadinessForItems(trackerContext, records, {
+      getId: (record) => record.id,
+      getType: (record) => record.primaryType,
+      getStatus: (record) => {
+        const model = trackerContext.getTypeModel(record.primaryType);
+        const fieldName = model?.roles?.workflowStatus ?? 'status';
+        return String(record.fields[fieldName] ?? '');
+      },
+      getTitle: (record) => {
+        const model = trackerContext.getTypeModel(record.primaryType);
+        const fieldName = model?.roles?.title ?? 'title';
+        const title = record.fields[fieldName];
+        return typeof title === 'string' ? title : undefined;
+      },
+      getFieldValue: (record, fieldName) => record.fields[fieldName],
+      getReference: (record) => ({
+        ref: getTrackerDisplayRef(record),
+        refStatus: issueKeyStatus(record),
+      }),
+    });
+
+    return applyInMemoryListFilters(records, filters, readiness)
+      .slice(0, resolveLimit(filters.limit));
+  }
+
+  async getTracker(workspace: string, reference: string): Promise<TrackerRecord | null> {
+    const row = this.findRow(this.db, workspace, reference);
+    return row ? dbRowToRecord(row) : null;
   }
 
   async getTrackerByUrn(workspace: string, urn: string): Promise<TrackerRecord | null> {
@@ -395,8 +439,30 @@ export class DirectGateway implements TrackerGateway {
     }
   }
 
-  /** Resolve a row by id or issue key, workspace-first then workspace-agnostic. */
+  /**
+   * Resolve a row by id, issue key, or this machine's local number.
+   *
+   * A dotted local number resolves **only** inside the named workspace, and
+   * deliberately does not fall through to the workspace-agnostic lookup below:
+   * `NIM.4` means a different item in every project on the machine, so a
+   * cross-workspace match would confidently return the wrong one. That is the
+   * whole reason the dotted form is distinguishable from `NIM-4` at all.
+   *
+   * The workspace-agnostic fallback stays for ids and room keys, so
+   * `nim tracker get BUG-1` still works when workspace resolution picked a
+   * sibling directory.
+   */
   private findRow(db: DB, workspace: string, reference: string): any {
+    if (isLocalKeyReference(reference)) {
+      return db
+        .prepare(
+          `SELECT * FROM tracker_items
+           WHERE local_key = @ref AND workspace = @ws AND deleted_at IS NULL
+           ORDER BY updated DESC LIMIT 1`,
+        )
+        .get({ ref: reference.trim().toUpperCase(), ws: workspace });
+    }
+
     const inWs = db
       .prepare(
         `SELECT * FROM tracker_items
@@ -412,26 +478,6 @@ export class DirectGateway implements TrackerGateway {
          ORDER BY updated DESC LIMIT 1`,
       )
       .get({ ref: reference });
-  }
-
-  /** Derive the prefix from an existing key, else from the project name. */
-  private issueKeyPrefix(db: DB, workspace: string): string {
-    try {
-      const row = db
-        .prepare(
-          `SELECT issue_key FROM tracker_items
-           WHERE workspace = ? AND issue_key IS NOT NULL AND issue_key != ''
-           ORDER BY issue_number DESC LIMIT 1`,
-        )
-        .get(workspace) as { issue_key: string } | undefined;
-      if (row?.issue_key) {
-        const idx = row.issue_key.lastIndexOf('-');
-        if (idx > 0) return row.issue_key.slice(0, idx);
-      }
-    } catch {
-      /* fall through to default */
-    }
-    return deriveIssueKeyPrefix(workspace);
   }
 
   /** Mark a row pending iff it is already part of the sync set. Local-only items
@@ -517,11 +563,17 @@ export class DirectGateway implements TrackerGateway {
     const titleField = rf('title', 'title');
     const statusField = rf('workflowStatus', 'status');
     const priorityField = rf('priority', 'priority');
+    const model = this.loadTypeDefs(workspace).get(input.type);
+    const statusDefinition = model?.fields?.find((field: any) => field.name === statusField);
+    const defaultStatus =
+      typeof statusDefinition?.default === 'string' && statusDefinition.default
+        ? statusDefinition.default
+        : 'to-do';
     this.assertNotHumanOnlyStatus(statusField, input);
 
     const data: Record<string, any> = {
       [titleField]: input.title,
-      [statusField]: input.status || 'to-do',
+      [statusField]: input.status || defaultStatus,
       [priorityField]: input.priority || 'medium',
       created: createdDate,
       authorIdentity: identity,
@@ -539,6 +591,16 @@ export class DirectGateway implements TrackerGateway {
         if (v !== undefined) data[k] = v;
       }
     }
+    for (const field of model?.fields ?? []) {
+      if (
+        field.required
+        && field.type === 'string'
+        && field.displayInline === false
+        && data[field.name] === undefined
+      ) {
+        data[field.name] = id;
+      }
+    }
     appendActivity(data, identity, 'created');
 
     const typeTags: string[] = [input.type];
@@ -550,11 +612,11 @@ export class DirectGateway implements TrackerGateway {
     this.txn((db) => {
       db.prepare(
         `INSERT INTO tracker_items (
-          id, type, type_tags, data, workspace, document_path, line_number,
+          id, issue_number, issue_key, type, type_tags, data, workspace, document_path, line_number,
           created, updated, last_indexed, sync_status, content, archived,
           source, source_ref, body_version
         ) VALUES (
-          @id, @type, @typeTags, @data, @workspace, '', NULL,
+          @id, NULL, NULL, @type, @typeTags, @data, @workspace, '', NULL,
           @created, @updated, @lastIndexed, 'local', @content, 0,
           'native', NULL, @bodyVersion
         )`,
@@ -570,51 +632,6 @@ export class DirectGateway implements TrackerGateway {
         content: contentJson,
         bodyVersion,
       });
-
-      // Assign an issue key. In a workspace a tracker room owns, only the room
-      // may allocate a real issue number -- the CLI's rows drain through the
-      // app's sync_id-IS-NULL backfill, so a locally minted NIM key here would
-      // land in the room as a guess and diverge from what other members see.
-      // Those rows get a provisional LC-### key instead, which the ack
-      // replaces.
-      const roomOwned = db
-        .prepare(
-          `SELECT 1 FROM tracker_items
-           WHERE workspace = ? AND (sync_status = 'synced' OR sync_id IS NOT NULL)
-           LIMIT 1`,
-        )
-        .get(workspace) !== undefined;
-
-      if (roomOwned) {
-        const localRows = db
-          .prepare(
-            `SELECT issue_key AS k FROM tracker_items
-             WHERE workspace = ? AND issue_key LIKE '${LOCAL_ISSUE_KEY_PREFIX}-%'`,
-          )
-          .all(workspace) as { k: string }[];
-        let maxLocal = 0;
-        for (const row of localRows) {
-          const suffix = Number(row.k.slice(LOCAL_ISSUE_KEY_PREFIX.length + 1));
-          if (Number.isSafeInteger(suffix) && suffix > maxLocal) maxLocal = suffix;
-        }
-        db.prepare(`UPDATE tracker_items SET issue_key = ? WHERE id = ?`).run(
-          `${LOCAL_ISSUE_KEY_PREFIX}-${maxLocal + 1}`,
-          id,
-        );
-      } else {
-        // Solo workspace: no counterparty to disagree with. NULL issue_number
-        // on the new row is ignored by MAX, so this picks the next number.
-        const prefix = this.issueKeyPrefix(db, workspace);
-        const maxRow = db
-          .prepare(`SELECT MAX(issue_number) AS m FROM tracker_items WHERE workspace = ?`)
-          .get(workspace) as { m: number | null };
-        const nextNum = (maxRow?.m ?? 0) + 1;
-        db.prepare(`UPDATE tracker_items SET issue_number = ?, issue_key = ? WHERE id = ?`).run(
-          nextNum,
-          `${prefix}-${nextNum}`,
-          id,
-        );
-      }
 
       if (description && bodyVersion > 0) {
         db.prepare(
@@ -878,6 +895,85 @@ function resolveLimit(limit: number | undefined): number {
   if (limit === undefined) return DEFAULT_LIMIT;
   if (limit < 0) return ALL_CAP; // --all maps to a large cap by the caller
   return Math.min(limit, MAX_LIMIT);
+}
+
+function readReadinessTypeModels(
+  rows: Array<Record<string, unknown>>,
+): TrackerTypeModel[] {
+  const models = new Map<string, TrackerTypeModel>();
+  for (const row of rows) {
+    const raw = row.__readiness_type_model;
+    if (typeof raw !== 'string') continue;
+    try {
+      const model = JSON.parse(raw) as TrackerTypeModel;
+      if (model?.type) models.set(model.type, model);
+    } catch {
+      /* malformed materialized schema: status resolution stays conservative */
+    }
+  }
+  return [...models.values()];
+}
+
+function applyInMemoryListFilters(
+  records: TrackerRecord[],
+  filters: ListFilters,
+  readiness: ReadonlyMap<string, Readiness>,
+): TrackerRecord[] {
+  const dateField = filters.dateField === 'created' ? 'createdAt' : 'updatedAt';
+  return records.filter((record) => {
+    if (!filters.includeArchived && record.archived) return false;
+    if (filters.type && record.primaryType !== filters.type) return false;
+    if (filters.typeTag && !record.typeTags.includes(filters.typeTag)) return false;
+
+    const status = String(record.fields.status ?? '');
+    if (filters.status) {
+      if (isMetaStatus(filters.status)) {
+        const terminal = TERMINAL_STATUSES.has(status.toLowerCase());
+        if (filters.status === 'closed' ? !terminal : terminal) return false;
+      } else if (status !== filters.status) {
+        return false;
+      }
+    }
+
+    if (filters.priority && record.fields.priority !== filters.priority) return false;
+    if (filters.owner && record.fields.owner !== filters.owner) return false;
+    if (filters.search) {
+      const needle = filters.search.toLowerCase();
+      const title = String(record.fields.title ?? '').toLowerCase();
+      const description = String(record.fields.description ?? '').toLowerCase();
+      if (!title.includes(needle) && !description.includes(needle)) return false;
+    }
+    if (filters.since && (record.system[dateField] ?? '') < filters.since) return false;
+    if (filters.until && (record.system[dateField] ?? '') > filters.until) return false;
+
+    return (filters.where ?? []).every((clause) => {
+      const value = clause.field === READINESS_FILTER_FIELD
+        ? readiness.get(record.id)?.state
+        : record.fields[clause.field];
+      return matchesWhereClause(value, clause.op, clause.value);
+    });
+  });
+}
+
+function matchesWhereClause(
+  actual: unknown,
+  op: '=' | '!=' | '~' | 'in',
+  expected: string,
+): boolean {
+  const value = actual == null
+    ? ''
+    : typeof actual === 'string' ? actual : JSON.stringify(actual);
+  switch (op) {
+    case '=':
+      return value === expected;
+    case '!=':
+      return value !== expected;
+    case '~':
+      return value.toLowerCase().includes(expected.toLowerCase());
+    case 'in':
+      return expected.split(',').map((entry) => entry.trim()).includes(value);
+  }
+  return false;
 }
 
 /** SQLite json paths can't contain a literal single quote; field names are

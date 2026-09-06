@@ -313,8 +313,8 @@ public struct SessionDetailView: View {
             // character.
             guard !isApplyingRemoteDraft else { return }
             draftDebounceItem?.cancel()
-            let item = DispatchWorkItem { [weak appState] in
-                appState?.syncManager?.updateDraftInput(
+            let item = DispatchWorkItem {
+                appState.syncManager?.updateDraftInput(
                     sessionId: session.id,
                     draftInput: newText
                 )
@@ -1001,7 +1001,7 @@ public struct SessionDetailView: View {
             relativePath = String(filePath.dropFirst(projectId.count + 1))
         } else {
             logger.warning("handleOpenFile: path doesn't match project. filePath=\(filePath), projectId=\(projectId)")
-            withAnimation { fileNotAvailableToast = "This file is on your Mac and not available on this device" }
+            withAnimation { fileNotAvailableToast = "This file is on your computer and not available on this device" }
             return
         }
 

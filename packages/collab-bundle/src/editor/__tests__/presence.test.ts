@@ -9,6 +9,8 @@ import {
   resolveCollabEditorUser,
 } from '../presence';
 import { asTeamMemberId } from '@nimbalyst/runtime/auth/jwtScopes';
+import { createExtensionAwarenessBridge } from '@nimbalyst/runtime/sync/extensionAwarenessBridge';
+import type { Awareness } from 'y-protocols/awareness';
 
 class FakeAwarenessSurface {
   readonly document = new Y.Doc();
@@ -173,5 +175,106 @@ describe('collaboration presence surface', () => {
       displayName: 'Desktop Member',
     }]);
     surface.destroy();
+  });
+});
+
+/**
+ * The browser host stacks `CollabPresenceSurface` on top of the shared
+ * extension awareness bridge; the desktop host uses the bridge alone. This
+ * covers the claim in `extensionAwarenessBridge.ts`'s header -- that the full
+ * y-protocols local state travels as-is -- across that asymmetry, in both
+ * directions, for keys neither host knows about.
+ */
+describe('cross-host extension awareness', () => {
+  /** Relays a whole-roster broadcast the way DocumentRoom does, JSON and all. */
+  class FakeRoom {
+    private readonly members = new Map<string, FakeRoomMember>();
+
+    join(userId: string, member: FakeRoomMember): void {
+      this.members.set(userId, member);
+    }
+
+    publish(fromUserId: string, state: AwarenessState): void {
+      const wire = JSON.parse(JSON.stringify(state)) as AwarenessState;
+      for (const [userId, member] of this.members) {
+        if (userId !== fromUserId) member.receive(fromUserId, wire);
+      }
+    }
+  }
+
+  class FakeRoomMember {
+    readonly doc = new Y.Doc();
+    private readonly remote = new Map<string, AwarenessState>();
+    private readonly listeners = new Set<(states: Map<string, AwarenessState>) => void>();
+
+    constructor(private readonly room: FakeRoom, private readonly userId: string) {
+      room.join(userId, this);
+    }
+
+    getYDoc(): Y.Doc { return this.doc; }
+    getStatus() { return 'connected' as const; }
+    async connect(): Promise<void> {}
+    setLocalAwareness(state: AwarenessState): void { this.room.publish(this.userId, state); }
+    async sendAwareness(state: AwarenessState): Promise<void> { this.room.publish(this.userId, state); }
+
+    sendAwarenessDeparture(user: AwarenessState['user']): boolean {
+      this.room.publish(this.userId, { user, nimbalystDeparture: { version: 1 } });
+      return true;
+    }
+
+    onAwarenessChange(listener: (states: Map<string, AwarenessState>) => void): () => void {
+      this.listeners.add(listener);
+      return () => this.listeners.delete(listener);
+    }
+
+    receive(fromUserId: string, state: AwarenessState): void {
+      if (state.nimbalystDeparture?.version === 1) this.remote.delete(fromUserId);
+      else this.remote.set(fromUserId, state);
+      for (const listener of this.listeners) listener(new Map(this.remote));
+    }
+  }
+
+  function remoteStates(bridge: { awareness: Awareness }): Array<Record<string, unknown>> {
+    const { awareness } = bridge;
+    return [...awareness.getStates()]
+      .filter(([clientId]) => clientId !== awareness.clientID)
+      .map(([, state]) => state as Record<string, unknown>);
+  }
+
+  it('carries editor-private awareness keys in both directions', () => {
+    const room = new FakeRoom();
+
+    const desktopTransport = new FakeRoomMember(room, 'desktop-user');
+    const desktop = createExtensionAwarenessBridge({
+      syncProvider: desktopTransport,
+      yDoc: desktopTransport.getYDoc(),
+      user: { id: 'desktop-user', name: 'Desktop User', color: '#3A8FD6' },
+    });
+
+    const browserTransport = new FakeRoomMember(room, 'browser-user');
+    const browserPresence = new CollabPresenceSurface(browserTransport);
+    const browser = createExtensionAwarenessBridge({
+      syncProvider: browserPresence,
+      yDoc: browserTransport.getYDoc(),
+      user: { id: 'browser-user', name: 'Browser User', color: '#E05555' },
+    });
+
+    browser.awareness.setLocalStateField('selectedCell', { row: 2, col: 1 });
+    browser.awareness.setLocalStateField('editingCell', { row: 2, col: 1 });
+    desktop.awareness.setLocalStateField('tool', 'lasso');
+
+    expect(remoteStates(desktop)[0]).toMatchObject({
+      user: { id: 'browser-user', name: 'Browser User' },
+      selectedCell: { row: 2, col: 1 },
+      editingCell: { row: 2, col: 1 },
+    });
+    expect(remoteStates(browser)[0]).toMatchObject({
+      user: { id: 'desktop-user' },
+      tool: 'lasso',
+    });
+
+    browserPresence.destroy();
+    browser.destroy();
+    desktop.destroy();
   });
 });

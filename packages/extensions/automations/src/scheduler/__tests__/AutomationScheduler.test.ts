@@ -271,6 +271,61 @@ describe('AutomationScheduler timer firing', () => {
     scheduler.dispose();
   });
 
+  it('stops firing when disabled mid-run, even though the rescan clear lands while the run is in flight', async () => {
+    // #1351: the fire callback awaits the whole AI session, so a rescan that
+    // observes enabled:false during that window clears an already-fired timer
+    // (a no-op) and every later rescan sees false === false. Without an enabled
+    // check on the fire path the chain re-arms itself forever, while
+    // getAutomations() — what automations.list reports — says Disabled.
+    const path = 'nimbalyst-local/automations/poller.md';
+    const fs = makeFs({
+      [path]: automationFile({ id: 'poller', scheduleYaml: '    type: interval\n    intervalMinutes: 5' }),
+    });
+    const scheduler = new AutomationScheduler(fs, makeUi());
+
+    let disabled = false;
+    const fire = vi.fn(async () => {
+      if (!disabled) {
+        disabled = true;
+        fs.files.set(path, automationFile({ id: 'poller', enabled: false, scheduleYaml: '    type: interval\n    intervalMinutes: 5' }));
+        await scheduler.rescan();
+      }
+      return { success: true as const, response: 'done', sessionId: 's1', outputFile: 'out.md' };
+    });
+    scheduler.setOnFire(fire);
+
+    await scheduler.initialize();
+    await vi.advanceTimersByTimeAsync(5 * 60 * 1000 + 2000);
+    expect(fire).toHaveBeenCalledTimes(1);
+    expect(scheduler.getAutomations()[0].status.enabled).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(30 * 60 * 1000);
+    expect(fire).toHaveBeenCalledTimes(1);
+
+    scheduler.dispose();
+  });
+
+  it('does not fire a timer armed before the file was disabled behind the scheduler\'s back', async () => {
+    // The in-memory status can be minutes stale, so the fire path re-reads the
+    // file rather than trusting it.
+    const path = 'nimbalyst-local/automations/stale.md';
+    const fs = makeFs({
+      [path]: automationFile({ id: 'stale', scheduleYaml: '    type: interval\n    intervalMinutes: 5' }),
+    });
+    const scheduler = new AutomationScheduler(fs, makeUi());
+    const fire = vi.fn(okFire);
+    scheduler.setOnFire(fire);
+
+    await scheduler.initialize();
+    // Disabled on disk only — no rescan/applyDefinition tells the scheduler.
+    fs.files.set(path, automationFile({ id: 'stale', enabled: false, scheduleYaml: '    type: interval\n    intervalMinutes: 5' }));
+
+    await vi.advanceTimersByTimeAsync(5 * 60 * 1000 + 2000);
+    expect(fire).not.toHaveBeenCalled();
+
+    scheduler.dispose();
+  });
+
   it('records a reported execution failure as an error without incrementing the successful run count', async () => {
     const path = 'nimbalyst-local/automations/failing.md';
     const fs = makeFs({
@@ -327,6 +382,80 @@ describe('AutomationScheduler timer firing', () => {
     finish({ success: true, response: 'done', sessionId: 's1', outputFile: 'out.md' });
     await Promise.all([first, second]);
     expect(parseAutomationStatus(fs.files.get(path)!)?.runCount).toBe(1);
+
+    scheduler.dispose();
+  });
+});
+
+describe('AutomationScheduler malformed schedule handling', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  // #1374: a hand-written `days: mon` (scalar, not a sequence) used to reach
+  // calculateNextWeekly as a string, pass the `length === 0` guard, and throw on
+  // `.map`. The throw landed three times — in executeAutomation, again inside
+  // recordFailure, and finally in the unguarded timer callback as an unhandled
+  // rejection — leaving nextRun frozen so every later launch re-fired the same
+  // overdue occurrence and the automation never ran again.
+  it('coerces a scalar days value, runs the overdue occurrence, and rewrites the file as a list', async () => {
+    const path = 'nimbalyst-local/automations/weekly.md';
+    const pastNextRun = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+    const fs = makeFs({
+      [path]: automationFile({
+        id: 'weekly',
+        scheduleYaml: '    type: weekly\n    days: mon\n    time: "06:00"',
+        nextRun: pastNextRun,
+      }),
+    });
+    const scheduler = new AutomationScheduler(fs, makeUi());
+    const fire = vi.fn(okFire);
+    scheduler.setOnFire(fire);
+
+    await scheduler.initialize();
+    await vi.advanceTimersByTimeAsync(2000);
+
+    expect(fire).toHaveBeenCalledTimes(1);
+
+    const status = parseAutomationStatus(fs.files.get(path)!);
+    // Self-healed on disk, so the next launch reads a well-formed sequence.
+    expect(status?.schedule).toMatchObject({ type: 'weekly', days: ['mon'] });
+    // The occurrence was claimed: nextRun moved into the future, so a restart
+    // does not replay it.
+    expect(Date.parse(status!.nextRun!)).toBeGreaterThan(Date.now());
+    expect(status?.runCount).toBe(1);
+
+    scheduler.dispose();
+  });
+
+  it('reports a weekly schedule with no usable days instead of arming a timer', async () => {
+    const path = 'nimbalyst-local/automations/broken.md';
+    const fs = makeFs({
+      [path]: automationFile({
+        id: 'broken',
+        scheduleYaml: '    type: weekly\n    days: [someday]\n    time: "06:00"',
+        nextRun: new Date(Date.now() - 5 * 60 * 1000).toISOString(),
+      }),
+    });
+    const ui = makeUi();
+    const scheduler = new AutomationScheduler(fs, ui);
+    const fire = vi.fn(okFire);
+    scheduler.setOnFire(fire);
+
+    await scheduler.initialize();
+    await vi.advanceTimersByTimeAsync(2000);
+
+    expect(fire).not.toHaveBeenCalled();
+    expect(ui.showError).toHaveBeenCalledTimes(1);
+    expect(ui.showError.mock.calls[0][0]).toContain('broken.md');
+
+    // Repeated scans must not re-nag about the same unchanged file.
+    await scheduler.rescan();
+    expect(ui.showError).toHaveBeenCalledTimes(1);
 
     scheduler.dispose();
   });

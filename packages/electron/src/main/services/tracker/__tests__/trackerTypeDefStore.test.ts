@@ -1,3 +1,5 @@
+// @vitest-environment node
+
 /**
  * NIM-856: the DB materialization of tracker type definitions is the local
  * source of truth for custom schemas (what the `nim` CLI and a future schema-
@@ -332,12 +334,33 @@ describe('trackerTypeDefStore materialization lifecycle (SQLite, migration 0012)
       expect(JSON.parse(all[0].model)).toEqual(shared);
       expect(all[0].source).toBe('sync');
       expect(all[0].sync_id).toBe(14);
+      expect(all[0].synced_model).toBeNull();
+      expect(all[0].sync_status).toBe('synced');
     });
 
     it('does not queue a stale YAML load for push', async () => {
       await applyRemoteTrackerSchemaDef(WS, def('bug', shared, 14), db);
       await materializeYamlTrackerTypeDef(WS, staleYaml, db);
 
+      expect(await listUnsyncedTrackerSchemaDefs(WS, db)).toEqual([]);
+    });
+
+    it('a personal YAML model clears obsolete team ownership during migration', async () => {
+      await applyRemoteTrackerSchemaDef(WS, def('bug', shared, 14), db);
+      const personal = model('bug', {
+        displayName: 'Personal bugs',
+        sharing: 'personal',
+        draftByDefault: false,
+      });
+
+      await materializeYamlTrackerTypeDef(WS, personal, db);
+
+      const all = await rows();
+      expect(JSON.parse(all[0].model)).toEqual(personal);
+      expect(all[0].source).toBe('yaml');
+      expect(all[0].sync_status).toBe('local');
+      expect(all[0].sync_id).toBeNull();
+      expect(all[0].synced_model).toBeNull();
       expect(await listUnsyncedTrackerSchemaDefs(WS, db)).toEqual([]);
     });
 
@@ -354,6 +377,59 @@ describe('trackerTypeDefStore materialization lifecycle (SQLite, migration 0012)
       const all = await rows();
       expect(JSON.parse(all[0].model)).toEqual(edited);
       expect(all[0].sync_id).toBe(14); // still team-owned; server assigns the next version
+      expect(JSON.parse(all[0].synced_model!)).toEqual(shared); // baseline stays server truth
+    });
+
+    it('carries the full activity trail forward and attributes a real YAML edit', async () => {
+      const priorActivity = {
+        id: 'activity_1',
+        authorIdentity: { displayName: 'Alice' },
+        action: 'schema_updated',
+        field: 'schema',
+        timestamp: 1,
+      };
+      const sharedWithHistory = { ...shared, activity: [priorActivity] } as TrackerDataModel;
+      await applyRemoteTrackerSchemaDef(WS, def('bug', sharedWithHistory, 14), db);
+      await markTrackerTypeDefProjected(WS, 'bug', JSON.stringify(sharedWithHistory), db);
+      const edited = model('bug', { displayName: 'Defect', fields: [{ name: 'collection' }] });
+
+      await materializeYamlTrackerTypeDef(WS, edited, db, {
+        activity: {
+          authorIdentity: { displayName: 'Bob' },
+          action: 'schema_updated',
+          details: { field: 'schema' },
+        },
+      });
+
+      const stored = JSON.parse((await rows())[0].model);
+      expect(stored.activity).toEqual([
+        priorActivity,
+        expect.objectContaining({
+          authorIdentity: { displayName: 'Bob' },
+          action: 'schema_updated',
+          field: 'schema',
+        }),
+      ]);
+    });
+
+    it('takes a caller-supplied baseline from the row itself and queues the edit against it', async () => {
+      // The watcher knows a file was just edited; this layer does not. When it
+      // supplies the missing baseline, the shared model is already in hand on
+      // the row -- no second read, and no projection to disk.
+      await applyRemoteTrackerSchemaDef(WS, def('bug', shared, 14), db);
+      const edited = model('bug', { displayName: 'Defect', fields: [{ name: 'collection' }] });
+      const offered: string[] = [];
+
+      await materializeYamlTrackerTypeDef(WS, edited, db, {
+        establishBaseline: (sharedJson) => { offered.push(sharedJson); return sharedJson; },
+      });
+
+      expect(offered.map((j) => JSON.parse(j))).toEqual([shared]);
+      const all = await rows();
+      expect(JSON.parse(all[0].synced_model!)).toEqual(shared);
+      expect(JSON.parse(all[0].model)).toEqual(edited);
+      expect(all[0].sync_id).toBe(14);
+      expect(await listUnsyncedTrackerSchemaDefs(WS, db)).toHaveLength(1);
     });
 
     it('never tombstones a team-owned row whose YAML file is gone', async () => {
@@ -460,15 +536,13 @@ describe('trackerTypeDefStore materialization lifecycle (SQLite, migration 0012)
       expect(out[0]).toEqual({ type: 'local', model: null, deleted: true });
     });
 
-    it('respects sync mode: excludes explicit local overrides, includes shared/hybrid', async () => {
-      // A `local`-mode override (e.g. an idea/automation builtin override) must
-      // never leak to the team; shared/hybrid do sync.
-      await materializeTrackerTypeDef(WS, model('sharedType', { sync: { mode: 'shared', scope: 'project' } }), 'cli', db);
-      await materializeTrackerTypeDef(WS, model('hybridType', { sync: { mode: 'hybrid', scope: 'project' } }), 'cli', db);
-      await materializeTrackerTypeDef(WS, model('localType', { sync: { mode: 'local', scope: 'project' } }), 'cli', db);
+    it('excludes personal schemas and includes team schemas regardless of their draft default', async () => {
+      await materializeTrackerTypeDef(WS, model('teamType', { sharing: 'team', draftByDefault: false }), 'cli', db);
+      await materializeTrackerTypeDef(WS, model('draftType', { sharing: 'team', draftByDefault: true }), 'cli', db);
+      await materializeTrackerTypeDef(WS, model('personalType', { sharing: 'personal', draftByDefault: false }), 'cli', db);
 
       const out = await listUnsyncedTrackerSchemaDefs(WS, db);
-      expect(out.map((r) => r.type).sort()).toEqual(['hybridType', 'sharedType']);
+      expect(out.map((r) => r.type).sort()).toEqual(['draftType', 'teamType']);
     });
 
     it('still surfaces sync-undefined types (custom-type back-compat)', async () => {
@@ -479,13 +553,13 @@ describe('trackerTypeDefStore materialization lifecycle (SQLite, migration 0012)
       expect(out.map((r) => r.type)).toContain('noSync');
     });
 
-    it('excludes a pending tombstone for a local-mode override (nothing to retract)', async () => {
+    it('excludes a pending tombstone for a personal override (nothing to retract)', async () => {
       // The model column retains the last-known JSON even when tombstoned, so the
-      // local-mode filter applies to deletions too.
-      await materializeTrackerTypeDef(WS, model('localType', { sync: { mode: 'local', scope: 'project' } }), 'cli', db);
-      await removeTrackerTypeDef(WS, 'localType', db);
+      // personal-sharing filter applies to deletions too.
+      await materializeTrackerTypeDef(WS, model('personalType', { sharing: 'personal', draftByDefault: false }), 'cli', db);
+      await removeTrackerTypeDef(WS, 'personalType', db);
       const out = await listUnsyncedTrackerSchemaDefs(WS, db);
-      expect(out.map((r) => r.type)).not.toContain('localType');
+      expect(out.map((r) => r.type)).not.toContain('personalType');
     });
   });
 
@@ -503,7 +577,7 @@ describe('trackerTypeDefStore materialization lifecycle (SQLite, migration 0012)
     it('applies a builtin-named override def without special-casing', async () => {
       const res = await applyRemoteTrackerSchemaDef(
         WS,
-        def('feature', model('feature', { displayName: 'Feature', sync: { mode: 'shared', scope: 'project' } }), 1),
+        def('feature', model('feature', { displayName: 'Feature', sharing: 'team', draftByDefault: false }), 1),
         db,
       );
       expect(res).toEqual({ applied: true, deleted: false });
@@ -586,5 +660,53 @@ describe('classifyTrackerSchemaDrift (pure)', () => {
       { type: 'beta', status: 'drifted', source: 'yaml' },
       { type: 'gamma', status: 'db-only-orphan', source: 'yaml' },
     ]);
+  });
+
+  // Ownership decides whether a difference is drift at all: for a team-owned
+  // row the two writes a resync performs are no-ops, so reporting drift there
+  // offered a "Resync from files" button whose work would be discarded.
+  describe('team-owned rows', () => {
+    const yaml = model('epic', { displayName: 'Local edit' });
+    const shared = model('epic', { displayName: 'Team' });
+
+    it('is not drift when the file has no baseline, so materialize ignores it', () => {
+      const entries = classifyTrackerSchemaDrift(
+        [yaml],
+        [{ ...dbDef('epic', 'yaml', shared), sync_id: 7, synced_model: null }],
+      );
+      expect(entries).toEqual([{ type: 'epic', status: 'team-owned', source: 'yaml' }]);
+      expect(hasSchemaDrift(entries)).toBe(false);
+    });
+
+    it('is not drift when the file already matches the last projected shared model', () => {
+      const entries = classifyTrackerSchemaDrift(
+        [shared],
+        [{
+          ...dbDef('epic', 'yaml', model('epic', { displayName: 'Changed elsewhere' })),
+          sync_id: 7,
+          synced_model: JSON.stringify(shared),
+        }],
+      );
+      expect(entries[0].status).toBe('team-owned');
+      expect(hasSchemaDrift(entries)).toBe(false);
+    });
+
+    it('is drift when the file is a real edit on top of the baseline, which a resync pushes', () => {
+      const entries = classifyTrackerSchemaDrift(
+        [yaml],
+        [{ ...dbDef('epic', 'yaml', shared), sync_id: 7, synced_model: JSON.stringify(shared) }],
+      );
+      expect(entries[0].status).toBe('drifted');
+      expect(hasSchemaDrift(entries)).toBe(true);
+    });
+
+    it('is not an orphan when the file is missing -- reconcile refuses to retract it', () => {
+      const entries = classifyTrackerSchemaDrift(
+        [],
+        [{ ...dbDef('epic', 'yaml', shared), sync_id: 7, synced_model: null }],
+      );
+      expect(entries).toEqual([{ type: 'epic', status: 'team-owned', source: 'yaml' }]);
+      expect(hasSchemaDrift(entries)).toBe(false);
+    });
   });
 });

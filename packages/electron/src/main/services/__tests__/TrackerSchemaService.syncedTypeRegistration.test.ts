@@ -125,6 +125,29 @@ describe('registerMaterializedSyncedTypes (NIM-865)', () => {
     expect(globalRegistry.get(TYPE)?.displayName).toBe('StaleLocal');
   });
 
+  it('does not let an obsolete team-owned row replace a migrated personal schema', async () => {
+    globalRegistry.register({
+      type: TYPE,
+      displayName: 'Personal',
+      sharing: 'personal',
+      draftByDefault: false,
+      fields: [],
+      roles: {},
+    } as never);
+    await materializeTrackerTypeDef(
+      WS,
+      { type: TYPE, displayName: 'Old team copy', fields: [], roles: {} } as never,
+      'yaml',
+      db,
+    );
+    await db.query(`UPDATE tracker_type_defs SET sync_id = 14 WHERE type = '${TYPE}'`);
+
+    const count = await registerMaterializedSyncedTypes(WS, db);
+
+    expect(count).toBe(0);
+    expect(globalRegistry.get(TYPE)?.displayName).toBe('Personal');
+  });
+
   it('does not mutate the registry when the workspace is no longer active', async () => {
     const model = JSON.stringify({
       type: TYPE, displayName: 'GitHub PR Test',

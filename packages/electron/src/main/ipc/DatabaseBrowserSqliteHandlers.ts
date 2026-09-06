@@ -19,6 +19,11 @@ import { safeHandle } from '../utils/ipcRegistry';
 import type { SQLiteDatabase } from '../database/sqlite/SQLiteDatabase';
 import type { SQLiteDatabaseProxy } from '../database/sqlite/SQLiteDatabaseProxy';
 import type { SQLiteBackupService } from '../services/database/SQLiteBackupService';
+import {
+  getDatabaseMaintenanceSettings,
+  setDatabaseMaintenanceSettings,
+  type DatabaseMaintenanceSettings,
+} from '../utils/store';
 
 /**
  * Backend deps for the IPC layer. Production passes a `SQLiteDatabaseProxy`;
@@ -94,6 +99,60 @@ function normalizeDashboardBackupStatus(status: unknown): DashboardBackupStatus 
     oldestBackup: normalizeDashboardBackupInfo(candidate.oldestBackup),
     lastBackupAttempt: typeof candidate.lastBackupAttempt === 'string' ? candidate.lastBackupAttempt : null,
     lastSuccessfulBackup: typeof candidate.lastSuccessfulBackup === 'string' ? candidate.lastSuccessfulBackup : null,
+  };
+}
+
+/**
+ * The slice of the database a vacuum needs. Deliberately narrow: the handler is
+ * given `SQLiteDatabase | SQLiteDatabaseProxy`, and the proxy has no
+ * `getRawHandle`, so it cannot satisfy the full backend's dependency. Typing
+ * against what this actually uses lets both shapes through without a cast that
+ * would hide the difference.
+ */
+export interface VacuumableDatabase {
+  queryReadOnly<T = unknown>(sql: string, params?: unknown[]): Promise<{ rows: T[] }>;
+  exec(sql: string): Promise<void>;
+}
+
+export interface VacuumResult {
+  durationMs: number;
+  freelistPagesBefore: number;
+  bytesReclaimed: number;
+}
+
+/**
+ * Return free pages to the filesystem.
+ *
+ * Retention and slimming passes only mark pages free inside the file -- SQLite
+ * never shrinks it on its own, and `auto_vacuum` is NONE here so there is no
+ * incremental option. After a pass that leaves gigabytes of freelist, this is
+ * the only way to get the disk space back.
+ *
+ * VACUUM rewrites the whole database under an exclusive lock, so on a
+ * multi-gigabyte file every other query blocks for the duration (35s on a 9.8GB
+ * database). Strictly user-triggered; never run it as background maintenance.
+ */
+export async function vacuumDatabase(db: VacuumableDatabase): Promise<VacuumResult> {
+  const before = await db.queryReadOnly<{ freelist: number; pages: number; page_size: number }>(
+    `SELECT (SELECT freelist_count FROM pragma_freelist_count) AS freelist,
+            (SELECT page_count FROM pragma_page_count) AS pages,
+            (SELECT page_size FROM pragma_page_size) AS page_size`,
+  );
+
+  const startedAt = Date.now();
+  await db.exec('VACUUM');
+  const durationMs = Date.now() - startedAt;
+
+  const after = await db.queryReadOnly<{ pages: number }>(
+    'SELECT (SELECT page_count FROM pragma_page_count) AS pages',
+  );
+
+  const b = before.rows[0];
+  const a = after.rows[0];
+  return {
+    durationMs,
+    freelistPagesBefore: b?.freelist ?? 0,
+    bytesReclaimed: b && a ? Math.max(0, (b.pages - a.pages) * b.page_size) : 0,
   };
 }
 
@@ -176,6 +235,93 @@ export class DatabaseBrowserSqliteBackend {
 export function registerDatabaseBrowserSqliteHandlers(deps: SqliteBrowserHandlerDeps): void {
   const { sqlite } = deps;
   const proxy = sqlite as SQLiteDatabaseProxy;
+
+  // Backup retention + cadence, and the tool-output retention window. Each
+  // backup generation is a full copy of the database, so copiesKept is a
+  // direct multiplier on disk usage (#1248).
+  safeHandle('database:maintenance:get', async () => {
+    try {
+      return { success: true, settings: getDatabaseMaintenanceSettings() };
+    } catch (error) {
+      return { success: false, error: String(error) };
+    }
+  });
+
+  safeHandle('database:maintenance:set', async (_event, patch: Partial<DatabaseMaintenanceSettings>) => {
+    if (!patch || typeof patch !== 'object') {
+      throw new Error('database:maintenance:set requires a settings patch');
+    }
+    try {
+      const settings = setDatabaseMaintenanceSettings(patch);
+      // Applies on the next rotation; push it to the live service so the user
+      // does not have to restart for it to take hold.
+      await proxy.setBackupCopiesKept?.(settings.backupCopiesKept);
+      return { success: true, settings };
+    } catch (error) {
+      return { success: false, error: String(error) };
+    }
+  });
+
+  // Estimate what tombstoning aged tool output would reclaim. Bounded sample --
+  // the full-table version of this query hangs the app.
+  safeHandle('database:toolRetention:estimate', async (_event, opts?: { retentionDays?: number }) => {
+    try {
+      const estimate = await proxy.toolRetentionEstimate(opts?.retentionDays ?? 30);
+      return { success: true, estimate };
+    } catch (error) {
+      return { success: false, error: String(error) };
+    }
+  });
+
+  // Run the retention pass. Destructive and irreversible, so user-triggered
+  // only. Executes on the worker's background lane.
+  safeHandle('database:toolRetention:run', async (_event, opts?: { retentionDays?: number; maxRows?: number }) => {
+    try {
+      const result = await proxy.toolRetentionRun(opts?.retentionDays ?? 30, opts?.maxRows);
+      return { success: true, result };
+    } catch (error) {
+      return { success: false, error: String(error) };
+    }
+  });
+
+  // Delete rows the transcript has no branch for, then collapse duplicate
+  // session/init frames. Destructive and irreversible, so user-triggered only,
+  // same as the retention pass. Runs on the worker's background lane.
+  safeHandle('database:rawMessagePrune:run', async (
+    _event,
+    opts?: { retentionDays?: number; maxRows?: number; ignoreAge?: boolean },
+  ) => {
+    try {
+      const result = await proxy.rawMessagePruneRun(
+        opts?.retentionDays ?? 30,
+        opts?.maxRows,
+        opts?.ignoreAge,
+      );
+      return { success: true, result };
+    } catch (error) {
+      return { success: false, error: String(error) };
+    }
+  });
+
+  /**
+   * Return free pages to the filesystem.
+   *
+   * Retention and slimming passes only mark pages free inside the file --
+   * SQLite never shrinks it on its own, and `auto_vacuum` is NONE here so
+   * there is no incremental option. After a large pass that leaves gigabytes
+   * of freelist, this is the only way to get the disk back.
+   *
+   * Deliberately user-triggered: VACUUM rewrites the entire database and holds
+   * an exclusive lock for the duration, so on a multi-gigabyte file every other
+   * query blocks behind it.
+   */
+  safeHandle('database:vacuum', async () => {
+    try {
+      return { success: true, result: await vacuumDatabase(proxy) };
+    } catch (error) {
+      return { success: false, error: String(error) };
+    }
+  });
 
   safeHandle('database:getTables', async () => {
     try {

@@ -17,8 +17,9 @@
  */
 
 import type { AgentMessage } from '../ai/server/types';
+import type { PersonalJwt, PersonalMemberId } from '../auth/jwtScopes';
 import { shouldSyncMessageForSessionRoom, truncateContentForSync } from './syncContentTruncator';
-import { appendSyncClientParams } from './syncClientInfo';
+import { appendSyncClientParams, redactSyncUrl } from './syncClientInfo';
 import { buildSyncedSessionIndexFields } from './sessionIndexEntryFields';
 import { resolveIndexSortTimestamp } from './sessionSortTimestamp';
 import { deriveTrackerPersonalStateKey } from './trackerPersonalStateKey';
@@ -46,9 +47,18 @@ import type {
   SessionControlMessage,
   EncryptedAttachment,
   FileIndexData,
+  MobilePushOptions,
+  MobilePushResult,
 } from './types';
 import { filterSessionsForPersonalSync } from './types';
+import type { FleetActivitySnapshot, PushRejectionCause } from '@nimbalyst/collab-protocol';
 import type { SyncedReadReceipt } from '../readReceipts/readReceipts';
+
+/**
+ * How long to wait for the server's `mobilePushResult` before giving up. Older
+ * servers never send one, so this is also the ceiling on a no-op await.
+ */
+const MOBILE_PUSH_ACK_TIMEOUT_MS = 10_000;
 
 // ============================================================================
 // CollabV3 Protocol Types (matches server)
@@ -156,6 +166,8 @@ interface SessionIndexEntry {
   parentSessionId?: string;
   /** Worktree ID for git worktree association (plaintext UUID) */
   worktreeId?: string;
+  /** Stable device ID of the host that owns this session. */
+  hostDeviceId?: string;
   /** Agent role marker (e.g. 'meta-agent', 'standard'). Plaintext - drives mobile meta-agent grouping. */
   agentRole?: string;
   /** Meta-agent parent session ID for spawned children (plaintext UUID). Drives mobile meta-agent grouping. */
@@ -301,14 +313,24 @@ type ClientMessage =
   | { type: 'indexBatchUpdate'; sessions: SessionIndexEntry[] }
   | { type: 'indexDelete'; sessionId: string }
   | { type: 'deviceAnnounce'; device: DeviceInfo }
-  | { type: 'createSessionRequest'; request: EncryptedCreateSessionRequest }
+  | { type: 'createSessionRequest'; request: EncryptedCreateSessionRequest; targetDeviceId?: string }
   | { type: 'createSessionResponse'; response: EncryptedCreateSessionResponse }
-  | { type: 'createWorktreeRequest'; request: EncryptedCreateWorktreeRequest }
+  | { type: 'createWorktreeRequest'; request: EncryptedCreateWorktreeRequest; targetDeviceId?: string }
   | { type: 'createWorktreeResponse'; response: EncryptedCreateWorktreeResponse }
   | { type: 'voiceToolRequest'; request: EncryptedVoiceToolRequest }
   | { type: 'voiceToolResponse'; response: EncryptedVoiceToolResponse }
-  | { type: 'sessionControl'; message: { sessionId: string; messageType: string; payload?: Record<string, unknown>; timestamp: number; sentBy: 'desktop' | 'mobile' } }
-  | { type: 'requestMobilePush'; sessionId: string; title: string; body: string; requestingDeviceId?: string }
+  | { type: 'sessionControl'; message: { sessionId: string; messageType: string; payload?: Record<string, unknown>; timestamp: number; sentBy: 'desktop' | 'mobile'; sentByDeviceId?: string; targetDeviceId?: string } }
+  | {
+      type: 'requestMobilePush';
+      sessionId: string;
+      title: string;
+      body: string;
+      requestingDeviceId?: string;
+      requestId?: string;
+      force?: boolean;
+      reason?: string;
+    }
+  | { type: 'fleetActivityUpdate'; activity: FleetActivitySnapshot; shownOnDesktop?: boolean }
   | { type: 'settingsSync'; settings: EncryptedSettingsPayload }
   | { type: 'readReceipt'; receipt: EncryptedReadReceiptPayload }
   | { type: 'trackerPersonalState'; state: EncryptedTrackerPersonalStatePayload }
@@ -352,16 +374,17 @@ type ServerMessage =
   | { type: 'devicesList'; devices: DeviceInfo[] }
   | { type: 'deviceJoined'; device: DeviceInfo }
   | { type: 'deviceLeft'; deviceId: string }
-  | { type: 'createSessionRequestBroadcast'; request: EncryptedCreateSessionRequest; fromConnectionId?: string }
+  | { type: 'createSessionRequestBroadcast'; request: EncryptedCreateSessionRequest; targetDeviceId?: string; fromConnectionId?: string }
   | { type: 'createSessionResponseBroadcast'; response: EncryptedCreateSessionResponse; fromConnectionId?: string }
-  | { type: 'createWorktreeRequestBroadcast'; request: EncryptedCreateWorktreeRequest; fromConnectionId?: string }
+  | { type: 'createWorktreeRequestBroadcast'; request: EncryptedCreateWorktreeRequest; targetDeviceId?: string; fromConnectionId?: string }
   | { type: 'createWorktreeResponseBroadcast'; response: EncryptedCreateWorktreeResponse; fromConnectionId?: string }
   | { type: 'voiceToolRequestBroadcast'; request: EncryptedVoiceToolRequest; fromConnectionId?: string }
   | { type: 'voiceToolResponseBroadcast'; response: EncryptedVoiceToolResponse; fromConnectionId?: string }
-  | { type: 'sessionControlBroadcast'; message: { sessionId: string; messageType: string; payload?: Record<string, unknown>; timestamp: number; sentBy: 'desktop' | 'mobile' }; fromConnectionId?: string }
+  | { type: 'sessionControlBroadcast'; message: { sessionId: string; messageType: string; payload?: Record<string, unknown>; timestamp: number; sentBy: 'desktop' | 'mobile'; sentByDeviceId?: string; targetDeviceId?: string }; fromConnectionId?: string }
   | { type: 'settingsSyncBroadcast'; settings: EncryptedSettingsPayload; fromConnectionId?: string }
   | { type: 'readReceiptBroadcast'; receipt: EncryptedReadReceiptPayload; fromConnectionId?: string }
   | { type: 'trackerPersonalStateBroadcast'; state: EncryptedTrackerPersonalStatePayload; fromConnectionId?: string }
+  | ({ type: 'mobilePushResult'; requestId: string; sessionId: string } & MobilePushResult)
   | { type: 'error'; code: string; message: string };
 
 // ============================================================================
@@ -378,7 +401,7 @@ interface JwtClaims {
  * Decode a JWT's payload claims. Does not verify the signature -- the server does that.
  * The JWT is a base64url encoded string in the format: header.payload.signature
  */
-function decodeJwtClaims(jwt: string): JwtClaims {
+function decodeJwtClaims(jwt: PersonalJwt): JwtClaims {
   try {
     const parts = jwt.split('.');
     if (parts.length !== 3) {
@@ -873,6 +896,8 @@ interface CachedSessionIndex {
   parentSessionId?: string;
   /** Worktree ID for git worktree association */
   worktreeId?: string;
+  /** Stable device ID of the host that owns this session. */
+  hostDeviceId?: string;
   /** Agent role marker (e.g. 'meta-agent', 'standard'); drives mobile meta-agent grouping. */
   agentRole?: string;
   /** Meta-agent parent session ID for spawned children; drives mobile meta-agent grouping. */
@@ -925,10 +950,25 @@ interface CachedSessionIndex {
 // ============================================================================
 
 export function createCollabV3Sync(config: SyncConfig): SyncProvider {
+  /**
+   * This client's own device identity, read fresh on every call.
+   *
+   * `getDeviceInfo` exists so presence fields (focus, status, lastActiveAt)
+   * reflect the moment they are read rather than the moment the provider was
+   * constructed; `config.deviceInfo` is the static fallback for callers that
+   * never supplied one. Every read of "who am I" goes through here — the
+   * self-broadcast filters, device-targeted routing, and host attribution all
+   * have to agree on the answer, and they had drifted into eight hand-copied
+   * expressions of it.
+   */
+  const localDeviceInfo = (): DeviceInfo | undefined =>
+    config.getDeviceInfo?.() ?? config.deviceInfo;
+  const localDeviceId = (): string | undefined => localDeviceInfo()?.deviceId;
+
   // We need to get the initial JWT synchronously for setup, but will refresh before each connection
   // The getJwt function is called before each WebSocket connection to ensure fresh JWT
-  let currentJwt: string | null = null;
-  let currentUserId: string | null = null;
+  let currentJwt: PersonalJwt | null = null;
+  let currentPersonalMemberId: PersonalMemberId | null = null;
 
   // Use the injected WebSocket factory (Electron main injects the `ws` package;
   // its global WebSocket flakily drops the first connection) or fall back to the
@@ -937,25 +977,25 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
     config.createWebSocket ? config.createWebSocket(url) : new WebSocket(url);
 
   // Helper to get fresh JWT and extract user ID.
-  // Uses config.userId as the authoritative room routing ID.
-  // The JWT sub claim is validated against config.userId -- if they differ,
+  // Uses config.personalMemberId as the authoritative room routing ID.
+  // The JWT sub claim is validated against config.personalMemberId -- if they differ,
   // the JWT is from a different org (e.g., team) and the caller's getJwt()
   // should be returning a personal-org-scoped JWT. Log a warning so the
-  // mismatch is visible but still use config.userId for routing to ensure
+  // mismatch is visible but still use config.personalMemberId for routing to ensure
   // desktop and mobile always connect to the same index room.
-  async function ensureFreshJwt(): Promise<{ jwt: string; userId: string }> {
+  async function ensureFreshJwt(): Promise<{ jwt: PersonalJwt; personalMemberId: PersonalMemberId }> {
     const jwt = await config.getJwt();
     const claims = decodeJwtClaims(jwt);
     const jwtUserId = claims.sub;
     currentJwt = jwt;
 
-    // Use config.userId (personalUserId from SyncManager) as the canonical
+    // Use config.personalMemberId from SyncManager as the canonical
     // room routing ID. This must match iOS which also uses the personal
     // member ID. If the JWT sub doesn't match, the server WILL reject the
     // WebSocket auth (it validates JWT sub === room URL userId) -- but
     // routing to the wrong room is worse because it silently breaks
     // cross-device sync (prompts, drafts, etc.).
-    if (config.userId && jwtUserId !== config.userId) {
+    if (jwtUserId !== config.personalMemberId) {
       const jwtIsTeamScoped =
         !!claims.organization_id && !!config.orgId && claims.organization_id !== config.orgId;
       // Rate-limit: this used to log every 2s forever once the loop kicked in.
@@ -963,11 +1003,11 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
       if (now - lastJwtMismatchLogAt > JWT_MISMATCH_LOG_INTERVAL_MS) {
         lastJwtMismatchLogAt = now;
         console.warn(
-          '[CollabV3] JWT sub does not match sync config userId -- refusing to connect (would be server-rejected and throttle the client).',
+          '[CollabV3] JWT sub does not match sync config personalMemberId -- refusing to connect (would be server-rejected and throttle the client).',
           {
             jwtSub: jwtUserId,
             jwtOrgId: claims.organization_id ?? null,
-            configUserId: config.userId, // personalUserId from SyncManager
+            configPersonalMemberId: config.personalMemberId,
             configOrgId: config.orgId,   // personalOrgId from SyncManager
             likelyCause: jwtIsTeamScoped
               ? 'JWT is team-scoped (organization_id differs from personal orgId). getJwt() should return a personal-org-scoped JWT -- check StytchAuthService.refreshPersonalSession / getPersonalSessionJwt.'
@@ -978,22 +1018,22 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
       // Don't even attempt the connection -- the server will reject it and the
       // tight retry loop got us throttled in the past. Caller will set
       // `indexAuthBlocked` and stop scheduling reconnects.
-      const err = new Error('CollabV3 JWT/userId mismatch -- connection refused locally to avoid server throttling');
+      const err = new Error('CollabV3 JWT/personal-member mismatch -- connection refused locally to avoid server throttling');
       (err as any).code = 'AUTH_MISMATCH';
       throw err;
     }
-    currentUserId = config.userId || jwtUserId;
-    return { jwt, userId: currentUserId };
+    currentPersonalMemberId = config.personalMemberId;
+    return { jwt, personalMemberId: currentPersonalMemberId };
   }
 
   function isAuthMismatchError(err: unknown): boolean {
     return !!err && typeof err === 'object' && (err as any).code === 'AUTH_MISMATCH';
   }
 
-  // Get user ID synchronously if we have a cached JWT, otherwise use config.userId
-  function getUserId(): string {
-    if (currentUserId) return currentUserId;
-    if (config.userId) return config.userId;
+  // Get the personal member id synchronously after the JWT/config match is established.
+  function getPersonalMemberId(): PersonalMemberId {
+    if (currentPersonalMemberId) return currentPersonalMemberId;
+    if (config.personalMemberId) return config.personalMemberId;
     throw new Error('JWT not initialized - call ensureFreshJwt first');
   }
 
@@ -1028,14 +1068,14 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
    * `onopen`). Distinct from `indexReconnectAttempts` so we can keep the first
    * few retries fast (handles legitimate "network just came up" races) while
    * still ramping into a real backoff if the failures keep coming. Without this,
-   * a permanent server-side rejection (e.g. JWT/userId mismatch) used to hammer
+   * a permanent server-side rejection (e.g. JWT/personal-member mismatch) used to hammer
    * the server at 2s forever and get us throttled.
    */
   let indexPreOpenFailures = 0;
   let indexReconnectTimer: ReturnType<typeof setTimeout> | null = null;
   /**
    * When `ensureFreshJwt` detects that the JWT cannot possibly succeed against
-   * the configured room (JWT `sub` does not match `config.userId`), we set this
+   * the configured room (JWT `sub` does not match `config.personalMemberId`), we set this
    * flag and stop scheduling reconnects entirely. The server would only reject
    * us anyway, and repeated rejections get the client IP throttled. Cleared by
    * an explicit `reconnectIndex()` (network change / user toggles sync / app
@@ -1135,7 +1175,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
    *     rejection (e.g. stale JWT) would hammer the server at 2s forever and
    *     get the client throttled.
    *
-   * If `indexAuthBlocked` is set (JWT/userId mismatch detected), we don't
+   * If `indexAuthBlocked` is set (JWT/personal-member mismatch detected), we don't
    * schedule a reconnect at all. Recovery happens only via an explicit
    * `reconnectIndex()` call (network change, user toggles sync, app focus).
    */
@@ -1173,7 +1213,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
         connectToIndex().catch(err => {
           if (isAuthMismatchError(err)) {
             // ensureFreshJwt already set indexAuthBlocked. Do not reschedule.
-            console.warn('[CollabV3] Index reconnect blocked: JWT/userId mismatch. Waiting for explicit reconnect trigger.');
+            console.warn('[CollabV3] Index reconnect blocked: JWT/personal-member mismatch. Waiting for explicit reconnect trigger.');
             return;
           }
           console.error('[CollabV3] Failed to reconnect to index:', err);
@@ -1216,6 +1256,13 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
 
   // Settings sync listeners (for receiving synced settings from other devices)
   const settingsSyncListeners = new Set<(settings: SyncedSettings) => void>();
+
+  // In-flight mobile push requests, keyed by requestId so concurrent requests
+  // resolve to their own acknowledgements.
+  const pendingMobilePushes = new Map<string, {
+    resolve: (result: MobilePushResult) => void;
+    timer: ReturnType<typeof setTimeout>;
+  }>();
 
   // Read-receipt listeners (unread-indicator state arriving from other devices)
   const readReceiptListeners = new Set<(receipt: SyncedReadReceipt) => void>();
@@ -1280,6 +1327,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
       sessionType: baseEntry.sessionType,
       parentSessionId: baseEntry.parentSessionId,
       worktreeId: baseEntry.worktreeId,
+      hostDeviceId: baseEntry.hostDeviceId,
       agentRole: baseEntry.agentRole,
       createdBySessionId: baseEntry.createdBySessionId,
       isArchived: baseEntry.isArchived,
@@ -1372,6 +1420,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
       sessionType: 'sessionType' in pending ? pending.sessionType : cached.sessionType,
       parentSessionId: 'parentSessionId' in pending ? pending.parentSessionId : cached.parentSessionId,
       worktreeId: 'worktreeId' in pending ? pending.worktreeId : cached.worktreeId,
+      hostDeviceId: 'hostDeviceId' in pending ? pending.hostDeviceId : cached.hostDeviceId,
       agentRole: cached.agentRole,
       createdBySessionId: cached.createdBySessionId,
       isArchived: 'isArchived' in pending ? pending.isArchived : cached.isArchived,
@@ -1429,7 +1478,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
   // Helper to announce device to the index server
   function announceDevice(): void {
     // Get current device info (prefer callback for dynamic presence, fallback to static)
-    const deviceInfo = config.getDeviceInfo?.() ?? config.deviceInfo;
+    const deviceInfo = localDeviceInfo();
     // Check both our flag AND the actual WebSocket readyState to avoid "Sent before connected" errors
     if (deviceInfo && indexWs && indexConnected && indexWs.readyState === WebSocket.OPEN) {
       const announceMsg: ClientMessage = {
@@ -1485,16 +1534,16 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
     }
   }
 
-  function buildRoomId(userId: string, suffix: string): string {
-    return `org:${config.orgId}:user:${userId}:${suffix}`;
+  function buildRoomId(personalMemberId: PersonalMemberId, suffix: string): string {
+    return `org:${config.orgId}:user:${personalMemberId}:${suffix}`;
   }
 
   function getRoomId(sessionId: string): string {
-    return buildRoomId(getUserId(), `session:${sessionId}`);
+    return buildRoomId(getPersonalMemberId(), `session:${sessionId}`);
   }
 
   function getIndexRoomId(): string {
-    return buildRoomId(getUserId(), 'index');
+    return buildRoomId(getPersonalMemberId(), 'index');
   }
 
   function getWebSocketUrl(roomId: string): string {
@@ -1916,7 +1965,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
     if (indexAuthBlocked) {
       // Auth is known-bad; throwing here lets callers (e.g. ad-hoc
       // sendSessionControlMessage) skip work that would never succeed.
-      const err = new Error('CollabV3 index connection blocked: JWT/userId mismatch');
+      const err = new Error('CollabV3 index connection blocked: JWT/personal-member mismatch');
       (err as any).code = 'AUTH_MISMATCH';
       throw err;
     }
@@ -1940,7 +1989,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
 
     // Get fresh JWT before connecting. Throws AUTH_MISMATCH if the JWT cannot
     // succeed against the configured room (caught below to set indexAuthBlocked).
-    let jwt: string;
+    let jwt: PersonalJwt;
     try {
       ({ jwt } = await ensureFreshJwt());
     } catch (err) {
@@ -1955,7 +2004,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
     }
 
     const indexRoomId = getIndexRoomId();
-    console.log('[CollabV3] connectToIndex() roomId:', indexRoomId, 'orgId:', config.orgId, 'userId:', getUserId());
+    console.log('[CollabV3] connectToIndex() roomId:', indexRoomId, 'orgId:', config.orgId, 'personalMemberId:', getPersonalMemberId());
     const url = getWebSocketUrl(indexRoomId);
     // Pass JWT via query parameter (WebSocket doesn't support custom headers in browsers)
     const wsUrl = appendSyncClientParams(`${url}?token=${encodeURIComponent(jwt)}`);
@@ -2036,7 +2085,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
       const errorInfo = typeof ErrorEvent !== 'undefined' && event instanceof ErrorEvent
         ? { message: event.message, error: event.error }
         : { type: event.type };
-      console.error('[CollabV3] Index WebSocket error:', errorInfo, 'URL:', wsUrl);
+      console.error('[CollabV3] Index WebSocket error:', errorInfo, 'URL:', redactSyncUrl(wsUrl));
     };
 
     indexWs.onmessage = async (event) => {
@@ -2072,7 +2121,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
                     try {
                       projectId = await decryptProjectId(entry.encryptedProjectId, entry.projectIdIv, config.encryptionKey);
                     } catch (err) {
-                      console.warn(`[CollabV3] Cannot decrypt session ${entry.sessionId} (wrong encryption key, likely from before userId migration). Deleting from server index so it re-syncs with correct key.`);
+                      console.warn(`[CollabV3] Cannot decrypt session ${entry.sessionId} (wrong encryption key, likely from before personal member id migration). Deleting from server index so it re-syncs with correct key.`);
                       decryptionFailedSessionIds.push(entry.sessionId);
                       return null;
                     }
@@ -2144,6 +2193,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
                     sessionType: entry.sessionType,
                     parentSessionId: entry.parentSessionId,
                     worktreeId: entry.worktreeId,
+                    hostDeviceId: entry.hostDeviceId,
                     agentRole: entry.agentRole,
                     createdBySessionId: entry.createdBySessionId,
                     isArchived: entry.isArchived,
@@ -2175,6 +2225,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
                     sessionType: decrypted.sessionType,
                     parentSessionId: decrypted.parentSessionId,
                     worktreeId: decrypted.worktreeId,
+                    hostDeviceId: decrypted.hostDeviceId,
                     agentRole: decrypted.agentRole,
                     createdBySessionId: decrypted.createdBySessionId,
                     isArchived: decrypted.isArchived,
@@ -2205,7 +2256,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
               )).filter((s): s is DecryptedSessionIndexEntry => s !== null);
 
               // Delete server-side index entries that couldn't be decrypted.
-              // They were encrypted with a different key (e.g., before userId migration).
+              // They were encrypted with a different key (e.g., before personal member id migration).
               // The next sync cycle will re-push them from the local PGLite database
               // with the correct encryption key.
               if (decryptionFailedSessionIds.length > 0 && indexWs && indexWs.readyState === WebSocket.OPEN) {
@@ -2302,6 +2353,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
               sessionType: entry.sessionType,
               parentSessionId: entry.parentSessionId,
               worktreeId: entry.worktreeId,
+              hostDeviceId: entry.hostDeviceId,
               // Carry the meta-agent grouping fields off the wire so an
               // incremental broadcast keeps the local cache groupable (parity
               // with the indexResponse decrypt path above).
@@ -2432,8 +2484,25 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
             notifyDeviceStatusChange();
             break;
 
+          case 'mobilePushResult': {
+            const pending = pendingMobilePushes.get(message.requestId);
+            if (!pending) break;
+            clearTimeout(pending.timer);
+            pendingMobilePushes.delete(message.requestId);
+            pending.resolve({
+              accepted: message.accepted,
+              attemptedCount: message.attemptedCount,
+              deliveredCount: message.deliveredCount,
+              skipped: message.skipped,
+              rejection: message.rejection,
+            });
+            break;
+          }
+
           case 'createSessionRequestBroadcast': {
             // Another device (mobile) requested session creation
+            const ourDeviceId = localDeviceId();
+            if (message.targetDeviceId && message.targetDeviceId !== ourDeviceId) break;
             // Decrypt projectId - required for encrypted wire protocol
             let projectId: string;
             if (message.request.encryptedProjectId && message.request.projectIdIv && config.encryptionKey) {
@@ -2466,6 +2535,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
               provider: message.request.provider,
               model: message.request.model,
               agentRole: message.request.agentRole,
+              targetDeviceId: message.targetDeviceId,
               timestamp: message.request.timestamp,
             };
 
@@ -2581,6 +2651,8 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
 
           case 'createWorktreeRequestBroadcast': {
             // Another device (mobile) requested worktree creation
+            const ourDeviceId = localDeviceId();
+            if (message.targetDeviceId && message.targetDeviceId !== ourDeviceId) break;
             let projectId: string;
             if (message.request.encryptedProjectId && message.request.projectIdIv && config.encryptionKey) {
               try {
@@ -2596,6 +2668,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
             const decryptedRequest: CreateWorktreeRequest = {
               requestId: message.request.requestId,
               projectId,
+              targetDeviceId: message.targetDeviceId,
               timestamp: message.request.timestamp,
             };
 
@@ -2632,12 +2705,16 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
 
           case 'sessionControlBroadcast': {
             // Generic session control message from another device
+            const ourDeviceId = localDeviceId();
+            if (message.message.targetDeviceId && message.message.targetDeviceId !== ourDeviceId) break;
             const controlMessage: SessionControlMessage = {
               sessionId: message.message.sessionId,
               type: message.message.messageType,
               payload: message.message.payload,
               timestamp: message.message.timestamp,
               sentBy: message.message.sentBy,
+              sentByDeviceId: message.message.sentByDeviceId,
+              targetDeviceId: message.message.targetDeviceId,
             };
 
             console.log('[CollabV3] Received sessionControl:', controlMessage.sessionId, controlMessage.type);
@@ -2658,7 +2735,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
             const payload = message.settings;
 
             // Don't process our own broadcasts
-            const ourDeviceId = config.getDeviceInfo?.()?.deviceId ?? config.deviceInfo?.deviceId;
+            const ourDeviceId = localDeviceId();
             if (ourDeviceId && payload.deviceId === ourDeviceId) {
               break;
             }
@@ -2699,7 +2776,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
             // listeners which merge advance-only into local state.
             const payload = message.receipt;
 
-            const ourDeviceId = config.getDeviceInfo?.()?.deviceId ?? config.deviceInfo?.deviceId;
+            const ourDeviceId = localDeviceId();
             if (ourDeviceId && payload.deviceId === ourDeviceId) {
               break;
             }
@@ -2729,7 +2806,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
 
           case 'trackerPersonalStateBroadcast': {
             const payload = message.state;
-            const ourDeviceId = config.getDeviceInfo?.()?.deviceId ?? config.deviceInfo?.deviceId;
+            const ourDeviceId = localDeviceId();
             if (ourDeviceId && payload.deviceId === ourDeviceId) break;
             if (!config.encryptionKey) {
               console.error('[CollabV3] Cannot decrypt tracker personal state - no encryption key');
@@ -2765,11 +2842,11 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
   // Log the config being used
   // console.log('[CollabV3] Initializing with config:', {
   //   serverUrl: config.serverUrl,
-  //   userId: config.userId,
+  //   personalMemberId: config.personalMemberId,
   //   hasEncryptionKey: !!config.encryptionKey,
   // });
 
-  // Start index connection. If the JWT mismatches the configured userId,
+  // Start index connection. If the JWT mismatches the configured personalMemberId,
   // ensureFreshJwt sets indexAuthBlocked and throws -- we swallow it here so we
   // don't fire an unhandled promise rejection at startup. A later explicit
   // reconnectIndex() (network change / settings update / auth refresh) will
@@ -2777,7 +2854,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
   // existing scheduleIndexReconnect path via the onclose handler.
   connectToIndex().catch(err => {
     if (isAuthMismatchError(err)) {
-      console.warn('[CollabV3] Initial index connect blocked: JWT/userId mismatch. Waiting for explicit reconnect trigger.');
+      console.warn('[CollabV3] Initial index connect blocked: JWT/personal-member mismatch. Waiting for explicit reconnect trigger.');
       return;
     }
     console.error('[CollabV3] Initial index connect failed:', err);
@@ -3032,6 +3109,11 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
         // Plaintext relationship/flag fields (incl. agentRole + createdBySessionId
         // for mobile meta-agent grouping). Single source of truth + regression lock:
         // sessionIndexEntryFields.ts / __tests__/sessionIndexEntryFields.test.ts.
+        //
+        // hostDeviceId comes from the row and only from the row. A session
+        // written before host attribution existed stays unattributed: publishing
+        // a row is not evidence of owning it, and two upgraded installs holding
+        // the same pre-upgrade session would otherwise each claim it in turn.
         ...buildSyncedSessionIndexFields(session),
         messageCount: session.messageCount,
         // lastMessageAt keeps advancing per message so mobile unread state
@@ -3104,6 +3186,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
         sessionType: session.sessionType,
         parentSessionId: session.parentSessionId,
         worktreeId: session.worktreeId,
+        hostDeviceId: entry.hostDeviceId,
         agentRole: session.agentRole,
         createdBySessionId: session.createdBySessionId ?? undefined,
         isArchived: session.isArchived,
@@ -3178,7 +3261,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
         return; // Already connected
       }
 
-      // Short-circuit when the JWT/userId mismatch latch is set. The server
+      // Short-circuit when the JWT/personal-member mismatch latch is set. The server
       // would reject any session WebSocket against this room, and an active
       // agent streams ~10 messages/sec -- without this guard every message
       // hit `ensureFreshJwt()`, threw AUTH_MISMATCH, and flooded main.log
@@ -3187,7 +3270,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
       // signals (network change, settings update, auth refresh) still
       // unblock subsequent connects.
       if (indexAuthBlocked) {
-        const err = new Error('CollabV3 session connection blocked: JWT/userId mismatch');
+        const err = new Error('CollabV3 session connection blocked: JWT/personal-member mismatch');
         (err as any).code = 'AUTH_MISMATCH';
         throw err;
       }
@@ -3231,7 +3314,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
       // covers the case where the per-session connect() is the first
       // sync call in the process and connectToIndex() hasn't latched
       // yet).
-      let jwt: string;
+      let jwt: PersonalJwt;
       try {
         ({ jwt } = await ensureFreshJwt());
       } catch (err) {
@@ -3294,8 +3377,8 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
           // the actionable code/reason. Keep this log as a breadcrumb only.
           const errorInfo = typeof ErrorEvent !== 'undefined' && event instanceof ErrorEvent
             ? { message: event.message, error: event.error }
-            : { type: event.type, target: (event.target as WebSocket)?.url };
-          console.error(`[CollabV3] WebSocket error for ${sessionId}:`, errorInfo, 'URL:', wsUrl);
+            : { type: event.type, target: redactSyncUrl((event.target as WebSocket)?.url) };
+          console.error(`[CollabV3] WebSocket error for ${sessionId}:`, errorInfo, 'URL:', redactSyncUrl(wsUrl));
           updateStatus(sessionId, { connected: false, error: 'Connection error' });
         };
 
@@ -3558,6 +3641,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
               sessionType: 'sessionType' in meta ? (meta as any).sessionType : cached.sessionType,
               parentSessionId: 'parentSessionId' in meta ? meta.parentSessionId : cached.parentSessionId,
               worktreeId: 'worktreeId' in meta ? (meta as any).worktreeId : cached.worktreeId,
+              hostDeviceId: 'hostDeviceId' in meta ? meta.hostDeviceId : cached.hostDeviceId,
               // Meta-agent grouping fields: apply when the update carries them,
               // otherwise preserve the cached value (also held by the `...cached`
               // spread above). createdBySessionId is normalized null -> undefined.
@@ -3600,6 +3684,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
               sessionType: meta.sessionType,
               parentSessionId: meta.parentSessionId,
               worktreeId: (meta as any).worktreeId,
+              hostDeviceId: meta.hostDeviceId,
               // Meta-agent grouping fields (parity with bulk path's
               // buildSyncedSessionIndexFields + sendIndexUpdate). Without these a
               // freshly-created meta agent/child reaches the server/phone ungrouped
@@ -3639,6 +3724,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
               'sessionType' in meta ||
               'parentSessionId' in meta ||
               'worktreeId' in meta ||
+              'hostDeviceId' in meta ||
               'isArchived' in meta ||
               'isPinned' in meta ||
               'queuedPrompts' in meta ||
@@ -3660,6 +3746,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
               if ('sessionType' in meta) existing.sessionType = meta.sessionType;
               if ('parentSessionId' in meta) existing.parentSessionId = meta.parentSessionId;
               if ('worktreeId' in meta) existing.worktreeId = (meta as any).worktreeId;
+              if ('hostDeviceId' in meta) existing.hostDeviceId = meta.hostDeviceId;
               if ('isArchived' in meta) existing.isArchived = meta.isArchived;
               if ('isPinned' in meta) existing.isPinned = (meta as any).isPinned;
               if ('queuedPrompts' in meta) existing.queuedPrompts = meta.queuedPrompts;
@@ -3950,7 +4037,11 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
         }
       }
 
-      const msg: ClientMessage = { type: 'createSessionRequest', request: wireRequest };
+      const msg: ClientMessage = {
+        type: 'createSessionRequest',
+        request: wireRequest,
+        targetDeviceId: request.targetDeviceId,
+      };
       // Debug logging - uncomment if needed
       // console.log('[CollabV3] Sending create_session_request:', request.requestId, 'project:', request.projectId);
       indexWs.send(JSON.stringify(msg));
@@ -4132,6 +4223,11 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
       return Array.from(connectedDevices.values());
     },
 
+    /** Get this client's own current device identity. */
+    getLocalDeviceInfo(): DeviceInfo | undefined {
+      return localDeviceInfo();
+    },
+
     /** Subscribe to device status changes (devices joining/leaving) */
     onDeviceStatusChange(callback: (devices: DeviceInfo[]) => void): () => void {
       deviceStatusListeners.add(callback);
@@ -4173,6 +4269,8 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
           payload: message.payload,
           timestamp: message.timestamp,
           sentBy: message.sentBy,
+          sentByDeviceId: message.sentByDeviceId ?? localDeviceId(),
+          targetDeviceId: message.targetDeviceId,
         },
       };
       console.log('[CollabV3] Sending sessionControl:', message.sessionId, message.type);
@@ -4214,7 +4312,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
 
       try {
         // Get our device ID
-        const deviceId = config.getDeviceInfo?.()?.deviceId ?? config.deviceInfo?.deviceId ?? 'unknown';
+        const deviceId = localDeviceId() ?? 'unknown';
 
         // Encrypt the settings as JSON
         const settingsJson = JSON.stringify(settings);
@@ -4267,7 +4365,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
         return;
       }
       try {
-        const deviceId = config.getDeviceInfo?.()?.deviceId ?? config.deviceInfo?.deviceId ?? 'unknown';
+        const deviceId = localDeviceId() ?? 'unknown';
         const receiptKey = await sha256Hex(
           `${receipt.entityKind}|${receipt.entityId}|${receipt.scope}`,
         );
@@ -4309,7 +4407,7 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
         return;
       }
       try {
-        const deviceId = config.getDeviceInfo?.()?.deviceId ?? config.deviceInfo?.deviceId ?? 'unknown';
+        const deviceId = localDeviceId() ?? 'unknown';
         const stateKey = await deriveTrackerPersonalStateKey(change.scope, change.itemId, change.kind);
         const { encrypted, iv } = await encrypt(JSON.stringify(change), config.encryptionKey);
         const version = change.kind === 'favorite' ? change.favoriteUpdatedAt : change.lastOpenedAt;
@@ -4332,8 +4430,40 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
       return () => trackerPersonalStateListeners.delete(callback);
     },
 
+    /**
+     * Push the ambient fleet snapshot to the user's Live Activity.
+     *
+     * Unlike `requestMobilePush` this does not reconnect on demand. The lane is
+     * ambient and coalesced, so a disconnected desktop simply misses an update
+     * and the phone's stale date says so -- forcing a reconnect for a card that
+     * nobody may be looking at would be the more expensive mistake, and the next
+     * transition after reconnect carries the full current state anyway.
+     */
+    async sendFleetActivity(activity: FleetActivitySnapshot, shownOnDesktop = false): Promise<void> {
+      if (!indexWs || !indexConnected || indexWs.readyState !== WebSocket.OPEN) return;
+      const msg: ClientMessage = { type: 'fleetActivityUpdate', activity, shownOnDesktop };
+      try {
+        indexWs.send(JSON.stringify(msg));
+      } catch (error) {
+        console.warn('[CollabV3] Failed to send fleet activity update:', error);
+      }
+    },
+
     /** Request the sync server to send a push notification to mobile devices */
-    async requestMobilePush(sessionId: string, title: string, body: string): Promise<void> {
+    async requestMobilePush(
+      sessionId: string,
+      title: string,
+      body: string,
+      options?: MobilePushOptions
+    ): Promise<MobilePushResult> {
+      const failed = (rejection: PushRejectionCause): MobilePushResult => ({
+        accepted: false,
+        attemptedCount: 0,
+        deliveredCount: 0,
+        skipped: [],
+        rejection,
+      });
+
       // Ensure we're connected before sending the request
       if (!indexWs || !indexConnected) {
         console.log('[CollabV3] Not connected to index, attempting to reconnect before requesting mobile push...');
@@ -4341,37 +4471,62 @@ export function createCollabV3Sync(config: SyncConfig): SyncProvider {
           await connectToIndex();
         } catch (err) {
           console.error('[CollabV3] Failed to connect to index before requesting mobile push:', err);
-          return;
+          return failed('no_ack');
         }
       }
 
       // Double-check connection and WebSocket state after await
       if (!indexWs || !indexConnected) {
         console.error('[CollabV3] Cannot request mobile push - failed to establish connection');
-        return;
+        return failed('no_ack');
       }
 
       // Check actual WebSocket state
       if (indexWs.readyState !== WebSocket.OPEN) {
         console.error('[CollabV3] Cannot request mobile push - WebSocket not open, state:', indexWs.readyState);
-        return;
+        return failed('no_ack');
       }
 
-      const deviceId = config.getDeviceInfo?.()?.deviceId ?? config.deviceInfo?.deviceId;
+      const deviceId = localDeviceId();
+      const requestId = `push-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
       const msg: ClientMessage = {
         type: 'requestMobilePush',
         sessionId: sessionId,
         title,
         body,
         requestingDeviceId: deviceId,
+        requestId,
+        force: options?.force === true,
+        reason: options?.reason,
       };
       // console.log('[CollabV3] Requesting mobile push for session:', sessionId, 'deviceId:', deviceId, 'readyState:', indexWs.readyState);
+
+      const ack = new Promise<MobilePushResult>((resolve) => {
+        // A server that never answers must not leave the caller hanging -- and
+        // a silent timeout is itself the signal that something is wrong, which
+        // is exactly what this path used to lack.
+        const timer = setTimeout(() => {
+          pendingMobilePushes.delete(requestId);
+          console.warn('[CollabV3] No mobile push acknowledgement for request:', requestId);
+          resolve(failed('no_ack'));
+        }, MOBILE_PUSH_ACK_TIMEOUT_MS);
+        pendingMobilePushes.set(requestId, { resolve, timer });
+      });
+
       try {
         indexWs.send(JSON.stringify(msg));
         // console.log('[CollabV3] Mobile push message sent successfully');
       } catch (error) {
         console.error('[CollabV3] Failed to send mobile push message:', error);
+        const pending = pendingMobilePushes.get(requestId);
+        if (pending) {
+          clearTimeout(pending.timer);
+          pendingMobilePushes.delete(requestId);
+        }
+        return failed('no_ack');
       }
+
+      return ack;
     },
 
     syncFileToIndex(file: FileIndexData): void {

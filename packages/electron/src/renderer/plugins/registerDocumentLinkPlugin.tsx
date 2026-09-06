@@ -27,11 +27,11 @@ import {
   type CollabReferenceSource,
 } from '@nimbalyst/runtime/plugins/DocumentLinkPlugin';
 import {
-  resolveDocumentLinkLookupPath,
+  resolveDocumentLinkLookupPaths,
   parseCollabReferenceDocumentId,
 } from '@nimbalyst/runtime/plugins/DocumentLinkPlugin/documentLinkPaths';
 import { ElectronRendererDocumentService } from '../services/ElectronDocumentService';
-import { isCollabUri, parseCollabUri } from '../utils/collabUri';
+import { isCollabUri, parseCollabUri } from '@nimbalyst/collab-protocol';
 import {
   sharedDocumentsAtom,
   sharedFoldersAtom,
@@ -214,20 +214,21 @@ export function registerDocumentLinkPlugin(): void {
   setWorkspaceFileLinkOpener((rawHref, currentDocumentPath) => {
     const workspacePath =
       (window as unknown as { __workspacePath?: string }).__workspacePath ?? null;
-    const resolvedPath = resolveDocumentLinkLookupPath(
+    const candidatePaths = resolveDocumentLinkLookupPaths(
       rawHref,
       currentDocumentPath,
       workspacePath,
     );
     void (async () => {
-      const resolvedDoc = resolvedPath
-        ? await documentService.getDocumentByPath(resolvedPath)
-        : null;
-      if (resolvedDoc) {
-        await documentService.openDocument(resolvedDoc.id, { path: resolvedDoc.path });
-        return;
+      for (const candidate of candidatePaths) {
+        const resolvedDoc = await documentService.getDocumentByPath(candidate);
+        if (resolvedDoc) {
+          await documentService.openDocument(resolvedDoc.id, { path: resolvedDoc.path });
+          return;
+        }
       }
-      await documentService.openDocument('', { path: resolvedPath || rawHref });
+      const fallbackPath = candidatePaths[candidatePaths.length - 1];
+      await documentService.openDocument('', { path: fallbackPath || rawHref });
     })().catch((error) => {
       console.error('Failed to open workspace file link', rawHref, error);
     });

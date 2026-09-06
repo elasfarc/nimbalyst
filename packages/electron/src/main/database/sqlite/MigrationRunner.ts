@@ -191,6 +191,56 @@ export function getMigrations(schemaDir: string): Migration[] {
       name: 'tracker_type_defs_synced_model',
       sqlFile: path.join(schemaDir, '0030_tracker_type_defs_synced_model.sql'),
     },
+    {
+      version: 31,
+      name: 'session_commits',
+      sqlFile: path.join(schemaDir, '0031_session_commits.sql'),
+    },
+    {
+      version: 32,
+      name: 'feedback_request_cache',
+      sqlFile: path.join(schemaDir, '0032_feedback_request_cache.sql'),
+    },
+    {
+      version: 33,
+      name: 'tracker_local_key',
+      sqlFile: path.join(schemaDir, '0033_tracker_local_key.sql'),
+    },
+    {
+      version: 34,
+      name: 'feedback_request_index',
+      sqlFile: path.join(schemaDir, '0034_feedback_request_index.sql'),
+    },
+    {
+      version: 35,
+      name: 'github_issues',
+      sqlFile: path.join(schemaDir, '0035_github_issues.sql'),
+    },
+    {
+      version: 36,
+      name: 'history_file_timestamp_index',
+      sqlFile: path.join(schemaDir, '0036_history_file_timestamp_index.sql'),
+    },
+    {
+      version: 37,
+      name: 'drop_unused_message_index',
+      sqlFile: path.join(schemaDir, '0037_drop_unused_message_index.sql'),
+    },
+    {
+      version: 38,
+      name: 'repair_double_quoted_review_status',
+      sqlFile: path.join(schemaDir, '0038_repair_double_quoted_review_status.sql'),
+    },
+    {
+      version: 39,
+      name: 'drop_unique_issue_number_index',
+      sqlFile: path.join(schemaDir, '0039_drop_unique_issue_number_index.sql'),
+    },
+    {
+      version: 40,
+      name: 'worktree_source_folder',
+      sqlFile: path.join(schemaDir, '0040_worktree_source_folder.sql'),
+    },
   ];
 }
 

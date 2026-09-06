@@ -10,11 +10,13 @@ import {
 import { asTeamMemberId, type TeamJwt } from '@nimbalyst/runtime';
 
 import { getCollabSyncHttpUrl } from '../utils/collabSyncUrl';
+import { logger } from '../utils/logger';
 import { getSettingsService } from './SettingsService';
 import { getSubFromJwt } from './jwtOrg';
+import { isAuthenticated, onAuthStateChange } from './StytchAuthService';
 import {
   getOrgScopedJwt,
-  listTeams,
+  listTeamDirectory,
   type TeamDetails,
 } from './TeamService';
 
@@ -31,6 +33,17 @@ export interface TeamInboxServiceDependencies {
     getTeamJwtForOrg: () => Promise<TeamJwt>,
   ) => TeamInboxOrgClientLike;
   connectConcurrency?: number;
+  /**
+   * Auth readiness. Session restore runs before Stytch finishes initializing,
+   * so the inbox can be asked to start while `listOrganizations` still answers
+   * with an empty list — see `deferUntilAuthenticated`.
+   */
+  isAuthenticated?: () => boolean;
+  onAuthStateChange?: (
+    listener: (state: { isAuthenticated: boolean }) => void,
+  ) => () => void;
+  /** Backoff schedule for a team directory that is not fetchable yet. */
+  directoryRetryDelaysMs?: readonly number[];
 }
 
 type ResolvedInboxOrganization =
@@ -51,6 +64,27 @@ const DEFAULT_SNAPSHOT: TeamInboxSnapshot = {
   organizations: [],
   presence: {},
 };
+
+const AUTH_NOT_READY_MESSAGE = 'Not authenticated. Sign in first.';
+
+/**
+ * Backoff for a team directory that is not fetchable yet, roughly a minute in
+ * total.
+ *
+ * The signal that matters is the directory's own `complete`, not an auth-state
+ * transition: Stytch reports a restored session well before `/api/teams` can be
+ * fetched against it, so on a cold start there is no future auth event to wake
+ * on and a listener-only retry parks the inbox in `loading` for the life of the
+ * run. Auth transitions still accelerate this schedule; they no longer replace
+ * it.
+ */
+const DEFAULT_DIRECTORY_RETRY_DELAYS_MS = [
+  500, 1000, 2000, 4000, 8000, 15000, 30000,
+] as const;
+
+function isAuthNotReadyError(error: unknown): boolean {
+  return error instanceof Error && error.message.includes(AUTH_NOT_READY_MESSAGE);
+}
 
 function activeOrganization(team: TeamDetails): boolean {
   return !team.membershipType || team.membershipType === 'active_member';
@@ -95,6 +129,10 @@ export class TeamInboxService {
   private fanInCleanup: (() => void) | null = null;
   private snapshot: TeamInboxSnapshot = DEFAULT_SNAPSHOT;
   private startPromise: Promise<TeamInboxSnapshot> | null = null;
+  private cancelAuthRetry: (() => void) | null = null;
+  private retryStartAfterSettle = false;
+  private directoryRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  private directoryRetryAttempt = 0;
 
   constructor(dependencies: TeamInboxServiceDependencies) {
     this.dependencies = dependencies;
@@ -103,13 +141,23 @@ export class TeamInboxService {
   start(): Promise<TeamInboxSnapshot> {
     if (this.startPromise) return this.startPromise;
     if (this.fanIn) return Promise.resolve(this.snapshot);
-    this.startPromise = this.startInternal().finally(() => {
-      this.startPromise = null;
-    });
+    this.startPromise = Promise.resolve()
+      .then(() => this.startInternal())
+      .finally(() => {
+        this.startPromise = null;
+        if (this.retryStartAfterSettle) {
+          this.retryStartAfterSettle = false;
+          void this.start().catch(() => {});
+        }
+      });
     return this.startPromise;
   }
 
   refresh(): Promise<TeamInboxSnapshot> {
+    // An explicit refresh is a fresh chance, not the next step of a schedule
+    // that may already have run out.
+    this.clearDirectoryRetry();
+    this.directoryRetryAttempt = 0;
     this.destroyFanIn();
     return this.start();
   }
@@ -140,11 +188,26 @@ export class TeamInboxService {
     await this.fanIn.dismiss(deliveryId);
   }
 
+  async claimAgentDelivery(deliveryId: string, sessionId: string): Promise<boolean> {
+    if (!this.fanIn) throw new Error('Team inbox has not started');
+    return this.fanIn.claimAgentDelivery(deliveryId, sessionId);
+  }
+
+  async completeAgentDelivery(deliveryId: string, sessionId: string): Promise<boolean> {
+    if (!this.fanIn) throw new Error('Team inbox has not started');
+    return this.fanIn.completeAgentDelivery(deliveryId, sessionId);
+  }
+
   setPresenceStatus(status: PresenceDesiredStatus): void {
     this.fanIn?.setPresenceStatus(status);
   }
 
   destroy(): void {
+    this.cancelAuthRetry?.();
+    this.cancelAuthRetry = null;
+    this.retryStartAfterSettle = false;
+    this.clearDirectoryRetry();
+    this.directoryRetryAttempt = 0;
     this.destroyFanIn();
     this.snapshot = DEFAULT_SNAPSHOT;
   }
@@ -156,9 +219,122 @@ export class TeamInboxService {
     this.fanIn = null;
   }
 
+  /**
+   * True when the caller is too early and a sign-in wake has been armed.
+   *
+   * Starting unauthenticated is not merely a slow start — it is a permanent
+   * one. `listOrganizations` returns `[]` before Stytch initializes, the fan-in
+   * comes up with no rooms, and `start()` then short-circuits on the fan-in it
+   * already has, so the inbox stays empty for the rest of the run: no
+   * notifications, no agent mention wakes, no feedback-request quorum wakes.
+   * It reports `status: 'ready'` throughout, which is indistinguishable from a
+   * healthy inbox with nothing waiting, so nothing surfaces the failure.
+   *
+   * This only observes "Stytch has no session". It is an accelerator, never the
+   * whole retry story: a restored session can be visible here while the team
+   * directory is still unfetchable, and no further auth event is coming to wake
+   * the caller. The backoff schedule is what covers that gap.
+   */
+  private deferUntilAuthenticated(): boolean {
+    const isAuthenticated = this.dependencies.isAuthenticated;
+    const onAuthStateChange = this.dependencies.onAuthStateChange;
+    if (!isAuthenticated || !onAuthStateChange) return false;
+    if (isAuthenticated()) return false;
+    // An earlier deferral is still armed; a second caller must not add another.
+    if (this.cancelAuthRetry) return true;
+    // Safe to assign after subscribing: `onAuthStateChange` notifies
+    // synchronously with the current state, and that state is unauthenticated —
+    // we just checked — so the listener cannot have run before this returns.
+    this.cancelAuthRetry = onAuthStateChange((state) => {
+      if (!state.isAuthenticated) return;
+      const unsubscribe = this.cancelAuthRetry;
+      this.cancelAuthRetry = null;
+      unsubscribe?.();
+      // A real sign-in is new information, so the schedule starts over even if
+      // an earlier one had run out.
+      this.clearDirectoryRetry();
+      this.directoryRetryAttempt = 0;
+      this.requestStartRetry();
+    });
+    return true;
+  }
+
+  private requestStartRetry(): void {
+    if (this.startPromise) {
+      this.retryStartAfterSettle = true;
+      return;
+    }
+    void this.start().catch(() => {});
+  }
+
+  private clearDirectoryRetry(): void {
+    if (!this.directoryRetryTimer) return;
+    clearTimeout(this.directoryRetryTimer);
+    this.directoryRetryTimer = null;
+  }
+
+  /**
+   * Arms the next backoff attempt, or reports the schedule exhausted.
+   *
+   * Bounded so a directory that never becomes fetchable stops costing wakeups;
+   * a later sign-in, or an explicit `refresh()`, resets it.
+   */
+  private scheduleDirectoryRetry(): boolean {
+    const delays = this.dependencies.directoryRetryDelaysMs
+      ?? DEFAULT_DIRECTORY_RETRY_DELAYS_MS;
+    const delay = delays[this.directoryRetryAttempt];
+    if (delay === undefined) return false;
+    this.directoryRetryAttempt += 1;
+    this.clearDirectoryRetry();
+    this.directoryRetryTimer = setTimeout(() => {
+      this.directoryRetryTimer = null;
+      this.requestStartRetry();
+    }, delay);
+    this.directoryRetryTimer.unref?.();
+    return true;
+  }
+
+  /**
+   * Terminal state for a directory that stayed unfetchable for the whole
+   * schedule.
+   *
+   * Deliberately not `ready` with an empty organization list: that is
+   * indistinguishable from "you belong to no teams" and is exactly the silent
+   * failure this service exists to avoid. Offline says the inbox could not be
+   * loaded, which is the truth, and keeps whatever was already cached.
+   */
+  private publishDirectoryUnreachable(): void {
+    this.publish({
+      ...this.snapshot,
+      status: this.snapshot.deliveries.length > 0
+        ? 'offlineWithCache'
+        : 'offlineWithoutCache',
+    });
+  }
+
   private async startInternal(): Promise<TeamInboxSnapshot> {
-    const teams = (await this.dependencies.listOrganizations())
-      .filter(activeOrganization);
+    let teams: TeamDetails[];
+    try {
+      // Signed out is asked about first so the common case never burns a
+      // pointless directory fetch, but its failure path is the same one below.
+      if (this.deferUntilAuthenticated()) throw new Error(AUTH_NOT_READY_MESSAGE);
+      teams = (await this.dependencies.listOrganizations())
+        .filter(activeOrganization);
+    } catch (error) {
+      if (!isAuthNotReadyError(error)) throw error;
+      // The directory is not fetchable yet. Keep asking on a bounded schedule —
+      // waiting on an auth transition instead is what parked the inbox in
+      // `loading` forever, because on a cold start that transition already
+      // happened before the first attempt.
+      if (this.scheduleDirectoryRetry()) return this.snapshot;
+      logger.main.warn(
+        '[TeamInbox] Team directory never became fetchable; giving up until sign-in or refresh',
+      );
+      this.publishDirectoryUnreachable();
+      return this.snapshot;
+    }
+    this.clearDirectoryRetry();
+    this.directoryRetryAttempt = 0;
     const concurrency = this.dependencies.connectConcurrency
       ?? DEFAULT_TEAM_INBOX_CONNECT_CONCURRENCY;
     const resolved = await mapWithConcurrency<TeamDetails, ResolvedInboxOrganization>(
@@ -252,10 +428,16 @@ let service: TeamInboxService | null = null;
 export function getTeamInboxService(): TeamInboxService {
   if (!service) {
     service = new TeamInboxService({
-      listOrganizations: listTeams,
+      listOrganizations: async () => {
+        const directory = await listTeamDirectory();
+        if (!directory.complete) throw new Error(AUTH_NOT_READY_MESSAGE);
+        return directory.teams;
+      },
       getTeamJwt: getOrgScopedJwt,
       getServerUrl: getCollabSyncHttpUrl,
       getTeamMemberId: getSubFromJwt,
+      isAuthenticated,
+      onAuthStateChange,
     });
   }
   return service;
@@ -288,6 +470,12 @@ function createFailedOrgClient(
       throw new Error(message);
     },
     async dismiss() {
+      throw new Error(message);
+    },
+    async claimAgentDelivery() {
+      throw new Error(message);
+    },
+    async completeAgentDelivery() {
       throw new Error(message);
     },
     subscribe(listener) {

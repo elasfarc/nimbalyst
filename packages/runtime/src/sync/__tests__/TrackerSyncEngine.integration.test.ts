@@ -19,15 +19,22 @@
  * sitting opposite an obedient server. Both pass = the protocol is sound.
  */
 
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { indexedDB as fakeIndexedDB } from 'fake-indexeddb';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { asTeamJwt, asTeamMemberId } from '../../auth/jwtScopes';
 import {
   TrackerSyncEngine,
   type TrackerSyncEngineConfig,
 } from '../TrackerSyncEngine';
-import { InMemoryTrackerPersistence } from '../trackerPersistence';
-import { encodeTrackerPayloadPlaintext } from '../TrackerEnvelopeCrypto';
+import {
+  IndexedDbTrackerPersistence,
+  InMemoryTrackerPersistence,
+  type StoredTrackerItem,
+  type TrackerPersistence,
+} from '../trackerPersistence';
+import { encodeTrackerPayloadPlaintext } from '../trackerEnvelopeCodec';
 import { createFakeServer, type FakeTrackerRoom } from './fakeTrackerServer';
-import type { EncryptedTrackerItemEnvelope, TrackerItemPayload } from '../trackerProtocol';
+import type { TrackerItemEnvelope, TrackerItemPayload } from '../trackerProtocol';
 
 // ============================================================================
 // Helpers
@@ -78,31 +85,83 @@ function schemaModelJson(type = 'epic'): string {
   });
 }
 
+interface InspectableTrackerPersistence extends TrackerPersistence {
+  getItem(itemId: string): Promise<StoredTrackerItem | undefined>;
+  listItems(): Promise<StoredTrackerItem[]>;
+  putItem(item: StoredTrackerItem): Promise<void>;
+  getTransaction(clientMutationId: string): Promise<import('../trackerProtocol').TrackerTransactionRow | undefined>;
+  close(): Promise<void>;
+}
+
+class InspectableInMemoryTrackerPersistence
+  extends InMemoryTrackerPersistence
+  implements InspectableTrackerPersistence {
+  async getItem(itemId: string): Promise<StoredTrackerItem | undefined> {
+    return this.items.get(itemId);
+  }
+
+  async listItems(): Promise<StoredTrackerItem[]> {
+    return [...this.items.values()];
+  }
+
+  async putItem(item: StoredTrackerItem): Promise<void> {
+    this.items.set(item.envelope.itemId, item);
+  }
+
+  async getTransaction(clientMutationId: string) {
+    return this.transactions.get(clientMutationId);
+  }
+
+  async close(): Promise<void> {}
+}
+
+interface PersistenceBackend {
+  name: string;
+  create: () => InspectableTrackerPersistence;
+}
+
+let indexedDbSequence = 0;
+const PERSISTENCE_BACKENDS: PersistenceBackend[] = [
+  {
+    name: 'in-memory',
+    create: () => new InspectableInMemoryTrackerPersistence(),
+  },
+  {
+    name: 'IndexedDB',
+    create: () => new IndexedDbTrackerPersistence(
+      `tracker-engine-integration-${indexedDbSequence++}`,
+      fakeIndexedDB,
+    ),
+  },
+];
+
 interface BuiltEngine {
   engine: TrackerSyncEngine;
-  persistence: InMemoryTrackerPersistence;
+  persistence: InspectableTrackerPersistence;
   config: TrackerSyncEngineConfig;
 }
 
-async function buildEngine(opts: {
-  room: FakeTrackerRoom;
-  serverConnect: () => WebSocket;
-  encryptionKey?: CryptoKey;
-  initializeIssueKeyPrefix?: string;
-}): Promise<BuiltEngine> {
-  const persistence = new InMemoryTrackerPersistence();
-  const config: TrackerSyncEngineConfig = {
-    serverUrl: 'ws://fake',
-    orgId: 'test-org',
-    teamProjectId: 'tracker-test-project',
-    userId: `user-${Math.random().toString(36).slice(2, 8)}`,
-    persistence,
-    initializeIssueKeyPrefix: opts.initializeIssueKeyPrefix,
-    getJwt: async () => 'fake-jwt',
-    createWebSocket: () => opts.serverConnect(),
+function createEngineBuilder(createPersistence: () => InspectableTrackerPersistence) {
+  return async function buildEngine(opts: {
+    room: FakeTrackerRoom;
+    serverConnect: () => WebSocket;
+    encryptionKey?: CryptoKey;
+    initializeIssueKeyPrefix?: string;
+  }): Promise<BuiltEngine> {
+    const persistence = createPersistence();
+    const config: TrackerSyncEngineConfig = {
+      serverUrl: 'ws://fake',
+      orgId: 'test-org',
+      teamProjectId: 'tracker-test-project',
+      teamMemberId: asTeamMemberId(`user-${Math.random().toString(36).slice(2, 8)}`),
+      persistence,
+      initializeIssueKeyPrefix: opts.initializeIssueKeyPrefix,
+      getJwt: async () => asTeamJwt('fake-jwt'),
+      createWebSocket: () => opts.serverConnect(),
+    };
+    const engine = new TrackerSyncEngine(config);
+    return { engine, persistence, config };
   };
-  const engine = new TrackerSyncEngine(config);
-  return { engine, persistence, config };
 }
 
 /**
@@ -111,9 +170,9 @@ async function buildEngine(opts: {
  * generous; tests fail with a clear timeout if a wire message gets
  * dropped.
  */
-async function waitUntil(predicate: () => boolean, timeoutMs = 500): Promise<void> {
+async function waitUntil(predicate: () => boolean | Promise<boolean>, timeoutMs = 500): Promise<void> {
   const deadline = Date.now() + timeoutMs;
-  while (!predicate()) {
+  while (!(await predicate())) {
     if (Date.now() > deadline) {
       throw new Error('waitUntil timed out');
     }
@@ -125,11 +184,25 @@ async function waitUntil(predicate: () => boolean, timeoutMs = 500): Promise<voi
 // First test: two-client delta + queue ack lifecycle
 // ============================================================================
 
-describe('TrackerSyncEngine (in-memory)', () => {
+describe.each(PERSISTENCE_BACKENDS)('TrackerSyncEngine ($name)', backend => {
   let key: CryptoKey;
+  const persistences: InspectableTrackerPersistence[] = [];
+  const buildEngine = createEngineBuilder(() => {
+    const persistence = backend.create();
+    persistences.push(persistence);
+    return persistence;
+  });
 
   beforeEach(async () => {
     key = await generateKey();
+  });
+
+  afterEach(async () => {
+    // FakeTrackerRoom delivers acks on a queued task. Let handlers finish before
+    // closing their IndexedDB connections so late acknowledgements cannot write
+    // to a deliberately closed test database.
+    await new Promise(resolve => setTimeout(resolve, 0));
+    await Promise.all(persistences.splice(0).map(persistence => persistence.close()));
   });
 
   it('round-trips an upsert: clientA enqueues, server acks, clientB sees the delta', async () => {
@@ -158,18 +231,18 @@ describe('TrackerSyncEngine (in-memory)', () => {
     await waitUntil(() => appliedOnB.includes('round-trip-1'));
 
     // Local projection on A holds the decrypted payload.
-    const localA = a.persistence.items.get('round-trip-1');
+    const localA = await a.persistence.getItem('round-trip-1');
     expect(localA?.payload?.fields.title).toBe('Round trip');
     expect(localA?.envelope.syncId).toBeGreaterThan(0);
     expect(localA?.envelope.issueKey).toBe('NIM-1');
 
     // B got the same item via broadcast.
-    const localB = b.persistence.items.get('round-trip-1');
+    const localB = await b.persistence.getItem('round-trip-1');
     expect(localB?.payload?.fields.title).toBe('Round trip');
     expect(localB?.envelope.syncId).toBe(localA?.envelope.syncId);
 
     // Queue row was deleted after the ack.
-    expect(a.persistence.transactions.has(clientMutationId)).toBe(false);
+    expect(await a.persistence.getTransaction(clientMutationId)).toBeUndefined();
 
     a.engine.destroy();
     b.engine.destroy();
@@ -226,6 +299,92 @@ describe('TrackerSyncEngine (in-memory)', () => {
     a.engine.destroy();
     b.engine.destroy();
     c.engine.destroy();
+  });
+
+  it('completes schema bootstrap before applying the first item batch', async () => {
+    const server = createFakeServer();
+    const model = schemaModelJson('epic');
+
+    let pendingSchemas = [{ type: 'epic', model, deleted: false }];
+    const publisher = await buildEngine({
+      room: server.room,
+      serverConnect: server.connect,
+      encryptionKey: key,
+    });
+    publisher.config.schemaSync = {
+      listUnsynced: async () => pendingSchemas,
+      applyRemote: async (def) => {
+        pendingSchemas = pendingSchemas.filter(row => row.type !== def.type);
+      },
+    };
+
+    await publisher.engine.connect();
+    await waitUntil(() => server.room.getStoredSchemas().length === 1);
+    await publisher.engine.upsertItem(basePayload('epic-1', { primaryType: 'epic' }));
+    await waitUntil(() => server.room.getStoredItems().length === 1);
+
+    const applicationOrder: string[] = [];
+    const subscriber = await buildEngine({
+      room: server.room,
+      serverConnect: server.connect,
+      encryptionKey: key,
+    });
+    subscriber.config.schemaSync = {
+      listUnsynced: async () => [],
+      applyRemote: async () => { applicationOrder.push('schema'); },
+    };
+    subscriber.config.onItemApplied = () => { applicationOrder.push('item'); };
+
+    await subscriber.engine.connect();
+    await waitUntil(() => subscriber.engine.getStatus() === 'connected');
+
+    expect(applicationOrder).toEqual(['schema', 'item']);
+
+    publisher.engine.destroy();
+    subscriber.engine.destroy();
+  });
+
+  it('still loads items when the schema lane never answers', async () => {
+    const server = createFakeServer();
+    const publisher = await buildEngine({
+      room: server.room,
+      serverConnect: server.connect,
+      encryptionKey: key,
+    });
+    await publisher.engine.connect();
+    await waitUntil(() => publisher.engine.getStatus() === 'connected');
+    await publisher.engine.upsertItem(basePayload('deaf-schema-1'));
+    await waitUntil(() => server.room.getStoredItems().length === 1);
+
+    // A server too old to implement `trackerSchemaSync` never answers it. The
+    // schema lane runs first, so an unbounded wait there would strand the item
+    // bootstrap behind it and leave this client with an empty tracker.
+    const subscriber = await buildEngine({
+      room: server.room,
+      encryptionKey: key,
+      serverConnect: () => {
+        const ws = server.connect();
+        const relay = ws as unknown as { onSendFromClient: ((data: string) => void) | null };
+        const forward = relay.onSendFromClient;
+        relay.onSendFromClient = (data) => {
+          if ((JSON.parse(data) as { type: string }).type === 'trackerSchemaSync') return;
+          forward?.(data);
+        };
+        return ws;
+      },
+    });
+    subscriber.config.schemaBootstrapTimeoutMs = 50;
+    subscriber.config.schemaSync = {
+      listUnsynced: async () => [],
+      applyRemote: async () => {},
+    };
+
+    await subscriber.engine.connect();
+    await waitUntil(() => subscriber.engine.getStatus() === 'connected', 2000);
+    expect(await subscriber.persistence.getItem('deaf-schema-1')).toBeDefined();
+
+    publisher.engine.destroy();
+    subscriber.engine.destroy();
   });
 
   it('syncs tracker folders and type placements through outbox, live delta, and bootstrap', async () => {
@@ -361,6 +520,57 @@ describe('TrackerSyncEngine (in-memory)', () => {
     c.engine.destroy();
   });
 
+  /**
+   * A refused saved-view write must not be re-offered forever.
+   *
+   * These lanes push from a local "unsynced" queue: `pushPendingSavedViews`
+   * drains `listUnsynced()` at the end of every bootstrap, and a row leaves the
+   * queue only when `applyRemote` writes the server's envelope over it. A
+   * rejection did neither -- `handleSavedViewAck` returned without touching the
+   * row -- so the same refused mutation was re-sent on every reconnect, and the
+   * user was told nothing.
+   *
+   * Server-side this became reachable when collabv3 v0.1.146 started refusing
+   * writes from read-only members, which is the correct answer to the wrong
+   * question if the client just asks again.
+   */
+  it('stops re-offering a saved view the server refused, and reports it', async () => {
+    const server = createFakeServer({ rejectAll: true });
+    const rejections: Array<{ code: string }> = [];
+    const marked: string[] = [];
+
+    let pending: Array<{ viewId: string; payload: string | null; deleted: boolean }> =
+      [{ viewId: 'view-refused', payload: JSON.stringify({ name: 'Nope' }), deleted: false }];
+
+    const a = await buildEngine({ room: server.room, serverConnect: server.connect, encryptionKey: key });
+    a.config.savedViewSync = {
+      getMaxSyncId: async () => 0,
+      listUnsynced: async () => pending,
+      applyRemote: async (def) => {
+        pending = pending.filter((view) => view.viewId !== def.viewId);
+      },
+      markRejected: async (viewId) => {
+        marked.push(viewId);
+        pending = pending.filter((view) => view.viewId !== viewId);
+      },
+    };
+    a.config.onRejection = (rejection) => { rejections.push({ code: rejection.rejection.code }); };
+
+    await a.engine.connect();
+    await waitUntil(() => a.engine.getStatus() === 'connected');
+    await waitUntil(() => marked.includes('view-refused'));
+
+    // The refusal reached the user rather than vanishing.
+    expect(rejections).toEqual([{ code: 'forbidden' }]);
+
+    // ...and the row is out of the queue, so a re-drain does not replay it.
+    const beforeRedrain = server.room.receivedSavedViewMutations.length;
+    await a.engine.flushSavedViews();
+    expect(server.room.receivedSavedViewMutations.length).toBe(beforeRedrain);
+
+    a.engine.destroy();
+  });
+
   // ==========================================================================
   // Stripping linked sessions at upload boundary
   // ==========================================================================
@@ -385,9 +595,9 @@ describe('TrackerSyncEngine (in-memory)', () => {
       },
     });
     await a.engine.upsertItem(payload);
-    await waitUntil(() => b.persistence.items.has('strip-1'));
+    await waitUntil(async () => (await b.persistence.getItem('strip-1')) !== undefined);
 
-    const localB = b.persistence.items.get('strip-1');
+    const localB = await b.persistence.getItem('strip-1');
     expect(localB?.payload?.fields.title).toBe('Strip me');
     expect((localB?.payload?.fields as Record<string, unknown>).linkedSessions).toBeUndefined();
 
@@ -414,9 +624,9 @@ describe('TrackerSyncEngine (in-memory)', () => {
     await waitUntil(() => rejections.length > 0);
 
     // The optimistic projection is gone (rolled back to "no row").
-    expect(a.persistence.items.has('rejected-1')).toBe(false);
+    expect(await a.persistence.getItem('rejected-1')).toBeUndefined();
     // The transaction row stays around so the UI can show the failure.
-    const txn = a.persistence.transactions.get(clientMutationId);
+    const txn = await a.persistence.getTransaction(clientMutationId);
     expect(txn).toBeDefined();
     expect(txn?.lastRejection?.code).toBe('forbidden');
     expect(rejections[0].code).toBe('forbidden');
@@ -437,14 +647,14 @@ describe('TrackerSyncEngine (in-memory)', () => {
     await waitUntil(() => a.engine.getStatus() === 'connected' && b.engine.getStatus() === 'connected');
 
     await a.engine.upsertItem(basePayload('doomed'));
-    await waitUntil(() => b.persistence.items.has('doomed'));
+    await waitUntil(async () => (await b.persistence.getItem('doomed')) !== undefined);
     await a.engine.deleteItem('doomed');
-    await waitUntil(() => {
-      const row = b.persistence.items.get('doomed');
+    await waitUntil(async () => {
+      const row = await b.persistence.getItem('doomed');
       return row?.envelope.encryptedPayload === null;
     });
 
-    const tomb = b.persistence.items.get('doomed');
+    const tomb = await b.persistence.getItem('doomed');
     expect(tomb?.envelope.encryptedPayload).toBeNull();
     expect(tomb?.envelope.deletedAt).not.toBeNull();
     expect(tomb?.payload).toBeNull();
@@ -467,7 +677,7 @@ describe('TrackerSyncEngine (in-memory)', () => {
 
     // Bootstrap an item on both peers.
     await a.engine.upsertItem(basePayload('labels-1', { fields: { title: 'Labels CRDT', status: 'to-do' } }));
-    await waitUntil(() => b.persistence.items.has('labels-1'));
+    await waitUntil(async () => (await b.persistence.getItem('labels-1')) !== undefined);
 
     // Client A adds label "bug" with its own entry id. Producers in the
     // real host adapter ship the FULL current labels map (a CRDT state) so
@@ -476,8 +686,8 @@ describe('TrackerSyncEngine (in-memory)', () => {
       fields: { title: 'Labels CRDT', status: 'to-do' },
       labels: { 'a-bug': { id: 'a-bug', value: 'bug' } },
     }));
-    await waitUntil(() => {
-      const row = b.persistence.items.get('labels-1');
+    await waitUntil(async () => {
+      const row = await b.persistence.getItem('labels-1');
       return !!row?.payload?.labels && Object.keys(row.payload.labels).includes('a-bug');
     });
 
@@ -486,19 +696,19 @@ describe('TrackerSyncEngine (in-memory)', () => {
     // entry, so the server-side row and downstream peers can converge to
     // the union. This mirrors `trackerItemToPayload` reading
     // `item.labelsMap` from PGLite before each upload.
-    const bExisting = b.persistence.items.get('labels-1')?.payload?.labels ?? {};
+    const bExisting = (await b.persistence.getItem('labels-1'))?.payload?.labels ?? {};
     await b.engine.upsertItem(basePayload('labels-1', {
       fields: { title: 'Labels CRDT', status: 'to-do' },
       labels: { ...bExisting, 'b-urgent': { id: 'b-urgent', value: 'urgent' } },
     }));
-    await waitUntil(() => {
-      const row = a.persistence.items.get('labels-1');
+    await waitUntil(async () => {
+      const row = await a.persistence.getItem('labels-1');
       const keys = row?.payload?.labels ? Object.keys(row.payload.labels) : [];
       return keys.includes('a-bug') && keys.includes('b-urgent');
     });
 
-    const localA = a.persistence.items.get('labels-1');
-    const localB = b.persistence.items.get('labels-1');
+    const localA = await a.persistence.getItem('labels-1');
+    const localB = await b.persistence.getItem('labels-1');
     // After convergence both clients hold both entries with their original
     // per-element ids and no tombstones.
     expect(localA?.payload?.labels?.['a-bug']?.value).toBe('bug');
@@ -527,18 +737,18 @@ describe('TrackerSyncEngine (in-memory)', () => {
     await a.engine.upsertItem(basePayload('A'));
     await a.engine.upsertItem(basePayload('B'));
     await a.engine.upsertItem(basePayload('C'));
-    await waitUntil(() => a.persistence.items.size === 3);
+    await waitUntil(async () => (await a.persistence.listItems()).length === 3);
 
     // A second client claims to already know up to syncId=2 -- the
     // bootstrap should only deliver C (syncId=3). Simulate by seeding
     // persistence with two pre-known items at sync_id 1 and 2 before
     // connect.
     const b = await buildEngine({ room: server.room, serverConnect: server.connect, encryptionKey: key });
-    b.persistence.items.set('A', {
+    await b.persistence.putItem({
       envelope: { itemId: 'A', syncId: 1, encryptedPayload: null, updatedAt: 0, deletedAt: null, orgKeyFingerprint: null },
       payload: null,
     });
-    b.persistence.items.set('B', {
+    await b.persistence.putItem({
       envelope: { itemId: 'B', syncId: 2, encryptedPayload: null, updatedAt: 0, deletedAt: null, orgKeyFingerprint: null },
       payload: null,
     });
@@ -546,9 +756,9 @@ describe('TrackerSyncEngine (in-memory)', () => {
     await b.engine.connect();
     await waitUntil(() => b.engine.getStatus() === 'connected');
     // C arrived through bootstrap with the real (decrypted) payload.
-    expect(b.persistence.items.get('C')?.payload?.fields.title).toBe('Item C');
+    expect((await b.persistence.getItem('C'))?.payload?.fields.title).toBe('Item C');
     // A and B were not re-delivered (still the placeholder we seeded).
-    expect(b.persistence.items.get('A')?.envelope.encryptedPayload).toBeNull();
+    expect((await b.persistence.getItem('A'))?.envelope.encryptedPayload).toBeNull();
 
     a.engine.destroy();
     b.engine.destroy();
@@ -567,11 +777,11 @@ describe('TrackerSyncEngine (in-memory)', () => {
 
     const { clientMutationId } = await a.engine.upsertItem(basePayload('offline-1'));
     // Disconnected -> the transaction stays in `queued`; nothing was sent.
-    expect(a.persistence.transactions.get(clientMutationId)?.state).toBe('queued');
+    expect((await a.persistence.getTransaction(clientMutationId))?.state).toBe('queued');
     expect(server.room.receivedMutations.length).toBe(0);
 
     await a.engine.connect();
-    await waitUntil(() => !a.persistence.transactions.has(clientMutationId), 1000);
+    await waitUntil(async () => (await a.persistence.getTransaction(clientMutationId)) === undefined, 1000);
 
     // The server received it during replay.
     expect(server.room.receivedMutations.find(m => m.clientMutationId === clientMutationId)).toBeDefined();
@@ -606,6 +816,28 @@ describe('TrackerSyncEngine (in-memory)', () => {
 
     a.engine.destroy();
     b.engine.destroy();
+  });
+
+  it('returns a legible correlated rejection when the server says a prefix is taken', async () => {
+    const server = createFakeServer({ rejectConfigPrefix: 'TAKEN' });
+    const a = await buildEngine({ room: server.room, serverConnect: server.connect, encryptionKey: key });
+    const diagnostics: string[] = [];
+    a.config.onServerError = error => diagnostics.push(error.message);
+
+    await a.engine.connect();
+    await waitUntil(() => a.engine.getStatus() === 'connected');
+    const result = await a.engine.setIssueKeyPrefix('TAKEN');
+
+    expect(result).toMatchObject({
+      success: false,
+      code: 'issueKeyPrefixTaken',
+      conflictingProjectName: 'Other Project',
+      suggestedPrefix: 'FREE',
+    });
+    expect(result.message).toContain('already used by project "Other Project"');
+    expect(diagnostics).toEqual([result.message]);
+    expect(a.engine.getStatus()).toBe('connected');
+    a.engine.destroy();
   });
 
   it('initializes an empty room with the project-derived issue prefix', async () => {
@@ -669,16 +901,16 @@ describe('TrackerSyncEngine (in-memory)', () => {
       a.engine.upsertItem(basePayload('concur-A')),
       b.engine.upsertItem(basePayload('concur-B')),
     ]);
-    await waitUntil(() =>
-      a.persistence.items.has('concur-A') &&
-      a.persistence.items.has('concur-B') &&
-      b.persistence.items.has('concur-A') &&
-      b.persistence.items.has('concur-B'),
+    await waitUntil(async () =>
+      (await a.persistence.getItem('concur-A')) !== undefined &&
+      (await a.persistence.getItem('concur-B')) !== undefined &&
+      (await b.persistence.getItem('concur-A')) !== undefined &&
+      (await b.persistence.getItem('concur-B')) !== undefined,
     );
 
     const syncIds = [
-      a.persistence.items.get('concur-A')!.envelope.syncId,
-      a.persistence.items.get('concur-B')!.envelope.syncId,
+      (await a.persistence.getItem('concur-A'))!.envelope.syncId,
+      (await a.persistence.getItem('concur-B'))!.envelope.syncId,
     ];
     expect(syncIds[0]).not.toBe(syncIds[1]);
 
@@ -701,11 +933,11 @@ describe('TrackerSyncEngine (in-memory)', () => {
     // First write at bodyVersion=1 (the renderer save path bumps from 0
     // to 1 on the first edit).
     await a.engine.upsertItem(basePayload('bv-1', { bodyVersion: 1 }));
-    await waitUntil(() => b.persistence.items.get('bv-1')?.payload?.bodyVersion === 1);
+    await waitUntil(async () => (await b.persistence.getItem('bv-1'))?.payload?.bodyVersion === 1);
 
     // Second write bumps to 2; B should see the bumped pointer.
     await a.engine.upsertItem(basePayload('bv-1', { bodyVersion: 2 }));
-    await waitUntil(() => b.persistence.items.get('bv-1')?.payload?.bodyVersion === 2);
+    await waitUntil(async () => (await b.persistence.getItem('bv-1'))?.payload?.bodyVersion === 2);
 
     a.engine.destroy();
     b.engine.destroy();
@@ -725,6 +957,40 @@ describe('TrackerSyncEngine (in-memory)', () => {
 
     await a.engine.upsertItem(basePayload('pe-1'), { persistedEnqueue: true });
     expect(spy).toHaveBeenCalledOnce();
+
+    a.engine.destroy();
+  });
+
+  it('sends update-many once and rolls every optimistic row back on batch rejection', async () => {
+    const server = createFakeServer();
+    const a = await buildEngine({ room: server.room, serverConnect: server.connect, encryptionKey: key });
+    const rejected: string[] = [];
+    a.config.onRejection = rejection => rejected.push(rejection.itemId);
+
+    await a.engine.connect();
+    await waitUntil(() => a.engine.getStatus() === 'connected');
+    await a.engine.upsertItem(basePayload('batch-1'), { persistedEnqueue: true });
+    await a.engine.upsertItem(basePayload('batch-2'), { persistedEnqueue: true });
+    await waitUntil(async () => (
+      (await a.persistence.getItem('batch-1'))?.envelope.syncId! > 0
+      && (await a.persistence.getItem('batch-2'))?.envelope.syncId! > 0
+    ));
+
+    server.room.receivedMutations.splice(0);
+    server.room.receivedMutationMessages = 0;
+    server.room.setRejectAll(true);
+    const applyBatch = vi.spyOn(a.persistence, 'applyAndEnqueueBatchAtomically');
+    await a.engine.upsertItems([
+      basePayload('batch-1', { fields: { title: 'Changed one' } }),
+      basePayload('batch-2', { fields: { title: 'Changed two' } }),
+    ]);
+
+    await waitUntil(() => rejected.length === 2);
+    expect(applyBatch).toHaveBeenCalledOnce();
+    expect(server.room.receivedMutationMessages).toBe(1);
+    expect(server.room.receivedMutations.map(mutation => mutation.itemId)).toEqual(['batch-1', 'batch-2']);
+    expect((await a.persistence.getItem('batch-1'))?.payload?.fields.title).toBe('Item batch-1');
+    expect((await a.persistence.getItem('batch-2'))?.payload?.fields.title).toBe('Item batch-2');
 
     a.engine.destroy();
   });
@@ -761,16 +1027,21 @@ describe('TrackerSyncEngine (in-memory)', () => {
 
       // Bootstrap is empty: nothing was applied; nothing is in persistence.
       expect(applied).toHaveLength(0);
-      expect(a.persistence.items.size).toBe(0);
+      expect(await a.persistence.listItems()).toHaveLength(0);
 
       // First mutation against the new room: succeeds with a fresh issueKey
       // and syncId starts at 1. Wait for the ack (not just the optimistic
       // apply) -- the optimistic envelope carries syncId=0 until the server
       // assigns the real one.
-      await a.engine.upsertItem(basePayload('newroom-1', { fields: { title: 'first item' } }));
-      await waitUntil(() => (a.persistence.items.get('newroom-1')?.envelope.syncId ?? 0) > 0);
+      const { clientMutationId } = await a.engine.upsertItem(
+        basePayload('newroom-1', { fields: { title: 'first item' } }),
+      );
+      await waitUntil(async () =>
+        ((await a.persistence.getItem('newroom-1'))?.envelope.syncId ?? 0) > 0
+        && (await a.persistence.getTransaction(clientMutationId)) === undefined,
+      );
 
-      const row = a.persistence.items.get('newroom-1');
+      const row = await a.persistence.getItem('newroom-1');
       expect(row?.envelope.syncId).toBe(1);
       expect(row?.envelope.issueKey).toBe('NIM-1');
       expect(row?.payload?.fields.title).toBe('first item');
@@ -796,19 +1067,21 @@ describe('TrackerSyncEngine (in-memory)', () => {
       await a.engine.connect();
       await waitUntil(() => a.engine.getStatus() === 'connected');
 
-      await a.engine.upsertItem(basePayload('survives-1', { fields: { title: 'A' } }));
-      await a.engine.upsertItem(basePayload('survives-2', { fields: { title: 'B' } }));
+      const firstMutation = await a.engine.upsertItem(basePayload('survives-1', { fields: { title: 'A' } }));
+      const secondMutation = await a.engine.upsertItem(basePayload('survives-2', { fields: { title: 'B' } }));
       // Wait for both items' acks (envelope.syncId > 0 indicates the
       // server's confirmed projection has been written). Without this the
       // cloned persistence may carry one un-acked envelope with syncId=0.
-      await waitUntil(() =>
-        (a.persistence.items.get('survives-1')?.envelope.syncId ?? 0) > 0 &&
-        (a.persistence.items.get('survives-2')?.envelope.syncId ?? 0) > 0,
+      await waitUntil(async () =>
+        ((await a.persistence.getItem('survives-1'))?.envelope.syncId ?? 0) > 0 &&
+        ((await a.persistence.getItem('survives-2'))?.envelope.syncId ?? 0) > 0 &&
+        (await a.persistence.getTransaction(firstMutation.clientMutationId)) === undefined &&
+        (await a.persistence.getTransaction(secondMutation.clientMutationId)) === undefined,
       );
 
       const survivingSyncIds = [
-        a.persistence.items.get('survives-1')!.envelope.syncId,
-        a.persistence.items.get('survives-2')!.envelope.syncId,
+        (await a.persistence.getItem('survives-1'))!.envelope.syncId,
+        (await a.persistence.getItem('survives-2'))!.envelope.syncId,
       ];
       const maxSyncId = Math.max(...survivingSyncIds);
 
@@ -823,8 +1096,8 @@ describe('TrackerSyncEngine (in-memory)', () => {
       // Clone clientA's persistence into clientB so clientB starts with a
       // populated local cache and a non-zero high-water mark.
       const b = await buildEngine({ room: server.room, serverConnect: server.connect, encryptionKey: key });
-      for (const [itemId, row] of a.persistence.items) {
-        b.persistence.items.set(itemId, row);
+      for (const row of await a.persistence.listItems()) {
+        await b.persistence.putItem(row);
       }
       expect(await b.persistence.getMaxSyncId()).toBe(maxSyncId);
 
@@ -839,15 +1112,436 @@ describe('TrackerSyncEngine (in-memory)', () => {
 
       // Local state survives the empty bootstrap; the engine did not
       // delete clientB's rows on its own.
-      expect(b.persistence.items.has('survives-1')).toBe(true);
-      expect(b.persistence.items.has('survives-2')).toBe(true);
-      expect(b.persistence.items.get('survives-1')?.payload?.fields.title).toBe('A');
-      expect(b.persistence.items.get('survives-2')?.payload?.fields.title).toBe('B');
+      expect(await b.persistence.getItem('survives-1')).toBeDefined();
+      expect(await b.persistence.getItem('survives-2')).toBeDefined();
+      expect((await b.persistence.getItem('survives-1'))?.payload?.fields.title).toBe('A');
+      expect((await b.persistence.getItem('survives-2'))?.payload?.fields.title).toBe('B');
       // No tombstones were synthesized client-side from "the server didn't
       // tell me about these items".
       expect(tombstoneEvents).toHaveLength(0);
 
       b.engine.destroy();
     });
+  });
+});
+
+describe('IndexedDbTrackerPersistence durability', () => {
+  const databaseNames: string[] = [];
+  const openPersistences: IndexedDbTrackerPersistence[] = [];
+
+  function createPersistence(): IndexedDbTrackerPersistence {
+    const databaseName = `tracker-persistence-durability-${indexedDbSequence++}`;
+    databaseNames.push(databaseName);
+    return openPersistence(databaseName);
+  }
+
+  function openPersistence(databaseName: string): IndexedDbTrackerPersistence {
+    const persistence = new IndexedDbTrackerPersistence(databaseName, fakeIndexedDB);
+    openPersistences.push(persistence);
+    return persistence;
+  }
+
+  afterEach(async () => {
+    await Promise.all(openPersistences.splice(0).map(persistence => persistence.close()));
+    await Promise.all(databaseNames.splice(0).map(databaseName => new Promise<void>((resolve, reject) => {
+      const request = fakeIndexedDB.deleteDatabase(databaseName);
+      request.addEventListener('success', () => resolve(), { once: true });
+      request.addEventListener('error', () => reject(request.error), { once: true });
+    })));
+  });
+
+  it('quietly ignores every persistence operation after close', async () => {
+    const persistence = createPersistence();
+    const payload = basePayload('disposed-operation');
+    const envelope: TrackerItemEnvelope = {
+      itemId: payload.itemId,
+      syncId: 1,
+      encryptedPayload: encodeTrackerPayloadPlaintext(payload),
+      updatedAt: 1,
+      deletedAt: null,
+      orgKeyFingerprint: null,
+    };
+    const row: import('../trackerProtocol').TrackerTransactionRow = {
+      clientMutationId: 'disposed-operation',
+      itemId: payload.itemId,
+      workspacePath: '',
+      state: 'queued',
+      kind: 'update',
+      payload,
+      enqueuedAt: 1,
+    };
+    const emptySnapshot = { payload: null, syncId: null, isTombstone: false };
+
+    await persistence.close();
+
+    await expect(Promise.all([
+      persistence.getMaxSyncId(),
+      persistence.applyRemoteItem(envelope, payload),
+      persistence.applyOptimistic(payload.itemId, payload),
+      persistence.rollbackOptimistic(payload.itemId, emptySnapshot),
+      persistence.enqueueTransaction(row),
+      persistence.applyAndEnqueueAtomically(payload.itemId, payload, row),
+      persistence.applyAndEnqueueBatchAtomically([{ itemId: payload.itemId, payload, row }]),
+      persistence.markTransactionStates([row.clientMutationId], 'executing'),
+      persistence.markTransactionState(row.clientMutationId, 'executing'),
+      persistence.ackTransaction(row.clientMutationId, 1),
+      persistence.rejectTransaction(row.clientMutationId, {
+        code: 'forbidden',
+        message: 'rejected after disposal',
+        occurredAt: 1,
+      }),
+      persistence.loadPendingTransactions(),
+      persistence.getItem(payload.itemId),
+      persistence.getItems([payload.itemId]),
+      persistence.listItems(),
+      persistence.putItem({ envelope, payload }),
+      persistence.getTransaction(row.clientMutationId),
+      persistence.getMaxSavedViewSyncId(),
+      persistence.listSavedViews(),
+      persistence.putLocalSavedView('disposed-view', '{}'),
+      persistence.applyRemoteSavedView('disposed-view', '{}', 1),
+      persistence.markSavedViewRejected('disposed-view', 'forbidden'),
+      persistence.purgeAll(),
+    ])).resolves.toEqual([
+      0,
+      undefined,
+      emptySnapshot,
+      undefined,
+      undefined,
+      emptySnapshot,
+      [emptySnapshot],
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      [],
+      undefined,
+      [undefined],
+      [],
+      undefined,
+      undefined,
+      0,
+      [],
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+    ]);
+  });
+
+  it('resumes a new instance from the persisted syncId', async () => {
+    const first = createPersistence();
+    await first.applyRemoteItem({
+      itemId: 'resume-1',
+      syncId: 41,
+      encryptedPayload: encodeTrackerPayloadPlaintext(basePayload('resume-1')),
+      updatedAt: 1,
+      deletedAt: null,
+      orgKeyFingerprint: null,
+    }, basePayload('resume-1'));
+    const databaseName = first.databaseName;
+    await first.close();
+
+    const resumed = openPersistence(databaseName);
+    expect(await resumed.getMaxSyncId()).toBe(41);
+    expect((await resumed.getItem('resume-1'))?.payload?.fields.title).toBe('Item resume-1');
+    await resumed.close();
+  });
+
+  it('retains a pending transaction across instances', async () => {
+    const first = createPersistence();
+    const row: import('../trackerProtocol').TrackerTransactionRow = {
+      clientMutationId: 'pending-before-reload',
+      itemId: 'pending-1',
+      workspacePath: '',
+      state: 'queued',
+      kind: 'update',
+      payload: basePayload('pending-1'),
+      enqueuedAt: 10,
+    };
+    await first.enqueueTransaction(row);
+    const databaseName = first.databaseName;
+    await first.close();
+
+    const resumed = openPersistence(databaseName);
+    expect(await resumed.loadPendingTransactions()).toEqual([row]);
+    await resumed.close();
+  });
+
+  it('does not replay member A pending work under member B credentials', async () => {
+    const server = createFakeServer();
+    const first = createPersistence();
+    const databaseName = first.databaseName;
+    const memberA = new TrackerSyncEngine({
+      serverUrl: 'ws://fake',
+      orgId: 'test-org',
+      teamProjectId: 'member-owned-outbox',
+      teamMemberId: asTeamMemberId('member-a'),
+      persistence: first,
+      getJwt: async () => asTeamJwt('member-a-jwt'),
+      createWebSocket: () => server.connect(),
+    });
+
+    const { clientMutationId } = await memberA.upsertItem(basePayload('alice-offline-write'), {
+      persistedEnqueue: true,
+    });
+    memberA.destroy();
+    await first.close();
+
+    const resumed = openPersistence(databaseName);
+    const memberB = new TrackerSyncEngine({
+      serverUrl: 'ws://fake',
+      orgId: 'test-org',
+      teamProjectId: 'member-owned-outbox',
+      teamMemberId: asTeamMemberId('member-b'),
+      persistence: resumed,
+      getJwt: async () => asTeamJwt('member-b-jwt'),
+      createWebSocket: () => server.connect(),
+    });
+
+    await memberB.connect();
+    await waitUntil(() => memberB.getStatus() === 'connected');
+    await new Promise(resolve => setTimeout(resolve, 20));
+
+    expect(server.room.receivedMutations).toEqual([]);
+    expect(await resumed.getTransaction(clientMutationId)).toBeDefined();
+
+    memberB.destroy();
+    await resumed.close();
+  });
+
+  it('durably rolls back a terminal rejection after reload and never replays it on reconnect', async () => {
+    const original = basePayload('reload-rejection', {
+      fields: { title: 'Server-confirmed title', status: 'to-do' },
+    });
+    const first = createPersistence();
+    const databaseName = first.databaseName;
+    await first.applyRemoteItem({
+      itemId: original.itemId,
+      syncId: 9,
+      encryptedPayload: encodeTrackerPayloadPlaintext(original),
+      updatedAt: Date.now(),
+      deletedAt: null,
+      orgKeyFingerprint: null,
+    }, original);
+    const beforeReload = new TrackerSyncEngine({
+      serverUrl: 'ws://fake',
+      orgId: 'test-org',
+      teamProjectId: 'durable-rejection',
+      teamMemberId: asTeamMemberId('same-member'),
+      persistence: first,
+      getJwt: async () => asTeamJwt('same-member-jwt'),
+    });
+    const changed = basePayload('reload-rejection', {
+      fields: { title: 'Optimistic title', status: 'in-progress' },
+    });
+    const { clientMutationId } = await beforeReload.upsertItem(changed, { persistedEnqueue: true });
+    expect((await first.getItem(original.itemId))?.payload?.fields.title).toBe('Optimistic title');
+    beforeReload.destroy();
+    await first.close();
+
+    const server = createFakeServer({ rejectAll: true });
+    const resumed = openPersistence(databaseName);
+    const rejections: string[] = [];
+    const afterReload = new TrackerSyncEngine({
+      serverUrl: 'ws://fake',
+      orgId: 'test-org',
+      teamProjectId: 'durable-rejection',
+      teamMemberId: asTeamMemberId('same-member'),
+      persistence: resumed,
+      getJwt: async () => asTeamJwt('same-member-jwt'),
+      createWebSocket: () => server.connect(),
+      onRejection: rejection => rejections.push(rejection.clientMutationId),
+    });
+
+    await afterReload.connect();
+    await waitUntil(() => rejections.includes(clientMutationId), 1000);
+    expect((await resumed.getItem(original.itemId))?.payload?.fields.title).toBe('Server-confirmed title');
+    expect((await resumed.getTransaction(clientMutationId))?.lastRejection?.code).toBe('forbidden');
+    expect(server.room.receivedMutations).toHaveLength(1);
+
+    server.room.setRejectAll(false);
+    afterReload.disconnect();
+    await afterReload.connect();
+    await waitUntil(() => afterReload.getStatus() === 'connected');
+    await new Promise(resolve => setTimeout(resolve, 20));
+
+    expect(server.room.receivedMutations).toHaveLength(1);
+    expect(server.room.getStoredItems()).toEqual([]);
+
+    afterReload.destroy();
+    await resumed.close();
+  });
+});
+
+// ============================================================================
+// Terminal refusal vs ordinary drop
+// ============================================================================
+
+/**
+ * A socket that only ever closes. Enough surface for the engine's listener
+ * wiring, and nothing else -- the point of these two cases is what the engine
+ * does with the close frame, not what it does with the room.
+ */
+class ClosingSocket {
+  readyState = 0;
+  private readonly listeners = new Map<string, Set<(event: Event) => void>>();
+
+  addEventListener(type: string, cb: (event: Event) => void): void {
+    let set = this.listeners.get(type);
+    if (!set) this.listeners.set(type, (set = new Set()));
+    set.add(cb);
+  }
+
+  removeEventListener(type: string, cb: (event: Event) => void): void {
+    this.listeners.get(type)?.delete(cb);
+  }
+
+  send(): void {}
+
+  close(): void {
+    this.readyState = 3;
+  }
+
+  /** The server hanging up, with the code that says why. */
+  serverClose(code: number, reason: string): void {
+    this.readyState = 3;
+    for (const cb of this.listeners.get('close') ?? []) {
+      cb(new CloseEvent('close', { code, reason }));
+    }
+  }
+}
+
+describe('TrackerSyncEngine terminal access refusal', () => {
+  function build() {
+    const sockets: ClosingSocket[] = [];
+    const engine = new TrackerSyncEngine({
+      serverUrl: 'ws://fake',
+      orgId: 'test-org',
+      teamProjectId: 'tracker-refusal-project',
+      teamMemberId: asTeamMemberId('member-refusal'),
+      persistence: new InMemoryTrackerPersistence(),
+      // Skips the JWT await, so the socket exists synchronously and the test
+      // never has to guess how many microtasks a connect costs.
+      buildUrl: () => 'ws://fake/room',
+      getJwt: async () => asTeamJwt('unused'),
+      createWebSocket: () => {
+        const socket = new ClosingSocket();
+        sockets.push(socket);
+        return socket as unknown as WebSocket;
+      },
+    });
+    return { engine, sockets };
+  }
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('stops for good on a revocation close, and keeps retrying an ordinary one', async () => {
+    vi.useFakeTimers();
+
+    const revoked = build();
+    await revoked.engine.connect();
+    revoked.sockets[0].serverClose(4003, 'Tracker access revoked');
+
+    expect(revoked.engine.getAccessTermination()).toMatchObject({
+      reason: 'tracker-access-revoked',
+    });
+    // Not `disconnected`: that status is what an offline tab renders as
+    // "reconnecting", and this connection is not coming back.
+    expect(revoked.engine.getStatus()).toBe('error');
+
+    // A minute is far past the 30s reconnect ceiling, so this is a retry that
+    // was cancelled rather than one still owed.
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(revoked.sockets).toHaveLength(1);
+    await revoked.engine.connect();
+    expect(revoked.sockets).toHaveLength(1);
+
+    // The control. Without it, an engine that simply stopped reconnecting for
+    // every close would pass the assertions above and take offline tabs down
+    // with it.
+    const dropped = build();
+    await dropped.engine.connect();
+    dropped.sockets[0].serverClose(1006, '');
+    expect(dropped.engine.getAccessTermination()).toBeNull();
+    expect(dropped.engine.getStatus()).toBe('disconnected');
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(dropped.sockets.length).toBeGreaterThan(1);
+
+    revoked.engine.destroy();
+    dropped.engine.destroy();
+  });
+});
+
+// ============================================================================
+// Recovery for rows the old issue-key collision branch stranded
+// ============================================================================
+
+describe('TrackerSyncEngine stranded-identity recovery', () => {
+  const build = createEngineBuilder(() => new InspectableInMemoryTrackerPersistence());
+
+  /**
+   * The rows this repairs are `synced`, carry a `sync_id`, and hold no issue
+   * key, so the ordinary bootstrap -- which starts at `MAX(sync_id)` -- can
+   * never reach them again. The host reports them through `getFacts`; every
+   * step after that is the real engine over the real protocol.
+   *
+   * This exercise exists because a repair that is defined and unit-tested but
+   * never actually driven from the bootstrap is the failure destructive-data
+   * -paths.md calls out by name.
+   */
+  it('rewinds the bootstrap cursor and re-applies the rows the room still owns', async () => {
+    const server = createFakeServer();
+    const key = await generateKey();
+
+    const author = await build({ room: server.room, serverConnect: server.connect, encryptionKey: key });
+    await author.engine.connect();
+    await waitUntil(() => author.engine.getStatus() === 'connected');
+    for (const id of ['stranded-1', 'stranded-2', 'later-3']) {
+      await author.engine.upsertItem(basePayload(id));
+    }
+
+    let markedAttempted = 0;
+    const victim = await build({ room: server.room, serverConnect: server.connect, encryptionKey: key });
+    // Put the ordinary cursor past everything the room holds. This is what a
+    // stranded workspace actually looks like: the rows are below MAX(sync_id),
+    // so `trackerSync` from the watermark returns an empty batch forever.
+    victim.persistence.getMaxSyncId = async () => 999;
+    victim.config.identityRecovery = {
+      getFacts: async () => ({ strandedCount: 2, minStrandedSyncId: 1, alreadyAttempted: false }),
+      markAttempted: async () => { markedAttempted += 1; },
+    };
+
+    await victim.engine.connect();
+    await waitUntil(() => victim.engine.getStatus() === 'connected');
+
+    // Only the rewind can have delivered these.
+    expect(await victim.persistence.getItem('stranded-1')).not.toBeNull();
+    expect(await victim.persistence.getItem('stranded-2')).not.toBeNull();
+    expect(await victim.persistence.getItem('later-3')).not.toBeNull();
+    expect(markedAttempted).toBe(1);
+
+    author.engine.destroy();
+    victim.engine.destroy();
+  });
+
+  it('does not rewind when the host reports nothing stranded', async () => {
+    const server = createFakeServer();
+    const key = await generateKey();
+
+    let markedAttempted = 0;
+    const client = await build({ room: server.room, serverConnect: server.connect, encryptionKey: key });
+    client.config.identityRecovery = {
+      getFacts: async () => ({ strandedCount: 0, minStrandedSyncId: 0, alreadyAttempted: false }),
+      markAttempted: async () => { markedAttempted += 1; },
+    };
+
+    await client.engine.connect();
+    await waitUntil(() => client.engine.getStatus() === 'connected');
+
+    expect(markedAttempted).toBe(0);
+    client.engine.destroy();
   });
 });

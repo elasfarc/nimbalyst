@@ -47,8 +47,12 @@ export interface ClaudeCliSessionLauncherDeps {
     sessionId: string;
     workspacePath: string;
   }) => Promise<Record<string, unknown>>;
-  /** Resolve the `claude` executable path. Falls back to the bare `claude`. */
-  resolveClaudeExecutable: () => string;
+  /**
+   * Resolve the `claude` executable path for this workspace. Falls back to the
+   * bare `claude`. Takes the workspace so the user's "Custom Claude executable
+   * path" setting resolves with its project-level override (#1296).
+   */
+  resolveClaudeExecutable: (workspacePath: string) => string;
   /** Login-shell-enhanced PATH so a GUI-launched Electron can find `claude`. */
   getEnhancedPath: () => string;
   /** Terminal manager that spawns the PTY-backed terminal strip. */
@@ -132,6 +136,12 @@ export interface LaunchClaudeCliSessionInput {
   model?: string;
   /** Resume an existing CLI session id (`--resume <id>`). */
   resumeSessionId?: string;
+  /**
+   * Resolved effort level for this session, forwarded to the CLI as
+   * `CLAUDE_CODE_EFFORT_LEVEL` (parity with the Agent SDK path). Omit to leave
+   * the CLI on its own default.
+   */
+  effortLevel?: string;
   cols?: number;
   rows?: number;
   /**
@@ -280,7 +290,7 @@ export class ClaudeCliSessionLauncher {
 
     // 2.6. Resolve the `claude` executable once (reused for the plugin-support
     // probe and the spawn config below).
-    const claudeExecutable = this.deps.resolveClaudeExecutable();
+    const claudeExecutable = this.deps.resolveClaudeExecutable(workspacePath);
 
     // NIM-845: load extension Claude-plugin directories so namespaced slash
     // commands (`/feedback:bug-report`, …) resolve in this CLI session. Gate on
@@ -319,6 +329,7 @@ export class ClaudeCliSessionLauncher {
       baseEnv: this.deps.baseEnv ?? process.env,
       enhancedPath: this.deps.getEnhancedPath(),
       extraEnv,
+      effortLevel: input.effortLevel,
       allowedMcpServerNames,
       settingsJson,
       dangerouslySkipPermissions,

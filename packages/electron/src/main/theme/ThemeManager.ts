@@ -1,9 +1,10 @@
 import { BrowserWindow, nativeTheme } from 'electron';
-import { getTheme, getThemeIsDark } from '../utils/store';
+import { getTheme, getThemeIsDark, getThemeBackgroundColor, clearThemeBackgroundColor } from '../utils/store';
 import {
     getTitleBarOverlayColors,
     resetTitleBarOverlayColors,
 } from '../window/windowChrome';
+import { isWindowTransparent } from '../window/transparentWindows';
 
 /**
  * Determine if the current theme is dark.
@@ -62,16 +63,24 @@ export function updateWindowTitleBars() {
 
     // Select appropriate colors based on whether theme is dark or light
     const titleBarColor = isDarkTheme ? titleBarColors.dark : titleBarColors.light;
-    const backgroundColor = isDarkTheme ? '#1a1a1a' : '#ffffff';
 
     // A main-process theme change invalidates the renderer-resolved color
     // until the renderer applies the new theme and reports its computed vars.
+    // The remembered canvas colour is stale for the same reason, and unlike the
+    // title bar it outlives the process, so it has to be dropped rather than
+    // just reset — otherwise the next launch paints the old theme's colour.
     resetTitleBarOverlayColors(titleBarColor);
+    clearThemeBackgroundColor();
+
+    const backgroundColor = fallbackBackgroundColor(currentTheme);
 
     // Update all windows
     BrowserWindow.getAllWindows().forEach(window => {
-        // Update background color
-        window.setBackgroundColor(backgroundColor);
+        // Update background color -- except on a window created transparent,
+        // where this would paint it opaque permanently. See transparentWindows.
+        if (!isWindowTransparent(window)) {
+            window.setBackgroundColor(backgroundColor);
+        }
 
         // Send theme-change event to all windows
         // Each window's renderer listens to this and updates its own UI
@@ -92,10 +101,25 @@ export function getTitleBarColors() {
     return getTitleBarOverlayColors(fallback);
 }
 
-// Get background color for current theme
-// Note: For file-based themes, the actual --nim-bg may differ from this initial color.
-// This is used for the window background before the renderer loads.
+/**
+ * Base-theme canvas colour, for when no renderer has reported a real one yet
+ * (first ever launch, or a window opened between a theme change and the
+ * renderer applying it). These MUST track --nim-bg in NimbalystTheme.css.
+ */
+function fallbackBackgroundColor(theme: string): string {
+    if (theme === 'crystal-dark') return '#0f172a';
+    return isCurrentThemeDark(theme) ? '#2d2d2d' : '#ffffff';
+}
+
+/**
+ * The colour to paint a window's canvas with before the renderer loads.
+ *
+ * Prefers the active theme's real --nim-bg as last reported by the renderer,
+ * which is the only way main can know the colour of an extension or file-based
+ * theme — those live in the renderer's theme registry, so resolving them here
+ * would otherwise collapse to a base light/dark stand-in and open a light
+ * extension theme on white.
+ */
 export function getBackgroundColor() {
-    const isDarkTheme = isCurrentThemeDark(getTheme());
-    return isDarkTheme ? '#1a1a1a' : '#ffffff';
+    return getThemeBackgroundColor() ?? fallbackBackgroundColor(getTheme());
 }

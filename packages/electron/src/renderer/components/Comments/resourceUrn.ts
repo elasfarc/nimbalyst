@@ -16,6 +16,7 @@
  * `parseResourceUrn` returns null for them and `parseMentionUrn` exists.
  */
 
+import { feedbackRequestUrn, parseFeedbackRequestUrn } from '@nimbalyst/collab-protocol';
 import type { CommentRef, ResourceRef, ResourceKind } from './commentTypes';
 
 const SCHEME = 'nimbalyst://';
@@ -29,6 +30,8 @@ const KIND_SEGMENT: Record<ResourceKind, string> = {
   file: 'file',
   commit: 'commit',
   pullRequest: 'pull',
+  // Matches `feedbackRequestUrn`, which stays the authority for forming one.
+  feedbackRequest: 'feedback-request',
 };
 
 const SEGMENT_KIND: Record<string, ResourceKind> = Object.fromEntries(
@@ -49,9 +52,12 @@ export function isProjectScopedKind(kind: ResourceKind): boolean {
  * paths, which legitimately contain slashes and spaces.
  */
 export function resourceRefToUrn(ref: ResourceRef): string {
-  const segment = KIND_SEGMENT[ref.kind as ResourceKind];
+  if (ref.kind === 'feedbackRequest') {
+    return feedbackRequestUrn(ref.sourceId);
+  }
+  const segment = KIND_SEGMENT[ref.kind];
   const id = encodeURIComponent(ref.sourceId);
-  if (PROJECT_SCOPED.has(ref.kind as ResourceKind)) {
+  if (PROJECT_SCOPED.has(ref.kind)) {
     return `${SCHEME}project/${encodeURIComponent(ref.projectId ?? '')}/${segment}/${id}`;
   }
   if (ref.kind === 'conversation' && ref.messageId) {
@@ -68,6 +74,10 @@ export function resourceRefToUrn(ref: ResourceRef): string {
  * accepting a cross-org id out of body text would be a trust hole.
  */
 export function parseResourceUrn(urn: string, orgId: string): ResourceRef | null {
+  const feedbackRequestId = parseFeedbackRequestUrn(urn);
+  if (feedbackRequestId) {
+    return { orgId, kind: 'feedbackRequest', sourceId: feedbackRequestId };
+  }
   if (!urn.startsWith(SCHEME)) return null;
   const parts = urn.slice(SCHEME.length).split('/').filter((part) => part.length > 0);
   if (parts.length < 2) return null;
@@ -103,13 +113,21 @@ export interface PastedResourceLink {
 }
 
 /**
- * Turn the shareable tracker URLs copied by Tracker Mode into the canonical
+ * Turn the shareable URLs copied elsewhere in Nimbalyst into the canonical
  * resource reference messaging stores.
  *
- * Tracker links carry their organization in the query string because they can
- * be opened from outside Nimbalyst. A message is already organization-scoped,
- * so a foreign-org link must stay literal text rather than being authorized as
- * a resource reference in the current conversation.
+ * Two spellings meet here and nowhere else. A copied link is addressed for the
+ * OS protocol handler: it spells a shared document `doc` and carries its
+ * organization in the query string, because it can be opened from outside
+ * Nimbalyst. A stored reference is addressed for a conversation: it spells the
+ * same thing `document` and takes the organization from the conversation it
+ * was read in. Translating at this boundary is what keeps the stored body
+ * format unchanged and `parse(format(ref))` round-tripping.
+ *
+ * A message is already organization-scoped, so a foreign-org link must stay
+ * literal text rather than being authorized as a reference in this
+ * conversation. A link with no `orgId` is already org-relative and is read as
+ * belonging to this one.
  */
 export function parsePastedResourceLink(
   rawValue: string,
@@ -127,22 +145,23 @@ export function parsePastedResourceLink(
 
   if (parsed.protocol !== 'nimbalyst:') return null;
 
-  const routeIsTracker =
-    parsed.host === 'tracker'
-    || (parsed.host === '' && parsed.pathname.startsWith('/tracker/'));
-  if (!routeIsTracker) return null;
-
   const linkOrgId = parsed.searchParams.get('orgId');
   if (linkOrgId !== null && linkOrgId !== orgId) return null;
 
+  const route = pastedLinkRoute(parsed);
+  if (!route) return null;
+
+  const sourceId = safeDecode(route.encodedSourceId);
+  if (sourceId === null || sourceId === '') return null;
+
+  if (route.host === 'doc') {
+    // A `thread` parameter may ride along from "copy link" on a comment; it is
+    // presentation intent for the opener, not part of the document's identity.
+    return { ref: { orgId, kind: 'document', sourceId }, label: 'Document' };
+  }
+
   const rawView = parsed.searchParams.get('view');
   if (rawView !== null && rawView !== 'document') return null;
-
-  const encodedSourceId = parsed.host === 'tracker'
-    ? parsed.pathname.replace(/^\//, '')
-    : parsed.pathname.replace(/^\/tracker\//, '');
-  const sourceId = safeDecode(encodedSourceId);
-  if (sourceId === null || sourceId === '') return null;
 
   return {
     ref: {
@@ -152,6 +171,27 @@ export function parsePastedResourceLink(
     },
     label: rawView === 'document' ? 'Plan' : 'Tracker',
   };
+}
+
+/** Hosts a pasted link may address. `folder` is absent: there is no such kind. */
+const PASTED_LINK_HOSTS = ['tracker', 'doc'] as const;
+
+/**
+ * Both `nimbalyst://doc/x` (host form) and `nimbalyst:///doc/x` (path form)
+ * reach us, because a non-special scheme leaves the authority optional.
+ */
+function pastedLinkRoute(
+  parsed: URL,
+): { host: (typeof PASTED_LINK_HOSTS)[number]; encodedSourceId: string } | null {
+  for (const host of PASTED_LINK_HOSTS) {
+    if (parsed.host === host) {
+      return { host, encodedSourceId: parsed.pathname.replace(/^\//, '') };
+    }
+    if (parsed.host === '' && parsed.pathname.startsWith(`/${host}/`)) {
+      return { host, encodedSourceId: parsed.pathname.slice(host.length + 2) };
+    }
+  }
+  return null;
 }
 
 /** `nimbalyst://user/<userId>`. Not a ResourceRef -- see the module header. */

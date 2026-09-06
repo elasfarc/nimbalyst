@@ -48,8 +48,17 @@ export function resolveClaudeCliModelArg(model: string | undefined): string | un
 
   const variant = normalizeClaudeCodeVariant(variantInput);
   if (variant) {
-    // Collapse pinned opus variants (opus-4-7 / opus-4-6) to the CLI's `opus` alias.
-    const alias = variant.startsWith('opus') ? 'opus' : variant;
+    // The CLI accepts canonical aliases (fable, opus, sonnet, haiku) and full
+    // model ids (claude-fable-5, claude-opus-4-7). For pinned variants the
+    // CLI doesn't accept as short aliases, pass the full model id instead.
+    let alias: string;
+    if (variant.startsWith('opus')) {
+      alias = 'opus';
+    } else if (variant === 'fable-5') {
+      alias = 'claude-fable-5';
+    } else {
+      alias = variant;
+    }
     return isExtended ? `${alias}[1m]` : alias;
   }
 
@@ -87,6 +96,14 @@ export interface ClaudeCliSpawnInput {
    * to point the CLI at the local SSE-tee proxy. Never used to inject API keys.
    */
   extraEnv?: Record<string, string>;
+  /**
+   * Resolved effort level for this session, forwarded as
+   * `CLAUDE_CODE_EFFORT_LEVEL`. Mirrors the Agent SDK path, which sets the same
+   * variable (`sdkOptionsBuilder`). Every resolved value is forwarded, including
+   * `high`, so the selector matches what the CLI actually runs (#844). Omit to
+   * leave the CLI on its own default.
+   */
+  effortLevel?: string;
   /**
    * Names of trusted MCP servers to pre-allow (NIM-806 BUG 2). Each becomes a
    * server-level `mcp__<server>` entry in `--allowedTools`, so the genuine CLI
@@ -367,6 +384,12 @@ export function buildClaudeCliSpawnConfig(input: ClaudeCliSpawnInput): ClaudeCli
   // Set as a default the user can still override via their own shell/`baseEnv`.
   if (merged.ENABLE_TOOL_SEARCH == null) {
     merged.ENABLE_TOOL_SEARCH = 'true';
+  }
+  // Mirrors the Agent SDK path. Set after baseEnv so an explicit selection wins
+  // over an inherited value; when nothing is selected the inherited value (or
+  // the CLI's own default) stands.
+  if (input.effortLevel) {
+    merged.CLAUDE_CODE_EFFORT_LEVEL = input.effortLevel;
   }
   if (input.extraEnv) {
     Object.assign(merged, input.extraEnv);

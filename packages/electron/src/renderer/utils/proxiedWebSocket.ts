@@ -60,6 +60,52 @@ function registerWsHandler(id: string, handler: WsEventHandler): void {
 }
 
 /**
+ * The only query keys a host config may contribute to a collab room URL.
+ *
+ * `urlExtraQuery` has exactly one producer: the Playwright collab identity
+ * bridge, which hands a loopback `wrangler dev` worker `test_user_id` /
+ * `test_org_id` in place of a Stytch session. Production `document-sync:open`
+ * never sets the field at all.
+ *
+ * Those two keys are identity claims against a server that honours them when
+ * `TEST_AUTH_BYPASS=true`, so the set is closed rather than open. A future
+ * config path that populates `urlExtraQuery` from somewhere less trusted then
+ * cannot smuggle its own parameters onto an authenticated room URL just by
+ * reaching this function -- it has to come back here and say so.
+ */
+const ALLOWED_COLLAB_URL_QUERY_KEYS = new Set(['test_user_id', 'test_org_id']);
+
+/**
+ * Append a host-supplied, already-authorized query to a collab room URL.
+ *
+ * Re-serialized through `URLSearchParams` rather than concatenated verbatim:
+ * that both re-encodes the values and drops anything outside
+ * {@link ALLOWED_COLLAB_URL_QUERY_KEYS}. Dropping is deliberate -- the room URL
+ * stays connectable and the server refuses it on its own terms, which is a
+ * better failure than a renderer exception on a path that only the test bridge
+ * exercises.
+ */
+export function appendCollabUrlQuery(url: string, urlExtraQuery?: string): string {
+  if (!urlExtraQuery) return url;
+
+  const allowed = new URLSearchParams();
+  for (const [key, value] of new URLSearchParams(urlExtraQuery)) {
+    if (ALLOWED_COLLAB_URL_QUERY_KEYS.has(key)) {
+      allowed.append(key, value);
+    } else {
+      console.warn(
+        `[collab] Ignored unrecognized collab URL query parameter "${key}". `
+        + 'Only the Playwright identity bridge may extend a room URL.',
+      );
+    }
+  }
+
+  const serialized = allowed.toString();
+  if (!serialized) return url;
+  return `${url}${url.includes('?') ? '&' : '?'}${serialized}`;
+}
+
+/**
  * Create a browser-compatible WebSocket that proxies through the Electron
  * main process via IPC. This works around Cloudflare blocking WebSocket
  * upgrades from browser/Chromium clients.

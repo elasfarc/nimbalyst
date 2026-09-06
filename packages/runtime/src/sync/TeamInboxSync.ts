@@ -13,7 +13,11 @@ import type {
 } from '@nimbalyst/collab-protocol';
 import { teamInboxRoomId } from '@nimbalyst/collab-protocol';
 
-import type { TeamJwt, TeamMemberId } from '../auth/jwtScopes';
+import { asTeamMemberId, type TeamJwt, type TeamMemberId } from '../auth/jwtScopes';
+import {
+  collabAccessRevokedMessage,
+  isCollabAccessRevokedCloseCode,
+} from './collabCloseCodes';
 import { appendSyncClientParams } from './syncClientInfo';
 
 export const DEFAULT_TEAM_INBOX_CONNECT_CONCURRENCY = 4;
@@ -40,7 +44,7 @@ export type { PresenceDesiredStatus, TeamPresenceMember };
 
 export interface TeamInboxMaterializedDelivery {
   id: string;
-  recipientUserId: string;
+  teamMemberId: TeamMemberId;
   orgId: string;
   orgName: string;
   createdAt: number;
@@ -49,6 +53,11 @@ export interface TeamInboxMaterializedDelivery {
   unavailable?: true;
   source?: InboxDelivery['source'];
   reason?: InboxDelivery['reason'];
+  agentSessionIds?: string[];
+  agentDispatchedSessionIds?: string[];
+  agentDispatch?: InboxDelivery['agentDispatch'];
+  agentWakePolicy?: string;
+  agentWakeMetadata?: Record<string, unknown>;
   /**
    * Structured author of the source event. Optional for the same reason it is
    * optional on the protocol delivery: the server does not populate it yet.
@@ -125,6 +134,12 @@ export type TeamInboxOrgEvent =
       dismissedAt: number;
       unreadCount: number;
     }
+  | {
+      type: 'agentDispatch';
+      deliveryId: string;
+      sessionId: string;
+      dispatchedAt: number;
+    }
   | { type: 'disconnected' }
   | { type: 'error'; code: string; message: string };
 
@@ -133,6 +148,8 @@ export interface TeamInboxOrgClientLike {
   connect(): Promise<void>;
   markRead(deliveryIds: string[]): Promise<void>;
   dismiss(deliveryIds: string[]): Promise<void>;
+  claimAgentDelivery(deliveryId: string, sessionId: string): Promise<boolean>;
+  completeAgentDelivery(deliveryId: string, sessionId: string): Promise<boolean>;
   setPresenceStatus?(status: PresenceDesiredStatus): void;
   subscribe(listener: (event: TeamInboxOrgEvent) => void): () => void;
   destroy(): void;
@@ -146,6 +163,7 @@ export interface TeamInboxOrgClientConfig {
   heartbeatIntervalMs?: number;
   getPresenceStatus?: () => PresenceDesiredStatus;
   now?: () => number;
+  clientId?: string;
 }
 
 function isCustodyError(code: string): boolean {
@@ -167,19 +185,33 @@ export class TeamInboxOrgClient implements TeamInboxOrgClientLike {
   private ws: WebSocket | null = null;
   private destroyed = false;
   private custodyBlocked = false;
+  /** Server said this member may not be here. Terminal for reconnects only. */
+  private accessRevoked = false;
   private reconnectAttempt = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private pendingMessages: TeamInboxClientMessage[] = [];
+  private readonly clientId: string;
+  private readonly pendingRequests = new Map<string, {
+    resolve: (accepted: boolean) => void;
+    reject: (error: Error) => void;
+    timer: ReturnType<typeof setTimeout>;
+  }>();
 
   constructor(config: TeamInboxOrgClientConfig) {
     this.config = config;
     this.org = config.org;
+    this.clientId = config.clientId
+      ?? globalThis.crypto?.randomUUID?.()
+      ?? `inbox-client-${Date.now()}-${Math.random().toString(36).slice(2)}`;
   }
 
   async connect(): Promise<void> {
     if (this.destroyed) throw new Error('Team inbox client has been destroyed');
     if (this.ws || this.custodyBlocked) return;
+    // An explicit reconnect asserts access may have been restored; let the
+    // server decide again rather than staying latched off.
+    this.accessRevoked = false;
 
     this.emit({ type: 'connecting' });
     try {
@@ -211,11 +243,23 @@ export class TeamInboxOrgClient implements TeamInboxOrgClientLike {
         if (this.ws !== ws) return;
         this.handleMessage(event.data);
       });
-      ws.addEventListener('close', () => {
+      ws.addEventListener('close', (event) => {
         if (this.ws !== ws) return;
         this.ws = null;
         this.stopHeartbeat();
         this.emit({ type: 'disconnected' });
+        const code = (event as CloseEvent | undefined)?.code;
+        if (isCollabAccessRevokedCloseCode(code)) {
+          // Settled answer: retrying replays the same refused handshake and
+          // leaves the inbox stuck reconnecting with nothing explaining why.
+          // Separate from `destroyed` so this says "no access", not "torn down".
+          const message = collabAccessRevokedMessage(code);
+          this.accessRevoked = true;
+          this.rejectPendingRequests(new Error(message));
+          this.emit({ type: 'error', code: 'TEAM_INBOX_ACCESS_REVOKED', message });
+          return;
+        }
+        this.rejectPendingRequests(new Error('Team inbox disconnected'));
         this.scheduleReconnect();
       });
       ws.addEventListener('error', () => {
@@ -245,6 +289,14 @@ export class TeamInboxOrgClient implements TeamInboxOrgClientLike {
     this.sendOrQueue({ type: 'dismissInbox', deliveryIds });
   }
 
+  claimAgentDelivery(deliveryId: string, sessionId: string): Promise<boolean> {
+    return this.sendAgentDispatchRequest('claimAgentDelivery', deliveryId, sessionId);
+  }
+
+  completeAgentDelivery(deliveryId: string, sessionId: string): Promise<boolean> {
+    return this.sendAgentDispatchRequest('completeAgentDelivery', deliveryId, sessionId);
+  }
+
   setPresenceStatus(status: PresenceDesiredStatus): void {
     this.sendOrQueue({
       type: 'presenceStatusSet',
@@ -262,6 +314,7 @@ export class TeamInboxOrgClient implements TeamInboxOrgClientLike {
     this.ws = null;
     ws?.close();
     this.pendingMessages = [];
+    this.rejectPendingRequests(new Error('Team inbox client destroyed'));
     this.listeners.clear();
   }
 
@@ -332,6 +385,32 @@ export class TeamInboxOrgClient implements TeamInboxOrgClientLike {
             unreadCount: Number(message.unreadCount ?? 0),
           });
           return;
+        case 'agentDeliveryClaimResponse': {
+          const pending = this.pendingRequests.get(message.requestId);
+          if (pending) {
+            this.pendingRequests.delete(message.requestId);
+            clearTimeout(pending.timer);
+            pending.resolve(message.claimed === true);
+          }
+          return;
+        }
+        case 'agentDeliveryCompleteResponse': {
+          const pending = this.pendingRequests.get(message.requestId);
+          if (pending) {
+            this.pendingRequests.delete(message.requestId);
+            clearTimeout(pending.timer);
+            pending.resolve(message.dispatched === true);
+          }
+          return;
+        }
+        case 'agentDeliveryDispatchBroadcast':
+          this.emit({
+            type: 'agentDispatch',
+            deliveryId: message.deliveryId,
+            sessionId: message.sessionId,
+            dispatchedAt: message.dispatchedAt,
+          });
+          return;
         case 'inboxError': {
           const code = String(message.code ?? 'TEAM_INBOX_ERROR');
           const errorMessage = String(
@@ -369,6 +448,40 @@ export class TeamInboxOrgClient implements TeamInboxOrgClientLike {
     this.ws.send(JSON.stringify(message));
   }
 
+  private sendAgentDispatchRequest(
+    type: 'claimAgentDelivery' | 'completeAgentDelivery',
+    deliveryId: string,
+    sessionId: string,
+  ): Promise<boolean> {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      return Promise.reject(new Error('Team inbox is offline'));
+    }
+    const requestId = globalThis.crypto?.randomUUID?.()
+      ?? `agent-dispatch-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    return new Promise<boolean>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pendingRequests.delete(requestId);
+        reject(new Error(`Team inbox ${type} timed out`));
+      }, 10_000);
+      this.pendingRequests.set(requestId, { resolve, reject, timer });
+      this.ws!.send(JSON.stringify({
+        type,
+        requestId,
+        deliveryId,
+        sessionId,
+        clientId: this.clientId,
+      } satisfies TeamInboxClientMessage));
+    });
+  }
+
+  private rejectPendingRequests(error: Error): void {
+    for (const pending of this.pendingRequests.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(error);
+    }
+    this.pendingRequests.clear();
+  }
+
   private startHeartbeat(): void {
     this.stopHeartbeat();
     this.sendPresenceHeartbeat();
@@ -402,6 +515,7 @@ export class TeamInboxOrgClient implements TeamInboxOrgClientLike {
     if (
       this.destroyed
       || this.custodyBlocked
+      || this.accessRevoked
       || this.reconnectTimer
     ) return;
     const delay = Math.min(
@@ -538,6 +652,22 @@ export class TeamInboxFanIn {
     await client.dismiss([deliveryId]);
   }
 
+  async claimAgentDelivery(deliveryId: string, sessionId: string): Promise<boolean> {
+    const orgId = this.findDeliveryOrg(deliveryId);
+    if (!orgId) throw new Error(`Unknown inbox delivery ${deliveryId}`);
+    const client = this.clients.get(orgId);
+    if (!client) throw new Error(`No inbox room for organization ${orgId}`);
+    return client.claimAgentDelivery(deliveryId, sessionId);
+  }
+
+  async completeAgentDelivery(deliveryId: string, sessionId: string): Promise<boolean> {
+    const orgId = this.findDeliveryOrg(deliveryId);
+    if (!orgId) throw new Error(`Unknown inbox delivery ${deliveryId}`);
+    const client = this.clients.get(orgId);
+    if (!client) throw new Error(`No inbox room for organization ${orgId}`);
+    return client.completeAgentDelivery(deliveryId, sessionId);
+  }
+
   destroy(): void {
     this.destroyed = true;
     this.destroyClients();
@@ -621,6 +751,24 @@ export class TeamInboxFanIn {
           }
         }
         break;
+      case 'agentDispatch': {
+        const current = state.deliveries.get(event.deliveryId);
+        if (current && 'source' in current) {
+          const dispatched = new Set(current.agentDispatchedSessionIds ?? []);
+          dispatched.add(event.sessionId);
+          const agentSessionIds = current.agentSessionIds ?? [];
+          state.deliveries.set(event.deliveryId, {
+            ...current,
+            agentDispatchedSessionIds: [...dispatched],
+            agentDispatch:
+              agentSessionIds.length > 0
+              && agentSessionIds.every((sessionId) => dispatched.has(sessionId))
+                ? 'dispatched'
+                : 'pending',
+          });
+        }
+        break;
+      }
       case 'disconnected':
         if (state.status !== 'messagingUnavailable') state.status = 'offline';
         break;
@@ -782,8 +930,10 @@ function materializeDelivery(
   delivery: TeamInboxWireDelivery,
 ): TeamInboxMaterializedDelivery {
   if ('unavailable' in delivery) {
+    const { recipientUserId, ...rest } = delivery;
     return {
-      ...delivery,
+      ...rest,
+      teamMemberId: asTeamMemberId(recipientUserId),
       orgName: state.descriptor.orgName,
       hasUnreadActivity: false,
     };
@@ -798,8 +948,10 @@ function materializeDelivery(
   const receipt = conversationId
     ? state.readReceipts.get(conversationId) ?? 0
     : 0;
+  const { recipientUserId, ...rest } = delivery;
   return {
-    ...delivery,
+    ...rest,
+    teamMemberId: asTeamMemberId(recipientUserId),
     orgName: state.descriptor.orgName,
     subscription: subscription?.state,
     hasUnreadActivity:

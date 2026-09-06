@@ -6,18 +6,13 @@ import {
   FORMAT_TEXT_COMMAND,
   type LexicalEditor,
 } from 'lexical';
-import { encodeStateAsUpdate, type Doc } from 'yjs';
 
 import type { EditorConfig } from '@nimbalyst/runtime/editor/EditorConfig';
 import '@nimbalyst/runtime/editor/extensions/registerBuiltinExtensions';
 import '@nimbalyst/runtime/editor/index.css';
 import { registerBrowserReferenceNodes } from './referenceNodes';
 import { CollabLexicalProvider } from '@nimbalyst/runtime/sync/CollabLexicalProvider';
-import { DocumentSyncProvider } from '@nimbalyst/runtime/sync/DocumentSync';
-import type {
-  AwarenessState,
-  DocumentSyncStatus,
-} from '@nimbalyst/runtime/sync/documentSyncTypes';
+import type { DocumentSyncProvider } from '@nimbalyst/runtime/sync/DocumentSync';
 
 import {
   BrowserEditorSurface,
@@ -25,53 +20,21 @@ import {
 } from './BrowserEditorSurface';
 import './browserChrome.css';
 import { applyBrowserEditorChrome } from './browserChrome';
-import {
-  CollabPresenceSurface,
-  resolveCollabEditorUser,
-} from './presence';
+import { deriveCollabEditorCommentsState } from './commenting';
+import { resolveCollabEditorUser } from './presence';
+import { createCollabDocumentSession } from './session';
+import { acquireCollabAssetImageResolver } from './collabAssetImages';
 
 import type {
-  CollabEditorFlushResult,
   CollabEditorHandle,
   CollabEditorMountOptions,
-  CollabEditorState,
-  CollabEditorTermination,
-  CollabEditorWriteRejection,
 } from './types';
-import {
-  classifyDocumentClose,
-  parseDocumentServerSignal,
-} from './serverSignals';
 
 // Must run before any editor mounts: `@lexical/yjs` resolves node types against
 // `editor._nodes` while applying the first update, and an unregistered type
 // aborts the binding so nothing paints. A call rather than a bare import on
 // purpose — see the header of `./referenceNodes`.
 registerBrowserReferenceNodes();
-
-class InMemoryDocumentSyncSurface {
-  constructor(private readonly document: Doc) {}
-
-  getYDoc(): Doc {
-    return this.document;
-  }
-
-  getStatus(): DocumentSyncStatus {
-    return 'connected';
-  }
-
-  async connect(): Promise<void> {}
-
-  setLocalAwareness(_state: AwarenessState): void {}
-
-  sendAwarenessDeparture(_user: AwarenessState['user']): boolean {
-    return false;
-  }
-
-  onAwarenessChange(_listener: (states: Map<string, AwarenessState>) => void): () => void {
-    return () => {};
-  }
-}
 
 class BundleEditorErrorBoundary extends React.Component<{
   children: React.ReactNode;
@@ -92,10 +55,6 @@ class BundleEditorErrorBoundary extends React.Component<{
   }
 }
 
-function cloneState(state: CollabEditorState): CollabEditorState {
-  return { ...state };
-}
-
 /**
  * Mount the collaborative editor in the host's DOM.
  *
@@ -103,35 +62,141 @@ function cloneState(state: CollabEditorState): CollabEditorState {
  * The bundle never reads browser storage, sessions, or personal credentials.
  * In-memory hosts are the transport-free harness seam and still use the same
  * CollabLexicalProvider per-mount editor-doc bridge as a live room.
+ *
+ * The transport, connection state and flush guards live in `./session`, shared
+ * with the extension-editor mount; this function is the Lexical renderer over
+ * that session and nothing else.
  */
 export function mountCollabEditor(options: CollabEditorMountOptions): CollabEditorHandle {
   const resolvedUser = resolveCollabEditorUser(options.user);
-  if (options.source.kind === 'team-room'
-    && options.source.auth.memberId !== resolvedUser.memberId) {
-    throw new Error('The editor user must match the authenticated team member.');
-  }
   let root: Root | null = createRoot(options.element);
   let lexicalEditor: LexicalEditor | null = null;
   let getMarkdown = (): string => '';
   let destroyed = false;
   let readyReported = false;
-  let hostReadOnly = options.readOnly ?? false;
-  let latestWriteRejection: CollabEditorWriteRejection | null = null;
-  let transportState: 'not-created' | 'connecting' | 'open' | 'closed' = 'not-created';
-  let observedSocket: WebSocket | null = null;
-  const flushInterruptWaiters = new Set<(result: CollabEditorFlushResult) => void>();
 
-  const state: CollabEditorState = {
-    connection: options.source.kind === 'in-memory' ? 'local' : 'disconnected',
-    edit: 'clean',
-    readOnly: hostReadOnly,
-    hostReadOnly,
-    serverAccess: options.source.kind === 'in-memory' ? 'not-applicable' : 'unknown',
-    termination: null,
+  const hostCanComment = (): boolean => options.comments?.canComment?.() ?? true;
+
+  /**
+   * Serves the document's `collab-asset://` images. Only a team room has an
+   * origin and a JWT to fetch them with; an in-memory harness document has no
+   * server behind it, so it gets no resolver and its images fall through to
+   * the editor's own handling.
+   */
+  const assetImages = options.source.kind === 'team-room'
+    ? acquireCollabAssetImageResolver({
+        serverUrl: options.source.serverUrl,
+        orgId: options.source.room.orgId,
+        getTeamJwt: options.source.auth.getTeamJwt,
+      })
+    : null;
+
+  // Declared before the session because DocumentSyncProvider can report a
+  // status from inside its own constructor, before the provider below exists.
+  let lexicalProvider: CollabLexicalProvider | undefined;
+
+  const session = createCollabDocumentSession({
+    source: options.source,
+    memberId: resolvedUser.memberId,
+    readOnly: options.readOnly,
+    lifecycleElement: options.element,
+    hostCanComment,
+    onStateChange: options.onStateChange,
+    onPresenceChange: (presence) => options.onPresenceChange?.(presence),
+    onWriteRejected: options.onWriteRejected,
+    onTermination: options.onTermination,
+    onError: options.onError,
+    onBindingError: options.onBindingError,
+    onStatusChange: (status) => lexicalProvider?.handleStatusChange(status),
+    onSurfaceInvalidated: () => syncEditorSurface(),
+  });
+
+  const presenceSurface = session.presence;
+  lexicalProvider = new CollabLexicalProvider(
+    presenceSurface as unknown as DocumentSyncProvider,
+    session.networkProvider ? { deferInitialSync: true } : undefined,
+  );
+  const boundLexicalProvider = lexicalProvider;
+
+  // Stable across re-renders so the announcement region does not reset its
+  // roster (and re-announce everyone) when read-only state flips.
+  const subscribeToPresence: PresenceSubscription = (listener) => (
+    presenceSurface.onPresenceChange(listener)
+  );
+
+  let renderedReadOnly = session.getState().readOnly;
+  let renderedCanComment = session.canComment();
+  /**
+   * Re-render when what the editor is *allowed* to do has drifted from what is
+   * on screen.
+   *
+   * Effective read-only is not a proxy for that. The runtime resolves comment
+   * capability on every render and deliberately never caches it, but nothing
+   * re-renders on its own: gating the re-render on a read-only flip left the
+   * toolbar permanently without "Add comment" for a writer whose capability
+   * changed while read-only did not. The comparison is against what was last
+   * rendered rather than against one field's previous value, so every input to
+   * the answer -- server access, termination, the host's role answer -- lands
+   * the same way, and a change that cancels out renders nothing.
+   */
+  function syncEditorSurface(): void {
+    if (session.getState().readOnly === renderedReadOnly
+      && session.canComment() === renderedCanComment) return;
+    renderEditor();
+  }
+
+  const sharedDocument = session.sharedDocument;
+
+  const providerFactory: NonNullable<EditorConfig['collaboration']>['providerFactory'] = (
+    id,
+    yjsDocMap,
+  ) => {
+    boundLexicalProvider.prepareForBinding();
+    yjsDocMap.set(id, boundLexicalProvider.getYDoc());
+    return boundLexicalProvider;
   };
 
-  const emitState = (): void => options.onStateChange?.(cloneState(state));
-  const focusDocument = (): void => {
+  const handle: CollabEditorHandle = {
+    getDocument: () => sharedDocument,
+    getMarkdown: () => getMarkdown(),
+    getState: () => session.getState(),
+    getPresence: () => presenceSurface.getPresence(),
+    setPresenceActive: (active) => { presenceSurface.setActive(active); },
+    flush: (flushOptions) => session.flush(flushOptions),
+    setReadOnly(nextReadOnly) {
+      if (destroyed) return;
+      session.setReadOnly(nextReadOnly);
+    },
+    refreshCommentAccess() {
+      if (destroyed) return;
+      syncEditorSurface();
+    },
+    markClean: () => session.markClean(),
+    focus: focusDocument,
+    insertText: (text) => {
+      if (!lexicalEditor || session.getState().readOnly) return;
+      lexicalEditor.update(() => $getRoot().selectEnd(), { discrete: true });
+      lexicalEditor.dispatchCommand(CONTROLLED_TEXT_INSERTION_COMMAND, text);
+    },
+    formatText: (format) => {
+      if (session.getState().readOnly) return;
+      lexicalEditor?.dispatchCommand(FORMAT_TEXT_COMMAND, format);
+    },
+    destroy() {
+      if (destroyed) return;
+      destroyed = true;
+      assetImages?.release();
+      session.destroy({
+        beforeTransportTeardown: () => {
+          root?.unmount();
+          root = null;
+          boundLexicalProvider.destroy();
+        },
+      });
+    },
+  };
+
+  function focusDocument(): void {
     // The DOM selection survives the trip to the toolbar, so re-focusing the
     // contentEditable puts the caret back exactly where the writer left it —
     // verified in a real browser across collapsed carets, range selections and
@@ -142,302 +207,41 @@ export function mountCollabEditor(options: CollabEditorMountOptions): CollabEdit
       return;
     }
     lexicalEditor?.focus();
-  };
-  const setDirty = (): void => {
-    if (state.edit === 'dirty') return;
-    state.edit = 'dirty';
-    emitState();
-  };
-  const updateEffectiveReadOnly = (): boolean => {
-    const nextReadOnly = hostReadOnly
-      || state.serverAccess === 'read-only'
-      || state.serverAccess === 'revoked';
-    if (state.readOnly === nextReadOnly) return false;
-    state.readOnly = nextReadOnly;
-    return true;
-  };
-  const interruptFlushes = (result: CollabEditorFlushResult): void => {
-    for (const resolve of flushInterruptWaiters) resolve(result);
-    flushInterruptWaiters.clear();
-  };
-  const setServerAccess = (access: CollabEditorState['serverAccess']): void => {
-    if (state.termination || state.serverAccess === access) return;
-    state.serverAccess = access;
-    const readOnlyChanged = updateEffectiveReadOnly();
-    emitState();
-    if (readOnlyChanged) renderEditor();
-  };
-  const setTermination = (termination: CollabEditorTermination): void => {
-    if (state.termination) return;
-    state.termination = termination;
-    state.connection = 'terminated';
-    state.serverAccess = 'revoked';
-    const readOnlyChanged = updateEffectiveReadOnly();
-    emitState();
-    if (readOnlyChanged) renderEditor();
-    options.onTermination?.(termination);
-    interruptFlushes({ status: 'unavailable', reason: termination.reason });
-  };
-
-  let lexicalProvider: CollabLexicalProvider;
-  let presenceSurface: CollabPresenceSurface;
-  let networkProvider: DocumentSyncProvider | null = null;
-  let removeInMemoryUpdateListener: (() => void) | null = null;
-  let removePresenceListener: (() => void) | null = null;
-  let removePresenceLifecycleListeners: (() => void) | null = null;
-
-  if (options.source.kind === 'team-room') {
-    const source = options.source;
-    networkProvider = new DocumentSyncProvider({
-      serverUrl: source.serverUrl,
-      orgId: source.room.orgId,
-      documentId: source.room.documentId,
-      userId: source.auth.memberId,
-      getJwt: source.auth.getTeamJwt,
-      createWebSocket: (url) => {
-        const socket = source.createWebSocket?.(url) ?? new WebSocket(url);
-        observedSocket = socket;
-        transportState = 'connecting';
-        socket.addEventListener('open', () => {
-          if (observedSocket !== socket) return;
-          transportState = 'open';
-        });
-        socket.addEventListener('message', (event) => {
-          if (observedSocket !== socket) return;
-          const signal = parseDocumentServerSignal(event.data);
-          if (!signal) return;
-          if (signal.type === 'write-acknowledged') {
-            setServerAccess('writable');
-            return;
-          }
-          if (signal.type === 'read-only') {
-            const rejection: CollabEditorWriteRejection = {
-              code: 'document_read_only',
-              message: signal.message,
-              ...(signal.clientUpdateId ? { clientUpdateId: signal.clientUpdateId } : {}),
-            };
-            latestWriteRejection = rejection;
-            setServerAccess('read-only');
-            options.onWriteRejected?.(rejection);
-            interruptFlushes({ status: 'rejected', rejection });
-            return;
-          }
-          setTermination({
-            reason: 'document-access-revoked',
-            closeCode: 4003,
-            message: signal.message,
-          });
-        });
-        socket.addEventListener('close', (event) => {
-          if (observedSocket !== socket) return;
-          observedSocket = null;
-          transportState = 'closed';
-          const termination = classifyDocumentClose(event.code, event.reason);
-          if (!termination) return;
-          setTermination(termination);
-          // Terminal authorization failures must not enter DocumentSync's
-          // ordinary reconnect loop with credentials the server just revoked.
-          networkProvider?.disconnect();
-        });
-        socket.addEventListener('error', () => {
-          if (observedSocket !== socket) return;
-          transportState = 'closed';
-        });
-        return socket;
-      },
-      onLocalUpdate: setDirty,
-      onEditorBindingError: (cause) => {
-        options.onBindingError?.(
-          cause instanceof Error
-            ? cause
-            : new Error('The shared document could not be rendered.'),
-        );
-      },
-      onStatusChange: (status) => {
-        if (!state.termination) state.connection = status;
-        lexicalProvider?.handleStatusChange(status);
-        emitState();
-      },
-    });
-    presenceSurface = new CollabPresenceSurface(networkProvider);
-    lexicalProvider = new CollabLexicalProvider(presenceSurface as unknown as DocumentSyncProvider, {
-      deferInitialSync: true,
-    });
-  } else {
-    const sourceDocument = options.source.document;
-    const syncSurface = new InMemoryDocumentSyncSurface(sourceDocument);
-    presenceSurface = new CollabPresenceSurface(syncSurface);
-    lexicalProvider = new CollabLexicalProvider(presenceSurface as unknown as DocumentSyncProvider);
-    const onUpdate = (): void => setDirty();
-    sourceDocument.on('update', onUpdate);
-    removeInMemoryUpdateListener = () => sourceDocument.off('update', onUpdate);
   }
-  removePresenceListener = presenceSurface.onPresenceChange((presence) => {
-    options.onPresenceChange?.(presence);
-  });
-  // Stable across re-renders so the announcement region does not reset its
-  // roster (and re-announce everyone) when read-only state flips.
-  const subscribeToPresence: PresenceSubscription = (listener) => (
-    presenceSurface.onPresenceChange(listener)
-  );
-  const lifecycleDocument = options.element.ownerDocument;
-  const lifecycleWindow = lifecycleDocument.defaultView;
-  if (lifecycleWindow) {
-    const leavePresence = (): void => { presenceSurface.setActive(false); };
-    const restorePresence = (): void => { presenceSurface.setActive(true); };
-    const handleVisibilityChange = (): void => {
-      presenceSurface.setActive(lifecycleDocument.visibilityState !== 'hidden');
-    };
-    lifecycleWindow.addEventListener('pagehide', leavePresence);
-    lifecycleWindow.addEventListener('pageshow', restorePresence);
-    lifecycleDocument.addEventListener('visibilitychange', handleVisibilityChange);
-    removePresenceLifecycleListeners = () => {
-      lifecycleWindow.removeEventListener('pagehide', leavePresence);
-      lifecycleWindow.removeEventListener('pageshow', restorePresence);
-      lifecycleDocument.removeEventListener('visibilitychange', handleVisibilityChange);
-    };
-  }
-
-  const sharedDocument = networkProvider?.getYDoc()
-    ?? (options.source.kind === 'in-memory' ? options.source.document : null);
-  if (!sharedDocument) {
-    throw new Error('Collaborative editor source did not provide a Y.Doc.');
-  }
-
-  const providerFactory: NonNullable<EditorConfig['collaboration']>['providerFactory'] = (
-    id,
-    yjsDocMap,
-  ) => {
-    lexicalProvider.prepareForBinding();
-    yjsDocMap.set(id, lexicalProvider.getYDoc());
-    return lexicalProvider;
-  };
-
-  const handle: CollabEditorHandle = {
-    getDocument: () => sharedDocument,
-    getMarkdown: () => getMarkdown(),
-    getState: () => cloneState(state),
-    getPresence: () => presenceSurface.getPresence(),
-    setPresenceActive: (active) => { presenceSurface.setActive(active); },
-    async flush(flushOptions) {
-      if (destroyed) return { status: 'unavailable', reason: 'destroyed' };
-      if (!networkProvider) return { status: 'not-required', reason: 'in-memory' };
-      if (encodeStateAsUpdate(sharedDocument).length <= 2) {
-        return { status: 'not-required', reason: 'empty-document' };
-      }
-      if (state.termination) {
-        return { status: 'unavailable', reason: state.termination.reason };
-      }
-      if (state.serverAccess === 'read-only') {
-        return latestWriteRejection
-          ? { status: 'rejected', rejection: latestWriteRejection }
-          : { status: 'unavailable', reason: 'server-read-only' };
-      }
-      if (state.connection === 'disconnected' || state.connection === 'error') {
-        return { status: 'unavailable', reason: 'disconnected' };
-      }
-      if ((transportState === 'closed' || transportState === 'not-created')
-        && state.connection !== 'connecting') {
-        return { status: 'unavailable', reason: 'disconnected' };
-      }
-      const requestedTimeout = flushOptions?.timeoutMs ?? 5_000;
-      const timeoutMs = Number.isFinite(requestedTimeout) && requestedTimeout > 0
-        ? Math.floor(requestedTimeout)
-        : 5_000;
-      let removeInterruptWaiter = (): void => {};
-      const interrupted = new Promise<CollabEditorFlushResult>((resolve) => {
-        const waiter = (result: CollabEditorFlushResult): void => resolve(result);
-        flushInterruptWaiters.add(waiter);
-        removeInterruptWaiter = () => flushInterruptWaiters.delete(waiter);
-      });
-      try {
-        return await Promise.race([
-          networkProvider.flushWithAck(timeoutMs).then((acknowledged): CollabEditorFlushResult => {
-            if (acknowledged) return { status: 'acknowledged' };
-            if (state.termination) {
-              return { status: 'unavailable', reason: state.termination.reason };
-            }
-            if (state.serverAccess === 'read-only') {
-              return latestWriteRejection
-                ? { status: 'rejected', rejection: latestWriteRejection }
-                : { status: 'unavailable', reason: 'server-read-only' };
-            }
-            if (state.connection === 'disconnected' || state.connection === 'error') {
-              return { status: 'unavailable', reason: 'disconnected' };
-            }
-            if (transportState === 'closed' || transportState === 'not-created') {
-              return { status: 'unavailable', reason: 'disconnected' };
-            }
-            return { status: 'timed-out', timeoutMs };
-          }),
-          interrupted,
-        ]);
-      } catch (error) {
-        const normalized = error instanceof Error ? error : new Error(String(error));
-        options.onError?.(normalized);
-        return { status: 'failed', message: normalized.message };
-      } finally {
-        removeInterruptWaiter();
-      }
-    },
-    setReadOnly(nextReadOnly) {
-      if (destroyed || hostReadOnly === nextReadOnly) return;
-      hostReadOnly = nextReadOnly;
-      state.hostReadOnly = nextReadOnly;
-      const readOnlyChanged = updateEffectiveReadOnly();
-      emitState();
-      if (readOnlyChanged) renderEditor();
-    },
-    markClean() {
-      if (state.edit === 'clean') return;
-      state.edit = 'clean';
-      emitState();
-    },
-    focus: focusDocument,
-    insertText: (text) => {
-      if (!lexicalEditor || state.readOnly) return;
-      lexicalEditor.update(() => $getRoot().selectEnd(), { discrete: true });
-      lexicalEditor.dispatchCommand(CONTROLLED_TEXT_INSERTION_COMMAND, text);
-    },
-    formatText: (format) => {
-      if (state.readOnly) return;
-      lexicalEditor?.dispatchCommand(FORMAT_TEXT_COMMAND, format);
-    },
-    destroy() {
-      if (destroyed) return;
-      destroyed = true;
-      interruptFlushes({ status: 'unavailable', reason: 'destroyed' });
-      presenceSurface.setActive(false);
-      removePresenceLifecycleListeners?.();
-      removePresenceLifecycleListeners = null;
-      root?.unmount();
-      root = null;
-      lexicalProvider.destroy();
-      removePresenceListener?.();
-      removePresenceListener = null;
-      presenceSurface.destroy();
-      networkProvider?.destroy();
-      removeInMemoryUpdateListener?.();
-      removeInMemoryUpdateListener = null;
-    },
-  };
 
   function renderEditor(): void {
     if (!root || destroyed) return;
+    const state = session.getState();
+    renderedReadOnly = state.readOnly;
+    renderedCanComment = session.canComment();
     const config: EditorConfig = {
       isRichText: true,
       editable: !state.readOnly,
       isCodeHighlighted: true,
       hasLinkAttributes: true,
       markdownOnly: true,
+      resolveImageSrc: assetImages?.resolve,
       collaboration: {
         providerFactory,
         shouldBootstrap: false,
         username: resolvedUser.displayName,
         cursorColor: resolvedUser.cursorColor,
       },
+      comments: options.comments ? {
+        ...options.comments,
+        // Browser comment threads belong to the document-lifetime shared doc;
+        // desktop uses the rotating per-binding editorDoc, which this bridge keeps converged.
+        getYDoc: () => sharedDocument,
+        isHydrated: () => session.hasConnectedOnce(),
+        getCapabilities: () => deriveCollabEditorCommentsState({
+          connection: session.getState().connection,
+          serverAccess: session.getState().serverAccess,
+          hasConnectedOnce: session.hasConnectedOnce(),
+          hostCanComment: hostCanComment(),
+        }).capabilities,
+      } : undefined,
       onDirtyChange: (dirty) => {
-        if (dirty) setDirty();
+        if (dirty) session.markDirty();
       },
       onGetContent: (reader) => {
         getMarkdown = reader;
@@ -463,6 +267,6 @@ export function mountCollabEditor(options: CollabEditorMountOptions): CollabEdit
   }
 
   renderEditor();
-  emitState();
+  session.emitState();
   return handle;
 }

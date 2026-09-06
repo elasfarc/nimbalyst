@@ -13,6 +13,12 @@
 
 export interface SubagentTaskLike {
   status: string;
+  /**
+   * SDK task type. 'local_bash' is a backgrounded shell command; anything else
+   * (or absent) is treated as a sub-agent. Only `resolvePromptEndDelay` reads
+   * it — the other helpers key off status alone.
+   */
+  taskType?: string;
 }
 
 /** A tracked task as `activeTasks` holds it — status is written in place. */
@@ -68,6 +74,51 @@ export function shouldSettleTaskFromToolResult(
   if (task.isBackgrounded) return false;
   if (BACKGROUND_LAUNCH_ACK.test(extractToolResultText(resultContent))) return false;
   return true;
+}
+
+/**
+ * Decide whether a terminal task_notification is worth recording for a
+ * continuation turn.
+ *
+ * While draining, backgroundedness is implied — every task still running at the
+ * lead's `result` was necessarily a background one, so record unconditionally
+ * (unchanged behavior).
+ *
+ * Off the drain path this is the #1410 gate. A task that settles DURING the turn
+ * never engages the drain machinery (hasRunningTasks() is already false at the
+ * `result` chunk), yet the CLI still queues its own `<task-notification>`
+ * continuation turn for a BACKGROUNDED one — and that turn runs against a
+ * control channel we tear down ~0.3s later, so every tool call needing a
+ * permission decision is denied before canUseTool is ever reached. Recording the
+ * notification is what lets Nimbalyst close the subprocess and deliver the
+ * equivalent turn visibly instead.
+ *
+ * A FOREGROUND Task must not qualify: it settled via its own tool_result, the
+ * model already saw that result inline, and the CLI queues nothing. Treating it
+ * as a trigger would bill an extra continuation turn per delegation.
+ */
+export function shouldRecordTerminalNotification(
+  task: { taskType?: string; isBackgrounded?: boolean },
+  draining: boolean,
+): boolean {
+  if (draining) return true;
+  return task.taskType === 'local_bash' || task.isBackgrounded === true;
+}
+
+/**
+ * Decide whether the turn must run drain finalization even though it never
+ * entered the drain (nothing was still running at the `result` chunk).
+ *
+ * True when a backgrounded task reported terminally during the turn: that fact
+ * predicts the CLI has a continuation turn queued on a subprocess whose control
+ * channel is about to die. Finalization closes it and delivers the results
+ * visibly instead. See #1410.
+ */
+export function shouldFinalizeForSettledBackgroundTasks(params: {
+  willDrainSubagents: boolean;
+  terminalNotificationCount: number;
+}): boolean {
+  return !params.willDrainSubagents && params.terminalNotificationCount > 0;
 }
 
 /**
@@ -161,41 +212,90 @@ export interface TaskTerminalNotification {
   status: 'completed' | 'failed' | 'stopped';
   summary?: string;
   outputFile?: string;
+  /**
+   * The task reported 'stopped' because OUR teardown killed it — the drain
+   * grace timer expired, we closed the prompt stream, and the CLI killed the
+   * task along with its own process. Distinct from a user stop, which reaches
+   * this struct identically. A background shell (local_bash) streams no chunks
+   * while it runs, so it never resets the grace timer and this is its normal
+   * fate on any run longer than the window. See GitHub #1355.
+   */
+  killedByTeardown?: boolean;
+  /** How long the task had been running when it was killed, for the report. */
+  elapsedMs?: number;
+}
+
+/** True for a task that ended only because our own teardown killed it. */
+function wasKilledByTeardown(n: TaskTerminalNotification): boolean {
+  return n.status === 'stopped' && n.killedByTeardown === true;
+}
+
+/** A notification worth telling the session about. */
+function isReportable(n: TaskTerminalNotification): boolean {
+  return n.status !== 'stopped' || wasKilledByTeardown(n);
 }
 
 /**
  * After a clean drain resolve, decide whether to wake the session with a
- * visible continuation turn carrying the task results. Only completed/failed
- * tasks warrant one — a task stopped by the user should stay stopped.
+ * visible continuation turn carrying the task results. Completed/failed tasks
+ * warrant one, and so does a task our own teardown killed — silence there left
+ * the agent unable to tell "killed" from "stopped" and cost the reporter a
+ * duplicate paid re-run (#1355). A task the USER stopped stays stopped.
  */
 export function shouldContinueWithTaskResults(
   cause: DrainExitCause,
   notifications: TaskTerminalNotification[],
 ): boolean {
-  return cause === 'resolved' && notifications.some(n => n.status !== 'stopped');
+  return cause === 'resolved' && notifications.some(isReportable);
+}
+
+/** "13m 42s" / "47s" — coarse duration for the report line. */
+function formatElapsed(ms: number): string {
+  const totalSeconds = Math.max(0, Math.round(ms / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return minutes > 0 ? `${minutes}m ${seconds}s` : `${seconds}s`;
 }
 
 /**
  * Build the continuation prompt delivered (via the idle-message path) when
- * background tasks finished after the lead turn ended. Visible to the user,
- * so it reads as a system notification rather than an internal nudge.
+ * background tasks settled after the lead turn ended. Visible to the user, so
+ * it reads as a system notification rather than an internal nudge.
+ *
+ * A teardown kill is named as a kill, not left as a bare "stopped": the agent
+ * reads this to decide whether the work still needs doing. See #1355.
  */
 export function buildTaskResultContinuationMessage(
   notifications: TaskTerminalNotification[],
 ): string {
-  const lines = notifications
-    .filter(n => n.status !== 'stopped')
-    .map(n => {
-      const parts = [`- "${n.description || n.taskId}" ${n.status}`];
-      if (n.summary) parts.push(`  Summary: ${n.summary}`);
-      if (n.outputFile) parts.push(`  Output file: ${n.outputFile}`);
-      return parts.join('\n');
-    });
-  return (
-    '[System: background task(s) you launched have finished:\n'
-    + lines.join('\n')
-    + '\nContinue the work that was waiting on them.]'
-  );
+  const reportable = notifications.filter(isReportable);
+  const killed = reportable.filter(wasKilledByTeardown);
+
+  const lines = reportable.map(n => {
+    const parts = wasKilledByTeardown(n)
+      ? [
+          `- "${n.description || n.taskId}" was KILLED at process exit`
+          + (n.elapsedMs !== undefined ? ` after running ${formatElapsed(n.elapsedMs)}` : '')
+          + ' — it did not finish on its own.',
+        ]
+      : [`- "${n.description || n.taskId}" ${n.status}`];
+    if (n.summary) parts.push(`  Summary: ${n.summary}`);
+    if (n.outputFile) parts.push(`  Output file: ${n.outputFile}`);
+    return parts.join('\n');
+  });
+
+  const header =
+    killed.length === reportable.length
+      ? '[System: background task(s) you launched were killed before finishing:'
+      : '[System: background task(s) you launched have settled:';
+
+  const footer = killed.length > 0
+    ? '\nAny output file above holds only partial output, up to the moment of the kill.'
+      + ' Treat the killed work as NOT done: re-run it, or report that it could not complete.'
+      + ' Continue the work that was waiting on the rest.]'
+    : '\nContinue the work that was waiting on them.]';
+
+  return header + '\n' + lines.join('\n') + footer;
 }
 
 /** True if any tracked sub-agent task is still running. */
@@ -240,6 +340,59 @@ export function countRunningTasks(tasks: Iterable<SubagentTaskLike>): number {
  */
 export function shouldDeferTeardownForSubagents(hasRunning: boolean): boolean {
   return hasRunning;
+}
+
+/**
+ * Default bound on how long a backgrounded shell holds the prompt stream open
+ * after its turn ended.
+ *
+ * The grace timer this feeds is a NO-ACTIVITY stall detector: any SDK chunk
+ * resets it. That works for a sub-agent, which streams `task_progress` while it
+ * runs — silence from one really is a stall. A `local_bash` task streams nothing
+ * at all until it settles, so silence from one carries no information, and the
+ * 5-minute sub-agent window killed every background shell that ran longer than
+ * it. See GitHub #1355.
+ *
+ * 30 minutes covers CI waits and long builds while still bounding a runaway; on
+ * expiry the existing `killedByTeardown` path reports the kill honestly rather
+ * than letting it look like a user stop.
+ */
+export const DEFAULT_SHELL_DRAIN_MS = 1_800_000;
+
+/**
+ * Resolve the background-shell window, allowing an env override so tests can use
+ * a short window instead of waiting out half an hour. Invalid / non-positive
+ * values fall back to the default. Mirrors `resolveStreamStallMs`.
+ */
+export function resolveShellDrainMs(
+  env: NodeJS.ProcessEnv = process.env,
+): number {
+  const raw = env.NIMBALYST_CC_SHELL_DRAIN_MS;
+  const n = raw !== undefined ? Number(raw) : NaN;
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_SHELL_DRAIN_MS;
+}
+
+/**
+ * How long to leave the prompt stream open after a turn ends, given what is
+ * still running. Ending it closes the CLI's stdin, which kills every live
+ * background task with the subprocess — so the window has to be sized by what
+ * silence MEANS for each kind of task, not by one number for all of them.
+ *
+ * Takes the max over the running set: a stalled sub-agent must not cut short a
+ * live shell. Terminal tasks are ignored, so a settled shell stops holding the
+ * stream open. With nothing running, the short idle window applies.
+ */
+export function resolvePromptEndDelay(
+  tasks: Iterable<SubagentTaskLike>,
+  windows: { idle: number; subagent: number; shell: number },
+): number {
+  let delay = windows.idle;
+  for (const task of tasks) {
+    if (task.status !== 'running') continue;
+    const window = task.taskType === 'local_bash' ? windows.shell : windows.subagent;
+    if (window > delay) delay = window;
+  }
+  return delay;
 }
 
 /**

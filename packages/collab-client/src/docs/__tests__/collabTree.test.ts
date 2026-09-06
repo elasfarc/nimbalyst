@@ -11,6 +11,8 @@ import {
   getCollabDocumentPath,
   getSharedDocumentDisplayPathWithFallback,
   getSharedDocumentDisplayPath,
+  getSharedDocumentDisplayName,
+  UNRESOLVED_SHARED_DOCUMENT_NAME,
   getCollabNodeName,
   getCollabParentPath,
   joinCollabPath,
@@ -404,6 +406,28 @@ describe('collabTree', () => {
     it('returns no updates for a blank or unchanged name', () => {
       expect(computeLegacyFolderRenameUpdates(documents, 'Specs', '  ')).toEqual([]);
       expect(computeLegacyFolderRenameUpdates(documents, 'Specs', 'Specs')).toEqual([]);
+    });
+  });
+
+  describe('getSharedDocumentDisplayName never leaks the transport id', () => {
+    // A shared doc whose title has not resolved yet -- or whose title is
+    // pre-cutover ciphertext no client can read -- must fall back to a plain
+    // label. Showing the raw document id in the tab was NIM-1641; the guard
+    // that fixed it had no coverage, so it could regress silently.
+    const ID = '4b37906e-fffd-455f-bd6e-0b3d57f0766e';
+
+    it.each([
+      ['title missing', undefined],
+      ['title null', null],
+      ['title blank', '   '],
+      ['title is the id itself', ID],
+      ['title is the id with path noise', `/${ID}/`],
+    ])('%s -> generic label', (_label, title) => {
+      expect(getSharedDocumentDisplayName(title, ID)).toBe(UNRESOLVED_SHARED_DOCUMENT_NAME);
+    });
+
+    it('uses the leaf name when a real title is present', () => {
+      expect(getSharedDocumentDisplayName('Specs/API Spec', ID)).toBe('API Spec');
     });
   });
 });

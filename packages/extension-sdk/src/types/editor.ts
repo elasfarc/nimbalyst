@@ -16,6 +16,7 @@
 import type { Doc as YDoc } from 'yjs';
 import type { Awareness } from 'y-protocols/awareness';
 import type { ExtensionStorage } from './panel.js';
+import type { CollaborationCommentsService } from './comments.js';
 
 // ============================================================================
 // Collaboration types
@@ -89,6 +90,13 @@ export interface CollaborationContext {
   /** Identity used to drive `awareness` and presence display. */
   readonly user: { id: string; name: string; color: string };
 
+  /**
+   * Host-owned collaborative comments for this document. Absent when the host
+   * cannot provide live authorization, hydration, identity, and notification
+   * routing for the capability.
+   */
+  readonly comments?: CollaborationCommentsService;
+
   /** Current connection status. */
   getStatus(): CollaborationStatus;
 
@@ -160,6 +168,22 @@ export interface CollaborationContext {
    * Excalidraw scene JSON) deterministically so dedupe-on-hash is stable.
    */
   registerRevisionAdapter?(adapter: RevisionSnapshotAdapter): () => void;
+
+  /**
+   * Register a synchronous drain of the editor's pending local content into the
+   * Y.Doc. The returned function unregisters it -- call it on unmount.
+   *
+   * A binding that debounces its local pushes holds the newest edit outside the
+   * CRDT until the debounce fires. The host awaits this before it reports a
+   * write as complete -- notably after every mutating extension AI tool -- so an
+   * agent edit is in the Y.Doc and server-acked before the tool returns.
+   * Without it the tool reports success while the edit is still in the
+   * debounce, and a peer update landing in that window discards it: the same
+   * loss window that direct keystrokes close by calling `syncNow()`.
+   *
+   * Bindings that write through to the Y.Doc synchronously do not need this.
+   */
+  registerContentFlush?(flush: () => void | Promise<void>): () => void;
 }
 
 /**
@@ -189,6 +213,115 @@ export interface RevisionSnapshotAdapter {
    * absent, the dialog shows metadata only.
    */
   readonly previewKind?: 'text' | 'metadata-only';
+}
+
+// ============================================================================
+// Host capability negotiation
+// ============================================================================
+
+/**
+ * A thing an editor might want to do that not every host can provide.
+ *
+ * The same extension bundle now runs in more than one host: the Electron
+ * renderer (filesystem, AI panel, Monaco source mode) and a browser host
+ * driving a collaborative document (none of those). Optional members of
+ * {@link EditorHost} already answer "can I do X" by being absent, but the
+ * required ones -- `saveContent`, `onFileChanged`, `storage`,
+ * `setEditorContext` -- cannot disappear, and a host that stubs them into
+ * resolved no-ops tells the editor a write succeeded when nothing was written.
+ *
+ * A host that cannot do one of these must both (a) report it here so the
+ * editor can branch BEFORE calling, and (b) fail loudly if called anyway.
+ */
+export type EditorHostCapability =
+  /** `host.collaboration` is present and drives document state. */
+  | 'collaboration'
+  /** Remote presence/awareness is transported to other clients. */
+  | 'presence'
+  /** `setDirty` reaches a real dirty indicator. */
+  | 'dirtyState'
+  /** `theme` / `onThemeChanged` reflect the host's real theme. */
+  | 'theme'
+  /** `readOnly` / `onReadOnlyChanged` reflect a real host mode. */
+  | 'readOnly'
+  /** `visible` / `onVisibilityChanged` report real on-screen visibility. */
+  | 'visibility'
+  /** `loadContent` returns the document's own content. */
+  | 'initialContent'
+  /** `loadBinaryContent` returns real bytes. */
+  | 'binaryContent'
+  /** `saveContent` writes the document to a local file. */
+  | 'localFileSave'
+  /** `onFileChanged` fires when the backing file changes out of band. */
+  | 'fileChangeNotifications'
+  /** `host.fs` is present: workspace-wide compare-and-swap file access. */
+  | 'projectFileSystem'
+  /** `workspaceId` identifies a real workspace. */
+  | 'workspace'
+  /** `openHistory` opens document history. */
+  | 'history'
+  /** `openExternal` opens a URL outside the app. */
+  | 'externalLinks'
+  /** Source-mode toggle (`toggleSourceMode` and friends). */
+  | 'sourceMode'
+  /** AI diff review (`onDiffRequested` and friends). */
+  | 'diffMode'
+  /** `onFindRequested` delivers the app's Find command. */
+  | 'findCommand'
+  /** `setEditorContext` / `setEditorContextItems` reach an AI chat surface. */
+  | 'aiContext'
+  /** `registerEditorAPI` publishes the editor to AI tools. */
+  | 'editorApi'
+  /** `registerViewport` reaches a host that carries scroll between documents. */
+  | 'viewport'
+  /** `registerMenuItems` reaches a real actions menu. */
+  | 'menuItems'
+  /** `storage` survives a reload. */
+  | 'persistentStorage'
+  /** `storage.getSecret` / `setSecret` reach a real secret store. */
+  | 'secretStorage'
+  /** `getConfig` reads extension configuration. */
+  | 'configuration';
+
+/** Why a host cannot provide a capability. Shown in diagnostics, not to users. */
+export interface EditorHostCapabilityGap {
+  capability: EditorHostCapability;
+  reason: string;
+}
+
+/**
+ * What this host can and cannot do, answered up front.
+ *
+ * Present only on hosts that model capabilities. `undefined` means "this host
+ * makes no claim" -- see {@link editorHostSupports} for the one place that
+ * decision is interpreted, so extensions never re-derive it.
+ */
+export interface EditorHostCapabilities {
+  /** Stable id of the host environment, e.g. `'browser'`. */
+  readonly environment: string;
+
+  /** True when this host really provides `capability`. */
+  supports(capability: EditorHostCapability): boolean;
+
+  /** Every capability this host cannot provide, each with a reason. */
+  readonly unavailable: readonly EditorHostCapabilityGap[];
+}
+
+/**
+ * An editor's scroll position, expressed so it survives the trip to a document
+ * of a different length. See {@link EditorHost.registerViewport}.
+ *
+ * A **fraction of scrollable height**, never a pixel offset. Two variants of a
+ * screen are rarely the same length, and 2000px down a 2400px design is near
+ * the end of it while 2000px down a 9000px design is barely started. Carrying
+ * pixels would land the reader somewhere arbitrary, and nothing on screen would
+ * say why.
+ */
+export interface EditorViewport {
+  /** Current position in `[0, 1]`. Content with nowhere to scroll returns 0. */
+  getScrollFraction(): number;
+  /** Restore a position captured from a document of any length. */
+  setScrollFraction(fraction: number): void;
 }
 
 // ============================================================================
@@ -322,9 +455,29 @@ export interface DiffResult {
  * ```
  */
 export interface EditorHost {
+  // ============ CAPABILITIES ============
+
+  /**
+   * What this host can and cannot do. Read it through
+   * {@link editorHostSupports} rather than directly, so the "host makes no
+   * claim" case is interpreted in exactly one place.
+   *
+   * Optional: the Electron renderer omits it (it provides everything). A host
+   * that cannot honour part of this interface -- the browser collaborative
+   * host -- populates it, and rejects the calls it declares unavailable.
+   */
+  readonly capabilities?: EditorHostCapabilities;
+
   // ============ FILE INFO ============
 
-  /** Absolute path to the file being edited */
+  /**
+   * Identifier for the document being edited.
+   *
+   * On the Electron host this is an absolute path on disk. On a host with no
+   * filesystem it is a stable synthetic URI for the same document; treat it as
+   * an opaque key (registry lookups, React keys) and gate anything that
+   * actually touches disk on `projectFileSystem` / `localFileSave`.
+   */
   readonly filePath: string;
 
   /** File name (for display) */
@@ -672,6 +825,46 @@ export interface EditorHost {
    * ```
    */
   registerEditorAPI(api: unknown | null): void;
+
+  // ============ VIEWPORT (OPTIONAL) ============
+
+  /**
+   * Publish this editor's scroll position, so a host showing several documents
+   * in sequence can carry the reader's place from one to the next.
+   *
+   * The case this exists for: comparing design alternatives. Open option A,
+   * scroll to the pricing table, step to option B, and land on B's pricing
+   * table. Without it, stepping between options is three separate lookups and
+   * the reader is comparing against memory again.
+   *
+   * The host cannot do this itself. An editor that paints into an iframe --
+   * which every mockup does -- owns a scroll position in a document the host
+   * has no business reaching into, and an editor that scrolls a `<div>` owns
+   * one the host cannot find. Only the editor knows what scrolls.
+   *
+   * Optional on both sides, and silence is a supported answer: an editor that
+   * never calls this simply does not carry scroll, and each document opens at
+   * the top. Call with `null` to unregister, as with `registerEditorAPI`.
+   *
+   * @example
+   * ```tsx
+   * useEffect(() => {
+   *   host.registerViewport?.({
+   *     getScrollFraction: () => {
+   *       const doc = iframeRef.current?.contentDocument?.documentElement;
+   *       if (!doc) return 0;
+   *       return scrollFractionOf(doc.scrollTop, doc.scrollHeight - doc.clientHeight);
+   *     },
+   *     setScrollFraction: (fraction) => {
+   *       const doc = iframeRef.current?.contentDocument?.documentElement;
+   *       if (doc) doc.scrollTop = fraction * (doc.scrollHeight - doc.clientHeight);
+   *     },
+   *   });
+   *   return () => host.registerViewport?.(null);
+   * }, [host]);
+   * ```
+   */
+  registerViewport?(viewport: EditorViewport | null): void;
 
   // ============ MENU ITEMS ============
 

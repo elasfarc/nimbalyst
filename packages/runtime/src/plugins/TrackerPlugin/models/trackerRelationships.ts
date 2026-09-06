@@ -10,6 +10,7 @@
  */
 
 import type { FieldDefinition, TrackerRelationshipValue } from './TrackerDataModel';
+import { normalizeRelationshipValue as normalizeCoreRelationshipValue } from '@nimbalyst/tracker-core';
 
 /** A relationship vocabulary entry (label + behavior hints for a field). */
 export interface TrackerRelationshipType {
@@ -26,8 +27,22 @@ export interface TrackerRelationshipType {
 
 /** Built-in relationship vocabulary. Custom keys may be added per workspace. */
 export const BUILTIN_RELATIONSHIP_TYPES: TrackerRelationshipType[] = [
-  { key: 'depends-on', displayName: 'Depends on', inverseKey: 'blocks', inverseDisplayName: 'Blocks', category: 'dependency' },
-  { key: 'blocks', displayName: 'Blocks', inverseKey: 'depends-on', inverseDisplayName: 'Depends on', category: 'dependency' },
+  {
+    key: 'depends-on',
+    displayName: 'Depends on',
+    inverseKey: 'blocks',
+    inverseDisplayName: 'Blocks',
+    category: 'dependency',
+    description: 'Work this item is waiting on.',
+  },
+  {
+    key: 'blocks',
+    displayName: 'Blocks',
+    inverseKey: 'depends-on',
+    inverseDisplayName: 'Depends on',
+    category: 'dependency',
+    description: 'Work that is waiting on this item.',
+  },
   { key: 'relates-to', displayName: 'Relates to', category: 'reference', symmetric: true },
   { key: 'duplicates', displayName: 'Duplicates', category: 'reference' },
   { key: 'supersedes', displayName: 'Supersedes', category: 'reference' },
@@ -39,6 +54,8 @@ export const BUILTIN_RELATIONSHIP_TYPES: TrackerRelationshipType[] = [
   // "is a subtask of".
   { key: 'has-item', displayName: 'Includes', inverseKey: 'in-collection', inverseDisplayName: 'In collection', category: 'hierarchy', icon: 'inventory_2' },
   { key: 'in-collection', displayName: 'In collection', inverseKey: 'has-item', inverseDisplayName: 'Includes', category: 'hierarchy', icon: 'inventory_2' },
+  { key: 'contributes-to', displayName: 'Contributes', inverseKey: 'contributed-by', inverseDisplayName: 'Goal', category: 'hierarchy', icon: 'flag' },
+  { key: 'contributed-by', displayName: 'Goal', inverseKey: 'contributes-to', inverseDisplayName: 'Contributes', category: 'hierarchy', icon: 'flag' },
 ];
 
 const BUILTIN_BY_KEY = new Map(BUILTIN_RELATIONSHIP_TYPES.map((t) => [t.key, t]));
@@ -64,33 +81,7 @@ export function isRelationshipField(def: Pick<FieldDefinition, 'type'>): boolean
  * pre-existing `reference` value never throws.
  */
 export function normalizeRelationshipValue(raw: unknown): TrackerRelationshipValue[] {
-  const list: unknown[] = Array.isArray(raw) ? raw : raw == null ? [] : [raw];
-  const byId = new Map<string, TrackerRelationshipValue>();
-  for (const entry of list) {
-    const v = coerceOne(entry);
-    if (v) byId.set(v.itemId, v);
-  }
-  return [...byId.values()];
-}
-
-function coerceOne(entry: unknown): TrackerRelationshipValue | null {
-  if (typeof entry === 'string') {
-    return entry ? { itemId: entry } : null;
-  }
-  if (entry && typeof entry === 'object') {
-    const o = entry as Record<string, unknown>;
-    const itemId = typeof o.itemId === 'string' ? o.itemId : typeof o.id === 'string' ? o.id : '';
-    if (!itemId) return null;
-    const out: TrackerRelationshipValue = { itemId };
-    if (typeof o.issueKey === 'string') out.issueKey = o.issueKey;
-    if (typeof o.title === 'string') out.title = o.title;
-    if (typeof o.trackerType === 'string') out.trackerType = o.trackerType;
-    if (typeof o.relationshipTypeKey === 'string') out.relationshipTypeKey = o.relationshipTypeKey;
-    if (o.direction === 'out') out.direction = 'out';
-    if (o.metadata && typeof o.metadata === 'object') out.metadata = o.metadata as Record<string, unknown>;
-    return out;
-  }
-  return null;
+  return normalizeCoreRelationshipValue(raw) as TrackerRelationshipValue[];
 }
 
 export interface RelationshipValidationContext {

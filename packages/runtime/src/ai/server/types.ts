@@ -72,6 +72,9 @@ export interface DocumentContext {
 
   /** Durable authorship provenance for prompt search and audit surfaces. */
   promptProvenance?: PromptProvenance;
+
+  /** Durable reciprocal links for work dispatched from a team conversation. */
+  agentWakeOrigin?: AgentWakePromptOrigin;
 }
 
 export type PromptActor = 'human' | 'agent' | 'system';
@@ -88,6 +91,17 @@ export interface PromptProvenance {
   origin: PromptProvenanceOrigin;
   originSessionId?: string;
   queuedPromptId?: string;
+  originOrgId?: string;
+  originConversationId?: string;
+  originMessageId?: string;
+}
+
+export interface AgentWakePromptOrigin {
+  policyKey: string;
+  orgId: string;
+  conversationId: string;
+  messageIds: string[];
+  targets: Array<{ deliveryId: string; sessionId: string }>;
 }
 
 export interface ChatAttachment {
@@ -127,7 +141,7 @@ export interface ToolCall {
 
 /**
  * OpenAI function-calling shaped tool definition threaded to extension-agent
- * providers so their tool loops (e.g. gemini-antigravity) can present the host's
+ * providers so their tool loops (e.g. Gemini) can present the host's
  * meta-agent tools as JSON in the model prompt. Built-in providers ignore this
  * — they discover the same tools over an SSE MCP server instead. Optional and
  * additive everywhere it appears so no built-in provider path is affected.
@@ -176,7 +190,7 @@ export interface Message {
  * Add new providers here -- the type, runtime array, and exhaustiveness
  * checks all derive from this one definition.
  */
-export const AI_PROVIDER_TYPES = ['claude', 'claude-code', 'claude-code-cli', 'openai', 'openai-codex', 'openai-codex-acp', 'lmstudio', 'opencode', 'copilot-cli'] as const;
+export const AI_PROVIDER_TYPES = ['claude', 'claude-code', 'claude-code-cli', 'openai', 'openai-codex', 'openai-codex-acp', 'lmstudio', 'opencode', 'copilot-cli', 'grok-build', 'cursor-agent', 'antigravity-gemini-agent'] as const;
 
 export type AIProviderType = typeof AI_PROVIDER_TYPES[number];
 
@@ -195,8 +209,34 @@ export function assertExhaustiveProvider(provider: never): never {
   throw new Error(`Unhandled provider: ${provider}`);
 }
 
-export function isAgentProvider(provider: string | null | undefined): provider is 'claude-code' | 'claude-code-cli' | 'openai-codex' | 'openai-codex-acp' | 'opencode' | 'copilot-cli' {
-  return provider === 'claude-code' || provider === 'claude-code-cli' || provider === 'openai-codex' || provider === 'openai-codex-acp' || provider === 'opencode' || provider === 'copilot-cli';
+export type AgentProviderType =
+  | 'claude-code'
+  | 'claude-code-cli'
+  | 'openai-codex'
+  | 'openai-codex-acp'
+  | 'opencode'
+  | 'copilot-cli'
+  | 'grok-build'
+  | 'cursor-agent'
+  // Keeps its original contribution id from the years it shipped as an
+  // extension: the id is persisted on every existing Gemini session row, and
+  // re-keying it would orphan that history for a cosmetic gain.
+  | 'antigravity-gemini-agent';
+
+const AGENT_PROVIDER_TYPES: ReadonlySet<string> = new Set<AgentProviderType>([
+  'claude-code',
+  'claude-code-cli',
+  'openai-codex',
+  'openai-codex-acp',
+  'opencode',
+  'copilot-cli',
+  'grok-build',
+  'cursor-agent',
+  'antigravity-gemini-agent',
+]);
+
+export function isAgentProvider(provider: string | null | undefined): provider is AgentProviderType {
+  return !!provider && AGENT_PROVIDER_TYPES.has(provider);
 }
 
 /**
@@ -242,15 +282,10 @@ export function shouldBlockStartedSessionProviderSwitch(
  * still choose previous generations. See CLAUDE_CODE_PINNED_SDK_MODELS in
  * modelConstants.ts.
  *
- * `fable` is the Fable 5 tier above Opus — the CLI accepts it as a first-class
- * alias (`--model fable`, `/model fable`). Its plain row runs a 1M window when
- * the plan auto-upgrades it, and it also gets an explicit `-1m` row for the
- * cases where that upgrade doesn't apply (Pro without credits, or any
- * `ANTHROPIC_BASE_URL` gateway) — see `CLAUDE_CODE_VARIANTS_WITH_1M`. Note it
- * requires usage credits on subscription plans (the CLI surfaces that itself
- * when unavailable).
+ * `fable` is the Fable tier above Opus (currently Fable 5.1). `fable-5` is the
+ * pinned previous-generation Fable. Both run a 1M window natively.
  */
-export const CLAUDE_CODE_VARIANTS = ['fable', 'opus', 'opus-4-8', 'opus-4-7', 'opus-4-6', 'sonnet', 'sonnet-4-6', 'haiku'] as const;
+export const CLAUDE_CODE_VARIANTS = ['fable', 'fable-5', 'opus', 'opus-4-8', 'opus-4-7', 'opus-4-6', 'sonnet', 'sonnet-4-6', 'haiku'] as const;
 
 /**
  * Resolves a configured model string to the SDK model value.
@@ -310,6 +345,49 @@ export interface AIModel {
   provider: AIProviderType;
   maxTokens?: number;
   contextWindow?: number;
+  cost?: AIModelCost;
+  status?: 'alpha' | 'beta' | 'deprecated' | 'active';
+  capabilities?: AIModelCapabilities;
+  /**
+   * Listed only because the user already selected it: discovery did not find
+   * the model under an authenticated provider, so a new turn would fail. Kept
+   * so a revoked credential never silently erases a selection (#916).
+   */
+  unavailable?: boolean;
+}
+
+export interface AIModelCost {
+  input: number;
+  output: number;
+  cache: {
+    read: number;
+    write: number;
+  };
+  experimentalOver200K?: {
+    input: number;
+    output: number;
+    cache: {
+      read: number;
+      write: number;
+    };
+  };
+}
+
+export interface AIModelModalityCapabilities {
+  text: boolean;
+  audio: boolean;
+  image: boolean;
+  video: boolean;
+  pdf: boolean;
+}
+
+export interface AIModelCapabilities {
+  temperature: boolean;
+  reasoning: boolean;
+  attachment: boolean;
+  toolcall: boolean;
+  input: AIModelModalityCapabilities;
+  output: AIModelModalityCapabilities;
 }
 
 /** Structural type describing what role a session plays in the hierarchy */
@@ -429,6 +507,12 @@ export interface ProviderConfig {
   baseUrl?: string;
   allowedTools?: string[];  // List of allowed tool names, ['*'] for all tools
   effortLevel?: EffortLevel;  // Effort level for Opus 4.6 adaptive reasoning (low/medium/high/max)
+  /**
+   * Provider-native persona the session runs as. Currently OpenCode only, where
+   * it names one of the `mode: primary | all` agents from `app.agents`.
+   * Undefined means the provider's own default role.
+   */
+  agentRole?: string;
   thinkingMode?: ThinkingMode;  // Extended thinking mode for Claude Agent (enabled/disabled)
   responseFormat?: ProviderResponseFormat;  // Response format constraint (extension chat completions)
   skipLogging?: boolean;  // Skip message logging to DB (extension stateless completions)
@@ -474,7 +558,14 @@ export interface StreamChunk {
   // step during a long agentic turn (instead of once per turn at 'complete').
   // It must never carry cumulative input/output usage -- those stay on
   // 'complete' to avoid double-counting. See NIM-868.
-  type: 'text' | 'tool_call' | 'tool_error' | 'error' | 'complete' | 'context_usage' | 'stream_edit_start' | 'stream_edit_content' | 'stream_edit_end' | 'pre_edit_snapshot' | 'post_edit_snapshot';
+  //
+  // 'tool_result' says a tool call the consumer already saw as 'tool_call' has
+  // reached a terminal outcome. Providers that attach the result by mutating the
+  // object they already yielded (Claude Code) emit it so consumers tracking
+  // liveness -- the Git journal behind the menu-bar indicator -- can see the
+  // call end. It carries the same `toolCall` object as that earlier chunk, so it
+  // is a completion signal only, never a second tool call.
+  type: 'text' | 'tool_call' | 'tool_result' | 'tool_error' | 'error' | 'complete' | 'context_usage' | 'stream_edit_start' | 'stream_edit_content' | 'stream_edit_end' | 'pre_edit_snapshot' | 'post_edit_snapshot';
   content?: string;
   isSystem?: boolean; // For system messages like slash command output
   toolCall?: {
@@ -502,6 +593,7 @@ export interface StreamChunk {
   isBedrockToolError?: boolean; // True when error is a Bedrock tool search error
   isServerError?: boolean; // True when error is a 500/internal server error (Claude may be down)
   isCodexAuthRequired?: boolean; // True when a Codex app-server session was blocked because the user is not signed in to OpenAI
+  isProcessCrash?: boolean; // True when the agent subprocess died from a native fault (#1361), so the turn must settle as errored despite the follow-up 'complete'
   isComplete?: boolean;
   config?: unknown; // For stream_edit_start
   usage?: {
@@ -510,6 +602,14 @@ export interface StreamChunk {
     total_tokens: number;
     cache_read_input_tokens?: number;
     cache_creation_input_tokens?: number;
+  };
+  // Structured `/context` report from the agent SDK (0.3.241+), when the binary
+  // attaches one. Set only on the `complete` chunk of a /context turn; the
+  // rendered markdown remains the fallback for older binaries.
+  contextReport?: {
+    totalTokens: number;
+    contextWindow: number;
+    categories?: TokenUsageCategory[];
   };
   // Per-model usage breakdown from SDK (available on 'complete' chunks from claude-code)
   modelUsage?: Record<string, {

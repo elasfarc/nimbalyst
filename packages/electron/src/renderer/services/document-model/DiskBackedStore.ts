@@ -29,6 +29,13 @@ export class DiskBackedStore implements DocumentBackingStore {
    */
   private recentSaveTimestamps = new Set<number>();
 
+  /**
+   * Order stamp handed to the model with each change. Taken when the watcher
+   * signal arrives, before the asynchronous read below, so two reads that
+   * resolve out of order are still recognisable as older and newer.
+   */
+  private nextSignalSequence = 0;
+
   constructor(filePath: string) {
     this.filePath = filePath;
     this.setupFileWatcher();
@@ -43,7 +50,14 @@ export class DiskBackedStore implements DocumentBackingStore {
     return result.content;
   }
 
-  async save(content: string | ArrayBuffer): Promise<void> {
+  /**
+   * `expectedDiskContent` reaches the main process as `lastKnownContent` and
+   * arms the conflict check in `FileHandlers.saveFile`. This used to be
+   * hardcoded `undefined`, which made every write through this store an
+   * unconditional overwrite -- including the autosaves of custom editors and
+   * every hidden editor (#3684).
+   */
+  async save(content: string | ArrayBuffer, expectedDiskContent?: string): Promise<void> {
     const now = Date.now();
     this.recentSaveTimestamps.add(now);
 
@@ -53,7 +67,7 @@ export class DiskBackedStore implements DocumentBackingStore {
     }, 5000);
 
     if (typeof content === 'string') {
-      const result = await window.electronAPI.saveFile(content, this.filePath, undefined, 'auto');
+      const result = await window.electronAPI.saveFile(content, this.filePath, expectedDiskContent, 'auto');
       assertFileSaveSucceeded(result);
     } else {
       // Binary content -- convert ArrayBuffer to base64 for IPC
@@ -61,7 +75,7 @@ export class DiskBackedStore implements DocumentBackingStore {
       const uint8 = new Uint8Array(content);
       const binary = Array.from(uint8, (b) => String.fromCharCode(b)).join('');
       const base64 = btoa(binary);
-      const result = await window.electronAPI.saveFile(base64, this.filePath, undefined, 'auto');
+      const result = await window.electronAPI.saveFile(base64, this.filePath, expectedDiskContent, 'auto');
       assertFileSaveSucceeded(result);
     }
   }
@@ -89,9 +103,9 @@ export class DiskBackedStore implements DocumentBackingStore {
    *    bypassed to check for AI edits
    */
   private setupFileWatcher(): void {
-    const emitChange = async (checkPendingTags: boolean) => {
+    const emitChange = async (checkPendingTags: boolean, sequence: number) => {
       const tStart = performance.now();
-      diffTrace('DiskBackedStore.emitChange start', { path: this.filePath, checkPendingTags, t: tStart });
+      diffTrace('DiskBackedStore.emitChange start', { path: this.filePath, checkPendingTags, sequence, t: tStart });
       let content: string;
       try {
         const result = await window.electronAPI.readFileContent(this.filePath);
@@ -114,6 +128,7 @@ export class DiskBackedStore implements DocumentBackingStore {
         content,
         timestamp: Date.now(),
         checkPendingTags,
+        sequence,
       };
 
       for (const cb of this.changeCallbacks) {
@@ -132,11 +147,11 @@ export class DiskBackedStore implements DocumentBackingStore {
 
     const unsubFileChange = store.sub(fileChangeAtom, () => {
       if (store.get(fileChangeAtom) === initialFileChangeVersion) return;
-      void emitChange(false);
+      void emitChange(false, ++this.nextSignalSequence);
     });
     const unsubTagCreated = store.sub(tagCreatedAtom, () => {
       if (store.get(tagCreatedAtom) === initialTagCreatedVersion) return;
-      void emitChange(true);
+      void emitChange(true, ++this.nextSignalSequence);
     });
 
     this.ipcCleanup = () => {

@@ -17,6 +17,11 @@ export interface ResolvedSharedDocumentTypeMetadata {
   source: 'v2' | 'legacy-inferred';
 }
 
+export interface SharedDocumentRenameParts {
+  baseName: string;
+  suffix: string;
+}
+
 export const UNSUPPORTED_SHARED_DOCUMENT_ICON = 'lock';
 
 function normalizeSuffix(value: string | null | undefined): string | undefined {
@@ -71,6 +76,28 @@ export function inferSharedDocumentTypeMetadata(
     editorId: document.editorId?.trim() || (descriptor ? editorIdForDescriptor(descriptor) : undefined),
     source,
   };
+}
+
+/** Keep the catalog-owned suffix out of the editable portion of a shared title. */
+export function getSharedDocumentRenameParts(
+  document: Pick<SharedDocument, 'title' | 'documentType' | 'metadataVersion' | 'fileExtension' | 'editorId'>,
+  descriptors: readonly CollabDocumentTypeDescriptor[],
+): SharedDocumentRenameParts {
+  const name = document.title.replace(/\\/g, '/').split('/').at(-1) ?? '';
+  const suffix = inferSharedDocumentTypeMetadata(document, descriptors).fileExtension ?? '';
+  const baseName = suffix && name.toLowerCase().endsWith(suffix.toLowerCase())
+    ? name.slice(0, -suffix.length)
+    : name;
+  return { baseName, suffix };
+}
+
+export function applySharedDocumentRenameSuffix(requestedName: string, suffix: string): string {
+  const trimmedName = requestedName.trim();
+  if (!suffix) return trimmedName;
+  const baseName = trimmedName.toLowerCase().endsWith(suffix.toLowerCase())
+    ? trimmedName.slice(0, -suffix.length)
+    : trimmedName;
+  return `${baseName}${suffix}`;
 }
 
 export function resolveSharedDocumentTypePresentation(

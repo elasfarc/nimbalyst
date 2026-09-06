@@ -10,7 +10,7 @@
  * `design/Collaboration/tracker-sync-redesign.md`. The wire protocol lives
  * in `./trackerProtocol.ts`; the storage seam lives in
  * `./trackerPersistence.ts`; the AES-256-GCM helpers live in
- * `./TrackerEnvelopeCrypto.ts`.
+ * `./trackerEnvelopeCodec.ts`.
  *
  * Platform notes
  * --------------
@@ -35,30 +35,35 @@
  */
 
 import type {
-  EncryptedTrackerItemEnvelope,
+  TrackerItemEnvelope,
   SyncId,
   TrackerClientMessage,
   TrackerServerMessage,
   TrackerMutationAckMessage,
+  TrackerMutationBatchAckMessage,
   TrackerItemPayload,
   TrackerRoomConfig,
   TrackerSyncResponseMessage,
   TrackerDeltaMessage,
   TrackerConfigBroadcastMessage,
   TrackerTransactionRow,
-  EncryptedTrackerSchemaEnvelope,
+  TrackerSchemaEnvelope,
   TrackerSchemaSyncResponseMessage,
   TrackerSchemaDeltaMessage,
   TrackerSchemaMutationAckMessage,
-  EncryptedTrackerNavigationEnvelope,
+  TrackerNavigationEnvelope,
   TrackerNavigationSyncResponseMessage,
   TrackerNavigationDeltaMessage,
   TrackerNavigationMutationAckMessage,
-  EncryptedTrackerSavedViewEnvelope,
+  TrackerSavedViewEnvelope,
   TrackerSavedViewSyncResponseMessage,
   TrackerSavedViewDeltaMessage,
   TrackerSavedViewMutationAckMessage,
+  TrackerPresenceRosterMessage,
+  TrackerPresenceDeltaMessage,
   TrackerRoomMovedMessage,
+  TrackerErrorMessage,
+  TrackerMutationRejectCode,
 } from './trackerProtocol';
 import { SYNC_ID_INITIAL, buildTrackerRoomId } from './trackerProtocol';
 import { appendSyncClientParams } from './syncClientInfo';
@@ -68,8 +73,21 @@ import {
   decodeTrackerSchemaEnvelopePlaintext,
   decodeTrackerNavigationEnvelopePlaintext,
   decodeTrackerSavedViewEnvelopePlaintext,
-} from './TrackerEnvelopeCrypto';
-import type { TrackerPersistence, TrackerRowSnapshot } from './trackerPersistence';
+} from './trackerEnvelopeCodec';
+import { classifyTrackerClose, type TrackerAccessTermination } from './trackerAccessTermination';
+import {
+  planTrackerIdentityRecovery,
+  type StrandedIdentityFacts,
+  type TrackerIdentityRecoveryPlan,
+} from './trackerIdentityRecovery';
+import {
+  isPermanentTrackerRejection,
+  type PersistedTrackerTransactionRow,
+  type TrackerPersistence,
+  type TrackerRowSnapshot,
+  type TrackerTransactionOwner,
+} from './trackerPersistence';
+import { asTeamMemberId, type TeamJwt, type TeamMemberId } from '../auth/jwtScopes';
 
 // ============================================================================
 // Public types
@@ -103,8 +121,36 @@ export interface AppliedTrackerItem {
  */
 export interface RejectedTrackerMutation {
   clientMutationId: string;
+  /** The item, view, entry or schema type the refusal is about. */
   itemId: string;
+  /**
+   * Which lane refused. Absent means the item lane, so existing consumers that
+   * predate the other three keep reading the same shape.
+   */
+  lane?: 'item' | 'savedView' | 'navigation' | 'schema';
   rejection: NonNullable<TrackerTransactionRow['lastRejection']>;
+}
+
+export interface TrackerConfigSetResult {
+  success: boolean;
+  config?: TrackerRoomConfig;
+  code?: string;
+  message?: string;
+  conflictingProjectName?: string;
+  suggestedPrefix?: string;
+}
+
+/** Public, branded projection of one remote member viewing this tracker room. */
+export interface TrackerPresenceParticipant {
+  teamMemberId: TeamMemberId;
+  displayName: string;
+  avatarUrl: string | null;
+}
+
+/** The only identity fields a tracker connection publishes for presence. */
+export interface TrackerPresenceIdentity {
+  displayName: string;
+  avatarUrl?: string | null;
 }
 
 export interface TrackerSchemaLocalChange {
@@ -126,6 +172,23 @@ export interface TrackerSchemaSyncHooks {
   // definition can repair a diverged row. See runSchemaBootstrap (#1178).
   listUnsynced: () => Promise<TrackerSchemaLocalChange[]>;
   applyRemote: (def: { type: string; model: string | null; syncId: SyncId }) => Promise<unknown>;
+  /**
+   * Retire a local change the server refused for good.
+   *
+   * This lane pushes whatever `listUnsynced` returns at the end of every
+   * bootstrap, and a row leaves that queue only when `applyRemote` overwrites
+   * it. Without this seam a settled refusal -- a read-only role, most often --
+   * is re-sent on every single reconnect, forever. Optional so a host that has
+   * no notion of a retired row simply keeps the old behaviour.
+   */
+  markRejected?: (type: string, code: string) => Promise<unknown>;
+}
+
+export interface TrackerIdentityRecoveryHooks {
+  /** Everything the plan needs except the bootstrap cursor, which the engine holds. */
+  getFacts: () => Promise<Omit<StrandedIdentityFacts, 'localMaxSyncId'>>;
+  /** Record that this workspace has had its one attempt. */
+  markAttempted: () => Promise<void>;
 }
 
 export interface TrackerNavigationLocalChange {
@@ -138,6 +201,8 @@ export interface TrackerNavigationSyncHooks {
   getMaxSyncId: () => Promise<SyncId>;
   listUnsynced: () => Promise<TrackerNavigationLocalChange[]>;
   applyRemote: (def: { entryId: string; payload: string | null; syncId: SyncId }) => Promise<unknown>;
+  /** Retire a refused change; see the note on `TrackerSchemaSyncHooks`. */
+  markRejected?: (entryId: string, code: string) => Promise<unknown>;
 }
 
 export interface TrackerSavedViewLocalChange {
@@ -155,6 +220,8 @@ export interface TrackerSavedViewSyncHooks {
   getMaxSyncId: () => Promise<SyncId>;
   listUnsynced: () => Promise<TrackerSavedViewLocalChange[]>;
   applyRemote: (def: { viewId: string; payload: string | null; syncId: SyncId }) => Promise<unknown>;
+  /** Retire a refused change; see the note on `TrackerSchemaSyncHooks`. */
+  markRejected?: (viewId: string, code: string) => Promise<unknown>;
 }
 
 export interface TrackerSyncEngineConfig {
@@ -172,8 +239,8 @@ export interface TrackerSyncEngineConfig {
    */
   teamProjectId: string;
 
-  /** The current user's ID (informational; not used in auth). */
-  userId: string;
+  /** The current user's member id in this team organization. */
+  teamMemberId: TeamMemberId;
 
   /** PGLite (or in-memory test) storage seam. */
   persistence: TrackerPersistence;
@@ -198,12 +265,28 @@ export interface TrackerSyncEngineConfig {
    * during reconnect retries -- the JWT can expire during long
    * disconnections.
    */
-  getJwt: () => Promise<string>;
+  getJwt: () => Promise<TeamJwt>;
+
+  /**
+   * Authoritative browser preflight against the same room gate as the upgrade.
+   * A terminal result stops before a socket or cached projection is exposed;
+   * thrown failures remain retryable.
+   */
+  authorizeConnection?: (jwt: TeamJwt) => Promise<TrackerAccessTermination | null>;
+
+  /** Fires only after the authorized WebSocket has opened. */
+  onAuthorized?: () => void;
+
+  /** Ephemeral viewer identity. Member id always comes from the team JWT. */
+  presenceIdentity?: TrackerPresenceIdentity;
 
   // --- Observers (all optional) -------------------------------------------
 
   /** Connection-state transitions. */
   onStatusChange?: (status: TrackerSyncStatus) => void;
+
+  /** Full remote-viewer roster after every join, update, leave, or disconnect. */
+  onPresenceChange?: (members: readonly TrackerPresenceParticipant[]) => void;
 
   /** Fires for every applied projection row (remote OR self-originated). */
   onItemApplied?: (item: AppliedTrackerItem) => void;
@@ -213,6 +296,16 @@ export interface TrackerSyncEngineConfig {
 
   /** Fires when a mutation was rejected and rolled back. */
   onRejection?: (rejection: RejectedTrackerMutation) => void;
+
+  /** Fires for server diagnostics that are not item-mutation acknowledgements. */
+  onServerError?: (error: TrackerErrorMessage) => void;
+
+  /**
+   * Fires once when the room refuses this client for good. Status is `error`
+   * at this point and no reconnect is scheduled; the engine will not reconnect
+   * again, so the host must state the reason rather than show a retry.
+   */
+  onAccessTerminated?: (termination: TrackerAccessTermination) => void;
 
   /** Fires for every applied schema definition (remote OR self-originated ack). */
   onSchemaApplied?: (schema: AppliedTrackerSchema) => void;
@@ -224,6 +317,12 @@ export interface TrackerSyncEngineConfig {
    * decide to force a reconnect.
    */
   onBootstrapError?: (err: unknown) => void;
+
+  /**
+   * Repair for rows the old issue-key collision branch stranded. Optional: a
+   * host that does not track stranded rows simply never runs the pass.
+   */
+  identityRecovery?: TrackerIdentityRecoveryHooks;
 
   /**
    * Epic H3 P1: fires when the server reports this tracker room was relocated
@@ -246,6 +345,13 @@ export interface TrackerSyncEngineConfig {
    * or the `partysocket` reconnecting client used elsewhere.
    */
   createWebSocket?: (url: string) => WebSocket;
+
+  /**
+   * How long the schema bootstrap waits for one `trackerSchemaSyncResponse`
+   * before giving up on the schema lane. Defaults to
+   * {@link SCHEMA_BOOTSTRAP_TIMEOUT_MS}; tests shorten it.
+   */
+  schemaBootstrapTimeoutMs?: number;
 }
 
 // ============================================================================
@@ -259,6 +365,20 @@ const RECONNECT_MAX_MS = 30_000;
 /** Keep-alive cadence. */
 const PING_INTERVAL_MS = 30_000;
 
+/**
+ * How long the schema bootstrap waits for a `trackerSchemaSyncResponse`.
+ *
+ * The schema lane runs BEFORE items so the team's definitions are in place when
+ * rows land -- which also means an unanswered `trackerSchemaSync` (a server too
+ * old to implement it, say) would hang the whole bootstrap and leave a fresh
+ * client with an empty tracker. Bounded, the same failure degrades to "items
+ * load, schemas are whatever this machine already knows".
+ */
+const SCHEMA_BOOTSTRAP_TIMEOUT_MS = 15_000;
+
+/** Thrown by a bootstrap request whose response never arrived. */
+class SyncRequestTimeoutError extends Error {}
+
 // ============================================================================
 // TrackerSyncEngine
 // ============================================================================
@@ -269,6 +389,8 @@ export class TrackerSyncEngine {
 
   private ws: WebSocket | null = null;
   private status: TrackerSyncStatus = 'disconnected';
+  /** Set once and never cleared: a refused client stays refused for this engine. */
+  private accessTermination: TrackerAccessTermination | null = null;
   private destroyed = false;
   private synced = false;
   private connecting = false;
@@ -281,6 +403,9 @@ export class TrackerSyncEngine {
   /** Keep-alive ping. */
   private pingTimer: ReturnType<typeof setInterval> | null = null;
 
+  /** Remote viewers only; the local authenticated member is excluded. */
+  private readonly presence = new Map<TeamMemberId, TrackerPresenceParticipant>();
+
   /**
    * Rollback snapshots keyed by `clientMutationId`. Held in-memory only;
    * persisted state is captured in `tracker_transactions.payload` so we
@@ -288,9 +413,23 @@ export class TrackerSyncEngine {
    * lives for the duration of any given mutation's lifecycle so this
    * map is sufficient.
    */
+  /**
+   * clientMutationId -> the saved view / navigation entry / schema type it is
+   * about. Rejection acks on those lanes carry only the mutation id, so this is
+   * the only way to know what the server refused. Entries are removed on the
+   * matching ack, so it holds at most the in-flight pushes.
+   */
+  private readonly pendingLaneIds = new Map<string, string>();
+
   private readonly rollbackSnapshots = new Map<string, {
     itemId: string;
     snapshot: TrackerRowSnapshot;
+  }>();
+
+  private readonly pendingConfigChanges = new Map<string, {
+    requestedPrefix: string;
+    resolve: (result: TrackerConfigSetResult) => void;
+    timer: ReturnType<typeof setTimeout>;
   }>();
 
   constructor(config: TrackerSyncEngineConfig) {
@@ -308,6 +447,11 @@ export class TrackerSyncEngine {
    */
   async connect(): Promise<void> {
     if (this.destroyed) return;
+    // Do not fake recovery. The room has already refused this client with a
+    // terminal code; dialling it again can only be refused the same way, and a
+    // surface watching `status` would flicker back to `connecting` and imply
+    // that waiting might help.
+    if (this.accessTermination) return;
     if (this.ws || this.connecting) return;
 
     this.suppressReconnect = false;
@@ -322,12 +466,18 @@ export class TrackerSyncEngine {
         url = this.config.buildUrl(roomId);
       } else {
         const jwt = await this.config.getJwt();
+        const termination = await this.config.authorizeConnection?.(jwt) ?? null;
+        if (termination) {
+          this.connecting = false;
+          this.recordAccessTermination(termination);
+          return;
+        }
         url = appendSyncClientParams(`${this.config.serverUrl}/sync/${roomId}?token=${encodeURIComponent(jwt)}`);
       }
     } catch (err) {
       this.connecting = false;
       this.setStatus('error');
-      this.scheduleReconnect();
+      if (!this.accessTermination) this.scheduleReconnect();
       throw err;
     }
 
@@ -341,9 +491,13 @@ export class TrackerSyncEngine {
       : new WebSocket(url);
     this.ws = ws;
     this.connecting = false;
+    let opened = false;
+    let upgradeCheckStarted = false;
 
     ws.addEventListener('open', () => {
       if (this.ws !== ws) return;
+      opened = true;
+      this.config.onAuthorized?.();
       this.suppressReconnect = false;
       this.reconnectAttempt = 0;
       this.setStatus('syncing');
@@ -356,19 +510,77 @@ export class TrackerSyncEngine {
       void this.handleMessage(event);
     });
 
-    ws.addEventListener('close', () => {
+    ws.addEventListener('close', (event) => {
       if (this.ws !== ws) return;
+      const closeEvent = event as CloseEvent;
+      const termination = classifyTrackerClose(closeEvent?.code ?? 0, closeEvent?.reason ?? '');
+      if (termination) {
+        this.handleDisconnect(termination);
+        return;
+      }
+      if (!opened && this.config.authorizeConnection) {
+        if (upgradeCheckStarted) return;
+        upgradeCheckStarted = true;
+        void this.revalidateFailedUpgrade(ws);
+        return;
+      }
       this.handleDisconnect();
     });
 
     ws.addEventListener('error', () => {
       if (this.ws !== ws) return;
+      if (!opened && this.config.authorizeConnection) {
+        if (upgradeCheckStarted) return;
+        upgradeCheckStarted = true;
+        void this.revalidateFailedUpgrade(ws);
+        return;
+      }
       this.handleDisconnect();
     });
   }
 
+  /** Re-run the room gate when the browser hides a failed upgrade's HTTP status. */
+  private async revalidateFailedUpgrade(ws: WebSocket): Promise<void> {
+    try {
+      const jwt = await this.config.getJwt();
+      const termination = await this.config.authorizeConnection?.(jwt) ?? null;
+      if (this.ws !== ws) return;
+      this.handleDisconnect(termination);
+    } catch {
+      if (this.ws === ws && !this.accessTermination) this.handleDisconnect();
+    }
+  }
+
   /** Disconnect without scheduling a reconnect. */
   disconnect(): void {
+    this.closeSocket();
+    // A refused engine stays at `error`. Reporting `disconnected` afterwards
+    // would read as "offline, retrying" for a connection that will not retry.
+    if (!this.accessTermination) this.setStatus('disconnected');
+  }
+
+  /**
+   * Stop for good, because this client may not be in this room.
+   *
+   * Called by the engine itself for a terminal close code, and by a host that
+   * learned the same thing before a socket existed -- notably a team JWT that
+   * cannot be minted because the browser session expired, which otherwise
+   * retries silently forever and presents as an empty tracker rather than as
+   * being signed out.
+   */
+  terminateAccess(termination: TrackerAccessTermination): void {
+    if (this.accessTermination) return;
+    this.closeSocket();
+    this.recordAccessTermination(termination);
+  }
+
+  /** The refusal that stopped this engine, or null while it is still trying. */
+  getAccessTermination(): TrackerAccessTermination | null {
+    return this.accessTermination;
+  }
+
+  /** Teardown shared by an ordinary disconnect and a terminal refusal. */
+  private closeSocket(): void {
     this.suppressReconnect = true;
     this.cancelReconnect();
     this.stopPing();
@@ -378,7 +590,15 @@ export class TrackerSyncEngine {
     }
     this.connecting = false;
     this.synced = false;
-    this.setStatus('disconnected');
+    if (this.presence.size > 0) {
+      this.presence.clear();
+      this.notifyPresenceChange();
+    }
+    this.resolvePendingConfigChanges({
+      success: false,
+      code: 'disconnected',
+      message: 'Tracker sync disconnected before the prefix change was confirmed.',
+    });
   }
 
   /** Destroy the engine. Cannot be reused after this. */
@@ -386,11 +606,17 @@ export class TrackerSyncEngine {
     this.destroyed = true;
     this.disconnect();
     this.rollbackSnapshots.clear();
+    this.pendingLaneIds.clear();
   }
 
   /** Current connection status. */
   getStatus(): TrackerSyncStatus {
     return this.status;
+  }
+
+  /** Current remote-viewer roster. Returns a defensive snapshot. */
+  getPresence(): TrackerPresenceParticipant[] {
+    return [...this.presence.values()];
   }
 
   /** Flush locally-pending shared saved views while connected. */
@@ -422,6 +648,48 @@ export class TrackerSyncEngine {
     return this.enqueueMutation(payload.itemId, payload, 'update', options);
   }
 
+  /** Optimistically apply and send an update-many command as one coherent batch. */
+  async upsertItems(
+    payloads: readonly TrackerItemPayload[],
+  ): Promise<{ clientMutationIds: string[] }> {
+    if (payloads.length === 0) return { clientMutationIds: [] };
+    if (payloads.length > 100) throw new Error('Tracker mutation batches are limited to 100 items');
+    const itemIds = new Set(payloads.map(payload => payload.itemId));
+    if (itemIds.size !== payloads.length) throw new Error('Tracker mutation batches require unique item ids');
+    const applyBatch = this.persistence.applyAndEnqueueBatchAtomically;
+    if (!applyBatch) throw new Error('Tracker persistence does not support atomic mutation batches');
+
+    const now = Date.now();
+    const batchId = generateClientMutationId();
+    const rows: PersistedTrackerTransactionRow[] = payloads.map((payload, index) => ({
+      clientMutationId: generateClientMutationId(),
+      itemId: payload.itemId,
+      workspacePath: '',
+      state: 'persistedEnqueue',
+      kind: 'update',
+      payload,
+      enqueuedAt: now + index,
+      batchId,
+      owner: {
+        orgId: this.config.orgId,
+        teamProjectId: this.config.teamProjectId,
+        teamMemberId: this.config.teamMemberId,
+      },
+    }));
+    const snapshots = await applyBatch.call(
+      this.persistence,
+      rows.map((row, index) => ({ itemId: row.itemId, payload: payloads[index], row })),
+    );
+    rows.forEach((row, index) => {
+      this.rollbackSnapshots.set(row.clientMutationId, {
+        itemId: row.itemId,
+        snapshot: snapshots[index],
+      });
+    });
+    await this.driveTransactionBatch(rows);
+    return { clientMutationIds: rows.map(row => row.clientMutationId) };
+  }
+
   /**
    * Optimistically apply a delete (tombstone) and enqueue it for upload.
    */
@@ -438,11 +706,42 @@ export class TrackerSyncEngine {
    * via `trackerConfigBroadcast` -- the engine surfaces it through
    * `onConfigChange`.
    */
-  setIssueKeyPrefix(prefix: string): void {
-    this.send({
-      type: 'trackerSetConfig',
-      key: 'issueKeyPrefix',
-      value: prefix,
+  setIssueKeyPrefix(
+    prefix: string,
+    assignmentMode: 'auto' | 'explicit' = 'explicit',
+  ): Promise<TrackerConfigSetResult> {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      return Promise.resolve({
+        success: false,
+        code: 'disconnected',
+        message: 'Tracker sync must be connected before changing the issue-key prefix.',
+      });
+    }
+    const clientMutationId = generateClientMutationId();
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        this.pendingConfigChanges.delete(clientMutationId);
+        resolve({
+          success: false,
+          code: 'timeout',
+          message: 'Timed out waiting for the server to confirm the issue-key prefix.',
+        });
+      }, 5_000);
+      (timer as { unref?: () => void }).unref?.();
+      this.pendingConfigChanges.set(clientMutationId, { requestedPrefix: prefix, resolve, timer });
+      try {
+        this.send({
+          type: 'trackerSetConfig',
+          key: 'issueKeyPrefix',
+          value: prefix,
+          clientMutationId,
+          assignmentMode,
+        });
+      } catch (error) {
+        clearTimeout(timer);
+        this.pendingConfigChanges.delete(clientMutationId);
+        resolve({ success: false, code: 'sendFailed', message: error instanceof Error ? error.message : String(error) });
+      }
     });
   }
 
@@ -452,6 +751,8 @@ export class TrackerSyncEngine {
 
   private async runBootstrap(): Promise<void> {
     try {
+      await this.runSchemaBootstrap();
+
       let cursor: SyncId = await this.persistence.getMaxSyncId();
       // Loop while the server says it has more rows. SYNC_ID_INITIAL (0)
       // is the "send me everything" sentinel.
@@ -484,15 +785,20 @@ export class TrackerSyncEngine {
       ) {
         // WebSocket messages are ordered, so the config reaches the room
         // before replayPending can ask it to allocate the first issue key.
-        this.setIssueKeyPrefix(desiredPrefix);
+        const result = await this.setIssueKeyPrefix(desiredPrefix, 'auto');
+        if (!result.success) {
+          console.warn(`[TrackerSync] automatic issue-key prefix assignment failed: ${result.message ?? result.code}`);
+        }
       }
 
-      await this.runSchemaBootstrap();
+      await this.runIdentityRecovery(cursor);
+
       await this.runNavigationBootstrap();
       await this.runSavedViewBootstrap();
 
       this.synced = true;
       this.setStatus('connected');
+      this.announcePresence();
 
       // After bootstrap, replay any persisted-but-unconfirmed mutations.
       await this.replayPending();
@@ -509,6 +815,55 @@ export class TrackerSyncEngine {
     }
   }
 
+  /**
+   * Re-request a span of the changelog for rows the old collision branch
+   * stranded without an issue key.
+   *
+   * Those rows are `synced` and carry a `sync_id`, so the ordinary bootstrap
+   * -- which starts at `MAX(sync_id)` -- can never reach them again. See
+   * `trackerIdentityRecovery.ts` for why, and for the pure decision this only
+   * executes.
+   *
+   * The attempt is marked whether or not it succeeds. The alternative, marking
+   * only on success, retries a multi-thousand-row rewind on every launch for
+   * any workspace whose rows the room cannot re-assert, which is a worse
+   * failure than one repair that did not take. A workspace stuck that way is
+   * diagnosable from the warning below.
+   */
+  private async runIdentityRecovery(localMaxSyncId: SyncId): Promise<void> {
+    const hooks = this.config.identityRecovery;
+    if (!hooks) return;
+
+    let plan: TrackerIdentityRecoveryPlan;
+    try {
+      plan = planTrackerIdentityRecovery({ ...(await hooks.getFacts()), localMaxSyncId });
+    } catch (err) {
+      this.config.onBootstrapError?.(err);
+      return;
+    }
+    if (plan.action === 'none') return;
+
+    console.warn(
+      `[TrackerSync] ${plan.strandedCount} synced item(s) carry no issue key; re-requesting`,
+      `the changelog from sync_id ${plan.sinceSyncId} (${plan.rewindDistance} entries behind`,
+      `the cursor) so the room can re-assert their identity`,
+    );
+    try {
+      let cursor: SyncId = plan.sinceSyncId;
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
+        const response = await this.requestSync(cursor);
+        await this.applyBootstrapBatch(response);
+        cursor = response.cursorSyncId;
+        if (!response.hasMore) break;
+      }
+    } catch (err) {
+      this.config.onBootstrapError?.(err);
+    } finally {
+      await hooks.markAttempted().catch((err) => this.config.onBootstrapError?.(err));
+    }
+  }
+
   private requestSync(sinceSyncId: SyncId): Promise<TrackerSyncResponseMessage> {
     return new Promise((resolve, reject) => {
       if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
@@ -522,7 +877,13 @@ export class TrackerSyncEngine {
         resolve(msg);
       };
       this.ws.addEventListener('message', handler);
-      this.send({ type: 'trackerSync', sinceSyncId });
+      this.send({
+        type: 'trackerSync',
+        sinceSyncId,
+        ...(sinceSyncId === SYNC_ID_INITIAL && this.config.initializeIssueKeyPrefix
+          ? { initializeIssueKeyPrefix: this.config.initializeIssueKeyPrefix }
+          : {}),
+      });
     });
   }
 
@@ -545,21 +906,33 @@ export class TrackerSyncEngine {
     let cursor: SyncId = 0 as SyncId;
     console.info('[TrackerSchemaSync] bootstrap start (full snapshot since sync_id=0)');
 
-    // eslint-disable-next-line no-constant-condition
-    while (true) {
-      const response = await this.requestSchemaSync(cursor);
-      console.info(
-        `[TrackerSchemaSync] bootstrap batch: ${response.schemas.length} schema(s), cursor=${response.cursorSyncId}, hasMore=${response.hasMore}`,
-      );
+    try {
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
+        const response = await this.requestSchemaSync(cursor);
+        console.info(
+          `[TrackerSchemaSync] bootstrap batch: ${response.schemas.length} schema(s), cursor=${response.cursorSyncId}, hasMore=${response.hasMore}`,
+        );
 
-      await this.applySchemaBootstrapBatch(response);
-      cursor = response.cursorSyncId;
-      if (!response.hasMore) break;
+        await this.applySchemaBootstrapBatch(response);
+        cursor = response.cursorSyncId;
+        if (!response.hasMore) break;
+      }
+    } catch (err) {
+      if (!(err instanceof SyncRequestTimeoutError)) throw err;
+      // Degrade, don't abort: this lane runs ahead of the item bootstrap, and
+      // aborting here would trade "schemas are stale" for "the tracker is
+      // empty". The next connect re-requests the full snapshot anyway.
+      console.warn(
+        `[TrackerSchemaSync] ${err.message}; continuing with locally-known schemas`,
+      );
+      return;
     }
     console.info(`[TrackerSchemaSync] bootstrap complete at sync_id=${cursor}`);
   }
 
   private requestSchemaSync(sinceSyncId: SyncId): Promise<TrackerSchemaSyncResponseMessage> {
+    const timeoutMs = this.config.schemaBootstrapTimeoutMs ?? SCHEMA_BOOTSTRAP_TIMEOUT_MS;
     return new Promise((resolve, reject) => {
       if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
         reject(new Error('WebSocket not open'));
@@ -568,9 +941,17 @@ export class TrackerSyncEngine {
       const handler = (event: MessageEvent) => {
         const msg = parseServerMessage(event.data);
         if (!msg || msg.type !== 'trackerSchemaSyncResponse') return;
+        clearTimeout(timer);
         this.ws?.removeEventListener('message', handler);
         resolve(msg);
       };
+      const timer = setTimeout(() => {
+        this.ws?.removeEventListener('message', handler);
+        reject(new SyncRequestTimeoutError(
+          `schema bootstrap timed out after ${timeoutMs}ms waiting for trackerSchemaSyncResponse`,
+        ));
+      }, timeoutMs);
+      (timer as { unref?: () => void }).unref?.();
       this.ws.addEventListener('message', handler);
       this.send({ type: 'trackerSchemaSync', sinceSyncId });
     });
@@ -678,9 +1059,40 @@ export class TrackerSyncEngine {
   }
 
   private async replayPending(): Promise<void> {
-    const pending = await this.persistence.loadPendingTransactions();
+    const owner: TrackerTransactionOwner = {
+      orgId: this.config.orgId,
+      teamProjectId: this.config.teamProjectId,
+      teamMemberId: this.config.teamMemberId,
+    };
+    // Persistence implementations may retain rejected rows for diagnostics.
+    // Enforce the terminal policy again at the driver boundary so a host store
+    // that predates the browser tombstone cannot re-offer the mutation.
+    const pending = (await this.persistence.loadPendingTransactions(owner))
+      .filter(row => !(row.lastRejection && isPermanentTrackerRejection(row.lastRejection.code)));
+    const replayedBatchIds = new Set<string>();
     for (const row of pending) {
       try {
+        if (row.batchId && !replayedBatchIds.has(row.batchId)) {
+          replayedBatchIds.add(row.batchId);
+          const batch = pending.filter(candidate => candidate.batchId === row.batchId);
+          for (const batchRow of batch) {
+            if (batchRow.rollbackSnapshot) {
+              this.rollbackSnapshots.set(batchRow.clientMutationId, {
+                itemId: batchRow.itemId,
+                snapshot: batchRow.rollbackSnapshot,
+              });
+            }
+          }
+          await this.driveTransactionBatch(batch);
+          continue;
+        }
+        if (row.batchId) continue;
+        if (row.rollbackSnapshot) {
+          this.rollbackSnapshots.set(row.clientMutationId, {
+            itemId: row.itemId,
+            snapshot: row.rollbackSnapshot,
+          });
+        }
         // NIM-602: a `pendingApply` row signals a crash between the queue
         // write and the projection write in `applyAndEnqueueAtomically`.
         // The queue row carries the payload we never finished applying.
@@ -690,7 +1102,10 @@ export class TrackerSyncEngine {
         // if the crash happened after the projection write but before
         // the promotion.
         if (row.state === 'pendingApply') {
-          await this.persistence.applyOptimistic(row.itemId, row.payload ?? null);
+          const snapshot = await this.persistence.applyOptimistic(row.itemId, row.payload ?? null);
+          if (!row.rollbackSnapshot) {
+            this.rollbackSnapshots.set(row.clientMutationId, { itemId: row.itemId, snapshot });
+          }
           await this.persistence.markTransactionState(row.clientMutationId, 'persistedEnqueue');
           row.state = 'persistedEnqueue';
         }
@@ -708,6 +1123,7 @@ export class TrackerSyncEngine {
   // --------------------------------------------------------------------------
 
   private async handleMessage(event: MessageEvent): Promise<void> {
+    if (this.destroyed) return;
     const msg = parseServerMessage(event.data);
     if (!msg) return;
 
@@ -717,6 +1133,9 @@ export class TrackerSyncEngine {
         break;
       case 'trackerMutationAck':
         await this.handleAck(msg);
+        break;
+      case 'trackerMutationBatchAck':
+        await this.handleBatchAck(msg);
         break;
       case 'trackerSchemaDelta':
         await this.handleSchemaDelta(msg);
@@ -739,6 +1158,12 @@ export class TrackerSyncEngine {
       case 'trackerConfigBroadcast':
         this.handleConfigBroadcast(msg);
         break;
+      case 'trackerPresenceRoster':
+        this.handlePresenceRoster(msg);
+        break;
+      case 'trackerPresenceDelta':
+        this.handlePresenceDelta(msg);
+        break;
       case 'trackerPong':
         // Keep-alive response; nothing to do.
         break;
@@ -746,9 +1171,7 @@ export class TrackerSyncEngine {
         this.handleRoomMoved(msg);
         break;
       case 'trackerError':
-        // Server-level error (not tied to a specific mutation). Surface as
-        // a status transition; the connection stays open.
-        this.setStatus('error');
+        this.handleServerError(msg);
         break;
       case 'trackerSyncResponse':
         // The bootstrap loop owns these via its inline `requestSync`
@@ -782,6 +1205,7 @@ export class TrackerSyncEngine {
   }
 
   private async handleAck(msg: TrackerMutationAckMessage): Promise<void> {
+    if (this.destroyed) return;
     const { clientMutationId, accepted } = msg;
 
     if (accepted && msg.syncId !== undefined && msg.item) {
@@ -793,7 +1217,9 @@ export class TrackerSyncEngine {
       // ack to advance, but in practice the server only acks when the key
       // fingerprint matched on the mutation.
       await this.applyEnvelope(msg.item);
+      if (this.destroyed) return;
       await this.persistence.ackTransaction(clientMutationId, msg.syncId);
+      if (this.destroyed) return;
       this.rollbackSnapshots.delete(clientMutationId);
       return;
     }
@@ -806,9 +1232,15 @@ export class TrackerSyncEngine {
         message: msg.error.message,
         occurredAt: Date.now(),
       };
-      await this.persistence.rejectTransaction(clientMutationId, rejection);
+      await this.persistence.rejectTransaction(
+        clientMutationId,
+        rejection,
+        isPermanentTrackerRejection(rejection.code),
+      );
+      if (this.destroyed) return;
       if (snapshot) {
         await this.persistence.rollbackOptimistic(snapshot.itemId, snapshot.snapshot);
+        if (this.destroyed) return;
         this.rollbackSnapshots.delete(clientMutationId);
         this.config.onRejection?.({
           clientMutationId,
@@ -816,6 +1248,47 @@ export class TrackerSyncEngine {
           rejection,
         });
       }
+    }
+  }
+
+  private async handleBatchAck(msg: TrackerMutationBatchAckMessage): Promise<void> {
+    if (this.destroyed) return;
+    if (msg.accepted) {
+      for (const entry of msg.entries) {
+        if (entry.syncId !== undefined && entry.item) {
+          await this.applyEnvelope(entry.item);
+          if (this.destroyed) return;
+          await this.persistence.ackTransaction(entry.clientMutationId, entry.syncId);
+          if (this.destroyed) return;
+          this.rollbackSnapshots.delete(entry.clientMutationId);
+        }
+      }
+      return;
+    }
+
+    if (!msg.error) return;
+    for (const entry of msg.entries) {
+      const snapshot = this.rollbackSnapshots.get(entry.clientMutationId);
+      const rejection = {
+        code: msg.error.code,
+        message: msg.error.message,
+        occurredAt: Date.now(),
+      };
+      await this.persistence.rejectTransaction(
+        entry.clientMutationId,
+        rejection,
+        isPermanentTrackerRejection(rejection.code),
+      );
+      if (this.destroyed) return;
+      if (!snapshot) continue;
+      await this.persistence.rollbackOptimistic(snapshot.itemId, snapshot.snapshot);
+      if (this.destroyed) return;
+      this.rollbackSnapshots.delete(entry.clientMutationId);
+      this.config.onRejection?.({
+        clientMutationId: entry.clientMutationId,
+        itemId: snapshot.itemId,
+        rejection,
+      });
     }
   }
 
@@ -836,7 +1309,12 @@ export class TrackerSyncEngine {
       await this.applySchemaEnvelope(msg.schema);
       return;
     }
-
+    await this.retireRefusedLaneChange(
+      'schema',
+      msg.clientMutationId,
+      msg.error,
+      this.config.schemaSync?.markRejected,
+    );
   }
 
   private async handleSavedViewDelta(msg: TrackerSavedViewDeltaMessage): Promise<void> {
@@ -848,6 +1326,56 @@ export class TrackerSyncEngine {
       await this.applySavedViewEnvelope(msg.view);
       return;
     }
+    await this.retireRefusedLaneChange(
+      'savedView',
+      msg.clientMutationId,
+      msg.error,
+      this.config.savedViewSync?.markRejected,
+    );
+  }
+
+  /**
+   * Retire a saved-view / navigation / schema change the server has settled on,
+   * and tell the host.
+   *
+   * Only *terminal* codes retire the row. A write barrier like `rotationLocked`
+   * or a missing key is temporary, and dropping the user's change on one would
+   * turn a momentary refusal into silent data loss -- so anything not in the
+   * tracker-specific permanent vocabulary stays queued and is retried, exactly
+   * as before. Tracker codes deliberately do not inherit the document outbox
+   * policy: `adminRequired`, `malformed`, and `legacy_encryption_retired` exist
+   * only here and replaying them cannot make the payload valid.
+   */
+  private async retireRefusedLaneChange(
+    lane: 'savedView' | 'navigation' | 'schema',
+    clientMutationId: string,
+    error: { code: TrackerMutationRejectCode; message: string } | undefined,
+    markRejected: ((id: string, code: string) => Promise<unknown>) | undefined,
+  ): Promise<void> {
+    // A rejection ack carries only the mutation id -- the server builds it
+    // without the view/entry/schema it refused -- so the subject comes from
+    // what we recorded when the mutation went out.
+    const id = this.pendingLaneIds.get(clientMutationId);
+    this.pendingLaneIds.delete(clientMutationId);
+    if (!error || id === undefined) return;
+    if (!isPermanentTrackerRejection(error.code)) return;
+
+    if (markRejected) {
+      try {
+        await markRejected(id, error.code);
+      } catch (err) {
+        // Retiring is best-effort: if the store write fails the row stays
+        // queued and we retry next connect, which is the old behaviour rather
+        // than a new failure mode. The host still hears about the refusal.
+        this.config.onBootstrapError?.(err);
+      }
+    }
+    this.config.onRejection?.({
+      clientMutationId,
+      itemId: id,
+      lane,
+      rejection: { code: error.code, message: error.message, occurredAt: Date.now() },
+    });
   }
 
   private async handleNavigationDelta(msg: TrackerNavigationDeltaMessage): Promise<void> {
@@ -859,10 +1387,98 @@ export class TrackerSyncEngine {
       await this.applyNavigationEnvelope(msg.entry);
       return;
     }
+    await this.retireRefusedLaneChange(
+      'navigation',
+      msg.clientMutationId,
+      msg.error,
+      this.config.navigationSync?.markRejected,
+    );
   }
 
   private handleConfigBroadcast(msg: TrackerConfigBroadcastMessage): void {
     this.config.onConfigChange?.(msg.config);
+    for (const [id, pending] of this.pendingConfigChanges) {
+      if (
+        pending.requestedPrefix === msg.config.issueKeyPrefix ||
+        pending.requestedPrefix === msg.config.issueKeyPrefixAssignment?.requestedPrefix
+      ) {
+        clearTimeout(pending.timer);
+        this.pendingConfigChanges.delete(id);
+        pending.resolve({ success: true, config: msg.config });
+      }
+    }
+  }
+
+  private handlePresenceRoster(msg: TrackerPresenceRosterMessage): void {
+    this.presence.clear();
+    for (const member of msg.members) {
+      const teamMemberId = asTeamMemberId(member.teamMemberId);
+      if (teamMemberId === this.config.teamMemberId) continue;
+      this.presence.set(teamMemberId, { ...member, teamMemberId });
+    }
+    this.notifyPresenceChange();
+  }
+
+  private handlePresenceDelta(msg: TrackerPresenceDeltaMessage): void {
+    const teamMemberId = asTeamMemberId(msg.member.teamMemberId);
+    if (teamMemberId === this.config.teamMemberId) return;
+    if (msg.connected) {
+      this.presence.set(teamMemberId, { ...msg.member, teamMemberId });
+    } else {
+      this.presence.delete(teamMemberId);
+    }
+    this.notifyPresenceChange();
+  }
+
+  private notifyPresenceChange(): void {
+    this.config.onPresenceChange?.(this.getPresence());
+  }
+
+  private handleServerError(msg: TrackerErrorMessage): void {
+    this.config.onServerError?.(msg);
+    // `guardConnection` says this in words before it closes the socket with
+    // 4003. The close code is the primary signal, but a client that only saw
+    // the words must not go back to retrying either.
+    if (msg.code === 'access_revoked') {
+      this.terminateAccess({
+        reason: 'tracker-access-revoked',
+        closeCode: 4003,
+        message: msg.message || 'Your access to this tracker was revoked.',
+      });
+      return;
+    }
+    const pending = msg.clientMutationId
+      ? this.pendingConfigChanges.get(msg.clientMutationId)
+      : this.pendingConfigChanges.size === 1
+        ? this.pendingConfigChanges.values().next().value
+        : undefined;
+    if (pending) {
+      clearTimeout(pending.timer);
+      if (msg.clientMutationId) this.pendingConfigChanges.delete(msg.clientMutationId);
+      else {
+        for (const [id, candidate] of this.pendingConfigChanges) {
+          if (candidate === pending) this.pendingConfigChanges.delete(id);
+        }
+      }
+      pending.resolve({
+        success: false,
+        code: msg.code,
+        message: msg.message,
+        conflictingProjectName: msg.conflictingProjectName,
+        suggestedPrefix: msg.suggestedPrefix,
+      });
+    }
+    if (!msg.code.startsWith('issueKeyPrefix') && msg.code !== 'invalid_config') {
+      this.setStatus('error');
+    }
+  }
+
+  private resolvePendingConfigChanges(result: TrackerConfigSetResult): void {
+    for (const pending of this.pendingConfigChanges.values()) {
+      clearTimeout(pending.timer);
+      pending.resolve(result);
+    }
+    this.pendingConfigChanges.clear();
   }
 
   // --------------------------------------------------------------------------
@@ -879,7 +1495,7 @@ export class TrackerSyncEngine {
    * `false` when decryption failed and the row was skipped. Callers use
    * this signal to detect a stale-key bootstrap and trigger `refreshKey()`.
    */
-  private async applyEnvelope(envelope: EncryptedTrackerItemEnvelope): Promise<boolean> {
+  private async applyEnvelope(envelope: TrackerItemEnvelope): Promise<boolean> {
     const isTombstone = envelope.encryptedPayload === null;
     let payload: TrackerItemPayload | null = null;
     if (!isTombstone) {
@@ -903,7 +1519,7 @@ export class TrackerSyncEngine {
     return true;
   }
 
-  private async applySchemaEnvelope(envelope: EncryptedTrackerSchemaEnvelope): Promise<boolean> {
+  private async applySchemaEnvelope(envelope: TrackerSchemaEnvelope): Promise<boolean> {
     const hooks = this.config.schemaSync;
     if (!hooks) return true;
 
@@ -932,7 +1548,7 @@ export class TrackerSyncEngine {
     return true;
   }
 
-  private async applySavedViewEnvelope(envelope: EncryptedTrackerSavedViewEnvelope): Promise<boolean> {
+  private async applySavedViewEnvelope(envelope: TrackerSavedViewEnvelope): Promise<boolean> {
     const hooks = this.config.savedViewSync;
     if (!hooks) return true;
     const isTombstone = envelope.encryptedPayload === null;
@@ -949,7 +1565,7 @@ export class TrackerSyncEngine {
     return true;
   }
 
-  private async applyNavigationEnvelope(envelope: EncryptedTrackerNavigationEnvelope): Promise<boolean> {
+  private async applyNavigationEnvelope(envelope: TrackerNavigationEnvelope): Promise<boolean> {
     const hooks = this.config.navigationSync;
     if (!hooks) return true;
     const isTombstone = envelope.encryptedPayload === null;
@@ -979,7 +1595,7 @@ export class TrackerSyncEngine {
     const clientMutationId = generateClientMutationId();
     const now = Date.now();
 
-    const row: TrackerTransactionRow = {
+    const row: PersistedTrackerTransactionRow = {
       clientMutationId,
       itemId,
       workspacePath: '',  // host adapter fills this in; engine doesn't care
@@ -987,6 +1603,11 @@ export class TrackerSyncEngine {
       kind,
       payload: payload ?? undefined,
       enqueuedAt: now,
+      owner: {
+        orgId: this.config.orgId,
+        teamProjectId: this.config.teamProjectId,
+        teamMemberId: this.config.teamMemberId,
+      },
     };
 
     let snapshot: TrackerRowSnapshot;
@@ -994,6 +1615,7 @@ export class TrackerSyncEngine {
       snapshot = await this.persistence.applyAndEnqueueAtomically(itemId, payload, row);
     } else {
       snapshot = await this.persistence.applyOptimistic(itemId, payload);
+      row.rollbackSnapshot = snapshot;
       await this.persistence.enqueueTransaction(row);
     }
     this.rollbackSnapshots.set(clientMutationId, { itemId, snapshot });
@@ -1046,6 +1668,32 @@ export class TrackerSyncEngine {
     });
   }
 
+  private async driveTransactionBatch(rows: readonly TrackerTransactionRow[]): Promise<void> {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    const startedAt = Date.now();
+    if (this.persistence.markTransactionStates) {
+      await this.persistence.markTransactionStates(
+        rows.map(row => row.clientMutationId),
+        'executing',
+        startedAt,
+      );
+    } else {
+      for (const row of rows) {
+        await this.persistence.markTransactionState(row.clientMutationId, 'executing', startedAt);
+      }
+    }
+    this.send({
+      type: 'trackerMutationBatch',
+      mutations: rows.map(row => ({
+        clientMutationId: row.clientMutationId,
+        itemId: row.itemId,
+        encryptedPayload: encodeTrackerPayloadPlaintext(row.payload!),
+        ...(row.payload?.issueNumber !== undefined ? { issueNumber: row.payload.issueNumber } : {}),
+        ...(row.payload?.issueKey !== undefined ? { issueKey: row.payload.issueKey } : {}),
+      })),
+    });
+  }
+
   private async pushPendingSchemas(): Promise<void> {
     const hooks = this.config.schemaSync;
     if (!hooks) return;
@@ -1057,6 +1705,7 @@ export class TrackerSyncEngine {
     }
     for (const def of pending) {
       const clientMutationId = generateClientMutationId();
+      this.pendingLaneIds.set(clientMutationId, def.type);
       if (def.deleted || def.model === null) {
         console.info(`[TrackerSchemaSync] -> mutation (delete) type=${def.type} cmid=${clientMutationId}`);
         this.send({
@@ -1086,6 +1735,7 @@ export class TrackerSyncEngine {
     const pending = await hooks.listUnsynced();
     for (const view of pending) {
       const clientMutationId = generateClientMutationId();
+      this.pendingLaneIds.set(clientMutationId, view.viewId);
       if (view.deleted || view.payload === null) {
         this.send({
           type: 'trackerSavedViewMutation',
@@ -1110,6 +1760,7 @@ export class TrackerSyncEngine {
     const pending = await hooks.listUnsynced();
     for (const entry of pending) {
       const clientMutationId = generateClientMutationId();
+      this.pendingLaneIds.set(clientMutationId, entry.entryId);
       if (entry.deleted || entry.payload === null) {
         this.send({
           type: 'trackerNavigationMutation',
@@ -1143,16 +1794,41 @@ export class TrackerSyncEngine {
     this.config.onStatusChange?.(status);
   }
 
-  private handleDisconnect(): void {
-    const shouldReconnect = !this.suppressReconnect;
+  private handleDisconnect(termination: TrackerAccessTermination | null = null): void {
+    const shouldReconnect = !this.suppressReconnect && !termination;
     this.stopPing();
     this.ws = null;
     this.synced = false;
     this.connecting = false;
+    if (this.presence.size > 0) {
+      this.presence.clear();
+      this.notifyPresenceChange();
+    }
+    this.resolvePendingConfigChanges({
+      success: false,
+      code: 'disconnected',
+      message: 'Tracker sync disconnected before the prefix change was confirmed.',
+    });
+    if (termination) {
+      // Deliberately never `disconnected`: that status is the one the host
+      // renders as "offline, reconnecting", and this connection is not coming
+      // back.
+      this.recordAccessTermination(termination);
+      return;
+    }
     this.setStatus('disconnected');
     if (shouldReconnect && !this.destroyed) {
       this.scheduleReconnect();
     }
+  }
+
+  private recordAccessTermination(termination: TrackerAccessTermination): void {
+    if (this.accessTermination) return;
+    this.accessTermination = termination;
+    this.suppressReconnect = true;
+    this.cancelReconnect();
+    this.setStatus('error');
+    this.config.onAccessTerminated?.(termination);
   }
 
   private scheduleReconnect(): void {
@@ -1180,8 +1856,21 @@ export class TrackerSyncEngine {
   private startPing(): void {
     this.stopPing();
     this.pingTimer = setInterval(() => {
+      // Presence doubles as an authorization heartbeat. A member whose room
+      // access was revoked is closed and removed by the server on this frame.
+      this.announcePresence();
       this.send({ type: 'trackerPing' });
     }, PING_INTERVAL_MS);
+  }
+
+  private announcePresence(): void {
+    const configured = this.config.presenceIdentity;
+    const displayName = configured?.displayName.trim() || this.config.teamMemberId;
+    this.send({
+      type: 'trackerPresence',
+      displayName,
+      avatarUrl: configured?.avatarUrl ?? null,
+    });
   }
 
   private stopPing(): void {

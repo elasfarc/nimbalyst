@@ -26,7 +26,7 @@ import { createRequire } from 'module';
 import { AISessionsRepository } from '@nimbalyst/runtime/storage/repositories/AISessionsRepository';
 import { getSyncProvider } from './SyncManager';
 import { isRemoteTerminalEnabled } from '../utils/store';
-import { getEnhancedPath } from './CLIManager';
+import { getEnhancedPath } from './shellEnvironment';
 import { ShellDetector } from './ShellDetector';
 import { logger } from '../utils/logger';
 

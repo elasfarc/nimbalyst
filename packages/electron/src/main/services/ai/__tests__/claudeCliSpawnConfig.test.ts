@@ -125,6 +125,45 @@ describe('buildClaudeCliSpawnConfig', () => {
     expect(cfg.env.ENABLE_TOOL_SEARCH).toBe('true');
   });
 
+  /**
+   * The SDK path forwards the selected effort via CLAUDE_CODE_EFFORT_LEVEL
+   * (sdkOptionsBuilder, #844). The CLI path never did, so the effort selector
+   * had no effect on a `claude-code-cli` session and every launch fell back to
+   * whatever the CLI defaults to.
+   */
+  describe('effort level', () => {
+    it('forwards the resolved effort to the CLI', () => {
+      const cfg = buildClaudeCliSpawnConfig({ ...base, effortLevel: 'max' });
+      expect(cfg.env.CLAUDE_CODE_EFFORT_LEVEL).toBe('max');
+    });
+
+    it('forwards "high" too, so the selector matches the request (#844)', () => {
+      const cfg = buildClaudeCliSpawnConfig({ ...base, effortLevel: 'high' });
+      expect(cfg.env.CLAUDE_CODE_EFFORT_LEVEL).toBe('high');
+    });
+
+    it('leaves the variable unset when no effort is resolved', () => {
+      expect(buildClaudeCliSpawnConfig(base).env.CLAUDE_CODE_EFFORT_LEVEL).toBeUndefined();
+    });
+
+    it('does not let an inherited env value override the resolved selection', () => {
+      const cfg = buildClaudeCliSpawnConfig({
+        ...base,
+        baseEnv: { CLAUDE_CODE_EFFORT_LEVEL: 'low' },
+        effortLevel: 'max',
+      });
+      expect(cfg.env.CLAUDE_CODE_EFFORT_LEVEL).toBe('max');
+    });
+
+    it('leaves an inherited value alone when nothing is selected', () => {
+      const cfg = buildClaudeCliSpawnConfig({
+        ...base,
+        baseEnv: { CLAUDE_CODE_EFFORT_LEVEL: 'xhigh' },
+      });
+      expect(cfg.env.CLAUDE_CODE_EFFORT_LEVEL).toBe('xhigh');
+    });
+  });
+
   it('lets the user override ENABLE_TOOL_SEARCH from their own env (default does not clobber it)', () => {
     const cfg = buildClaudeCliSpawnConfig({
       ...base,
@@ -442,8 +481,12 @@ describe('resolveClaudeCliModelArg', () => {
 
   it('passes the fable variant through as the CLI `fable` alias', () => {
     expect(resolveClaudeCliModelArg('claude-code-cli:fable')).toBe('fable');
-    expect(resolveClaudeCliModelArg('claude-code-cli:fable-5')).toBe('fable');
     expect(resolveClaudeCliModelArg('fable')).toBe('fable');
+  });
+
+  it('resolves pinned fable-5 to the full model id (CLI does not accept `fable-5` as alias)', () => {
+    expect(resolveClaudeCliModelArg('claude-code-cli:fable-5')).toBe('claude-fable-5');
+    expect(resolveClaudeCliModelArg('fable-5')).toBe('claude-fable-5');
   });
 
   // Plain `fable` is 1M on a plan that auto-upgrades, but NOT behind an

@@ -6,6 +6,8 @@ Guidance for Claude Code (claude.ai/code) when working in this repository.
 
 ### Keep Commit Messages and CHANGELOG Entries Short
 
+**Write the CHANGELOG entry only when a commit is requested — never while implementing.** `CHANGELOG.md` is touched by nearly every task, so an entry written early both describes code that is not in the tree yet and collides with every other session running against this checkout. See [parallel-sessions.md](./.claude/rules/parallel-sessions.md).
+
 **One-sentence commit subject. One-sentence CHANGELOG bullet.** Commit bodies may include short bullets for distinct key changes — one line each, no prose paragraphs, no root-cause explanations unless the diff truly can't explain itself. Match the existing voice in `[Unreleased]` and recent `git log --oneline`. If your draft is longer than the surrounding entries, cut it before submitting.
 
 **One feature = one CHANGELOG bullet, no matter how many commits built it.** A multi-commit feature (e.g. a whole panel landed over a dozen PRs) gets a single user-facing line, not one bullet per commit. Do NOT append a new bullet for every follow-up commit to the same feature — edit the existing bullet instead. The `[Unreleased]` section must read like a short release summary, not a commit log.
@@ -14,9 +16,15 @@ Guidance for Claude Code (claude.ai/code) when working in this repository.
 
 **At release time, condense — don't ship the dev-time bullets verbatim.** `[Unreleased]` accumulates verbose per-commit bullets during development. Before tagging, collapse them: merge a feature's scattered bullets into one line, drop scaffolding, squash near-duplicates. If the release notes are longer than the equivalent section in a recent shipped version, cut harder.
 
+### Parallel Sessions Must Not Share Files
+
+Before launching parallel work, list the files each slice will touch and confirm the sets are disjoint — including shared files like `CHANGELOG.md`, `package.json`, barrels, and central registries, which a source-only check misses. If two slices need the same file, they are one slice. Slices never run the full gate; the orchestrator runs it once. See [parallel-sessions.md](./.claude/rules/parallel-sessions.md).
+
 ### Write and Run Tests for Behavioral Changes
 
-**Any change to runtime behavior ships with a unit test** — a new test, or an extension of an existing one. Pure refactors already covered by tests, formatting, docs, and config-only changes are exempt. Before pushing, run the gate locally: `npm run typecheck && npm run test:prepush`. The repo's pre-push hook runs this automatically; it installs on `npm install` (or `npm run hooks:install`). Never push to `main` with a red suite — CI on `main` is a backstop, not the gate. For high-risk areas (sync/collab, main-process init, IPC, restart-to-verify bugs) the test comes **first** and must fail before the fix — see [end-to-end-verification.md](./.claude/rules/end-to-end-verification.md).
+**Any change to runtime behavior ships with a unit test** — a new test, or an extension of an existing one. Pure refactors already covered by tests, formatting, docs, and config-only changes are exempt. Before pushing, run the gate locally: `npm run typecheck && npm run test:prepush`.
+
+**Never run the suite twice to find out what failed.** It takes minutes. Every run records its failures — names, files, messages, diffs, and a command to rerun only those files — to `.vitest/last-run.log`. Read it with `npm run test:last`, which states up front whether the tree has changed since; on `CURRENT`, re-running cannot tell you anything you do not already have. Never pipe a test run through `tail -n`: it truncates exactly the failure block you need and costs another full run. Capture to a file, then read the file. When handing failures to another session, paste the failure list into its prompt. The repo's pre-push hook runs this automatically; it installs on `npm install` (or `npm run hooks:install`). Never push to `main` with a red suite — CI on `main` is a backstop, not the gate. For high-risk areas (sync/collab, main-process init, IPC, restart-to-verify bugs) the test comes **first** and must fail before the fix — see [end-to-end-verification.md](./.claude/rules/end-to-end-verification.md).
 
 **A test's job is to catch a regression a reader cannot see.** The test corpus is ~2M tokens, and every future session pays to read the tests next to the code it touches. A test that only re-states what is obvious on screen is pure cost. Write fewer, denser tests:
 
@@ -72,6 +80,12 @@ The biggest gotcha: **JSONB sub-extraction (`data->'someKey'`) returns a parsed 
 - NEVER use `node -e "const { PGlite } = require(...)"` or sqlite CLI
 
 **For sync/collab bugs, local PGLite ≠ server collab state.** `tracker_body_cache`, `documents`, and other sync-related tables only reflect the local side. The authoritative state for shared trackers/documents lives in Cloudflare Workers (`packages/collabv3/` DurableObjects) and must be inspected separately via `wrangler tail` against the prod sync worker, or via wrangler-backed E2E tests (`tracker-content-collab.spec.ts` / `tracker-sync-collab.spec.ts` patterns, `RUN_COLLAB_TESTS=1`, `document-sync:open-test` IPC for Stytch bypass). Confirming "the body is in PGLite" is not the same as confirming "the body is on the server." See `feedback_local_state_vs_server_state.md`.
+
+### Never Destroy User Data on a Heuristic
+
+See [destructive-data-paths.md](./.claude/rules/destructive-data-paths.md). Any path that renames, moves, truncates, overwrites, or deletes user data must **retry first, verify the damage is real (not a substring match on an error message), emit its event before acting, and leave a recoverable artifact with a launch heartbeat.** Never print an instruction telling the user to delete their data — restore-from-backup is the primary action.
+
+Past incident (#1347): a feature named "corruption recovery" renamed the live `pglite-db/` aside on any WASM abort, for nine months, silently. Six confirmed installs came up on empty databases; three then migrated the empty database and made it permanent.
 
 ### Always Run Your Own Observation Commands — Don't Push Logs/Curl/Tail to the User
 
@@ -205,6 +219,7 @@ Two-tier architecture — `ai_agent_messages` (raw append-only log, sole source 
 | [TRACKER_WORKFLOWS.md](./docs/TRACKER_WORKFLOWS.md) | Creating decision or bug tracker items as part of a fix or design decision. |
 | [ARCHITECTURE_DIAGRAMS.md](./docs/ARCHITECTURE_DIAGRAMS.md) | Considering whether a change is complex enough to warrant an Excalidraw diagram. |
 | [DEBUGGING_LOGS.md](./docs/DEBUGGING_LOGS.md) | Investigating bugs — use the log access tools, don't ask the user to paste logs. |
+| [IDENTITY_AUTH_AND_ROOMS.md](./docs/IDENTITY_AUTH_AND_ROOMS.md) | Anything touching encryption, key custody, room taxonomy, or the two JWTs. The `Encrypted*` names in the team lanes are vestigial — check the lane table before concluding anything from a name. |
 | [RENDER_PERFORMANCE.md](./docs/RENDER_PERFORMANCE.md) | Chasing excessive React re-renders, or adding a render-budget test to a hot surface. |
 | [MAIN_PROCESS_INIT.md](./packages/electron/MAIN_PROCESS_INIT.md) | Working on Electron main-process bootstrap, singleton init, or IPC handler registration. |
 | [DATABASE.md](./packages/electron/DATABASE.md) | Working with PGLite tables, shutdown, or timestamp handling. |
@@ -218,11 +233,13 @@ Two-tier architecture — `ai_agent_messages` (raw append-only log, sole source 
 
 ## Tracker Workflows
 
+Tracker sharing model: **a tracker is personal or it is the team's; if it is the team's, the server owns it — schema and items together — and `.nimbalyst/trackers/*.yaml` is the local copy.** Read [TRACKER_SCHEMA_SHARING.md](./docs/TRACKER_SCHEMA_SHARING.md) before changing a tracker schema or sharing and numbering behavior.
+
 When choosing between alternatives (libraries, patterns, deciding NOT to do something), log a **decision** tracker item. When fixing a bug, ensure a **bug** tracker item exists before writing fix code. See [TRACKER_WORKFLOWS.md](./docs/TRACKER_WORKFLOWS.md) for the exact `tracker_create` calls and lifecycle.
 
-### `NIM-###` Keys Are Workspace-Local — Cite GitHub Issues in Source
+### `NIM-###` Keys Are Tracker-Scoped — Cite GitHub Issues in Source
 
-**`NIM-###` issue keys are internal to a Nimbalyst workspace's tracker. They do not resolve anywhere else** — every install numbers its own items, so the same key points at a different item in every workspace. In a public repo they are worse than no reference: a reader who looks one up lands on an unrelated item and believes it.
+**`NIM-###` issue keys are scoped to the tracker room for a Nimbalyst workspace or team project. They do not resolve anywhere else** — peer installs in the same room share an identity, but the same key can point at a different item in an unrelated workspace. In a public repo they are worse than no reference: a reader who looks one up can land on an unrelated item and believe it is authoritative.
 
 - **Code comments and runtime log strings** reference the GitHub issue: `// #1146: typed workstream containers are always roots`. If there is no GitHub issue, write the reason in prose instead of citing a key.
 - **Commit messages** keep `Fixes NIM-123` — that trailer is what `CommitTrackerLinker` uses to auto-close the item, and it never ships inside the product. Add `Fixes #123` alongside it when a GitHub issue also exists.

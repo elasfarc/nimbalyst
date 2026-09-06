@@ -8,9 +8,8 @@ modes:
   inline: true
   fullDocument: false
 
-sync:
-  mode: shared
-  scope: project
+sharing: team
+draftByDefault: false
 
 idPrefix: tsk
 idFormat: ulid
@@ -27,24 +26,40 @@ fields:
       - value: to-do
         label: To Do
         icon: circle
+        category: unstarted
       - value: in-progress
         label: In Progress
         icon: motion_photos_on
+        category: started
       - value: in-review
         label: In Review
         icon: rate_review
         color: "#3b82f6"
+        category: started
       - value: changes-requested
         label: Changes Requested
         icon: edit_note
         color: "#f97316"
+        category: started
       - value: approved
         label: Approved
         icon: verified
         color: "#22c55e"
+        category: started
       - value: done
         label: Done
         icon: check_circle
+        category: done
+      - value: wont-do
+        label: Won't Do
+        icon: do_not_disturb_on
+        color: "#64748b"
+        category: cancelled
+      - value: duplicate
+        label: Duplicate
+        icon: content_copy
+        color: "#64748b"
+        category: cancelled
 
   - name: priority
     type: select
@@ -65,6 +80,24 @@ fields:
   - name: description
     type: text
 
+  # Dependency pair. `dependsOn` records work this item waits on; `blocks` records
+  # work waiting on this item. Writing either side materializes the other.
+  - name: dependsOn
+    type: relationship
+    relationshipTypeKey: depends-on
+    inverseRelationshipTypeKey: blocks
+    inverseFieldId: blocks
+    targetTrackerTypes: "*"
+    multiValue: true
+
+  - name: blocks
+    type: relationship
+    relationshipTypeKey: blocks
+    inverseRelationshipTypeKey: depends-on
+    inverseFieldId: dependsOn
+    targetTrackerTypes: "*"
+    multiValue: true
+
   # Collection membership. Written directly, or by inverse propagation when an
   # item is added to a milestone/release from the collection side.
   - name: collection
@@ -75,6 +108,17 @@ fields:
     targetTrackerTypes:
       - milestone
       - release
+    multiValue: true
+
+  # Goal membership. Written directly, or by inverse propagation when an item
+  # is added from a goal's `contributes` field.
+  - name: goal
+    type: relationship
+    relationshipTypeKey: contributed-by
+    inverseRelationshipTypeKey: contributes-to
+    inverseFieldId: contributes
+    targetTrackerTypes:
+      - goal
     multiValue: true
 
   - name: tags

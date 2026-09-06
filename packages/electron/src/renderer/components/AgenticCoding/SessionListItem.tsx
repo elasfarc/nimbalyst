@@ -1,3 +1,4 @@
+import { SessionProviderIcon } from './SessionProviderIcon';
 import React, { useState, useCallback, useEffect, useRef, useMemo, memo } from 'react';
 import { useAtomValue, useSetAtom } from 'jotai';
 import { MaterialSymbol } from '@nimbalyst/runtime/ui/icons/MaterialSymbol';
@@ -8,6 +9,7 @@ import { sessionOrChildProcessingAtom, sessionUnreadAtom, sessionPendingPromptAt
 import { convertToWorkstreamAtom } from '../../store/atoms/sessions';
 import { SessionContextMenu } from './SessionContextMenu';
 import { FullTitleTooltip } from './FullTitleTooltip';
+import { sessionAgentWakePendingAtom } from '../../store/atoms/teamInbox';
 
 /**
  * Combined status indicator that subscribes to this session's state atoms.
@@ -19,6 +21,7 @@ export const SessionStatusIndicator = memo<{ sessionId: string; messageCount?: n
   const hasPendingInteractivePrompt = useAtomValue(sessionHasPendingInteractivePromptAtom(sessionId));
   const isProcessing = useAtomValue(sessionOrChildProcessingAtom(sessionId));
   const hasPendingPrompt = useAtomValue(sessionPendingPromptAtom(sessionId));
+  const hasAgentWakePending = useAtomValue(sessionAgentWakePendingAtom(sessionId));
   const hasUnread = useAtomValue(sessionUnreadAtom(sessionId));
   const wakeup = useAtomValue(sessionWakeupAtom(sessionId));
 
@@ -36,6 +39,14 @@ export const SessionStatusIndicator = memo<{ sessionId: string; messageCount?: n
     return (
       <div className="session-list-item-status processing flex items-center justify-center w-5 h-5 text-[var(--nim-primary)] opacity-80" title="Processing...">
         <MaterialSymbol icon="progress_activity" size={14} className="animate-spin" />
+      </div>
+    );
+  }
+
+  if (hasAgentWakePending) {
+    return (
+      <div className="session-list-item-status agent-wake-pending flex items-center justify-center w-5 h-5 text-[var(--nim-warning)] animate-pulse" title="Room message pending agent dispatch">
+        <MaterialSymbol icon="hourglass_top" size={14} />
       </div>
     );
   }
@@ -401,6 +412,17 @@ export const SessionListItem = memo<SessionListItemProps>(function SessionListIt
   const timestamp = sortBy === 'updated' ? (effectiveUpdatedAt || createdAt) : createdAt;
   const timestampLabel = sortBy === 'updated' ? 'updated' : 'created';
 
+  // A quiet session still ages: relativeTime is derived from a fixed timestamp,
+  // so without a periodic re-render the "X ago" label sits frozen until the
+  // session next has activity (#1200). One coarse tick a minute matches the
+  // finest granularity getRelativeTimeString renders — same approach as the
+  // Inbox section's relative labels.
+  const [relativeTimeTick, setRelativeTimeTick] = useState(0);
+  useEffect(() => {
+    const timer = setInterval(() => setRelativeTimeTick((t) => t + 1), 60_000);
+    return () => clearInterval(timer);
+  }, []);
+
   const { relativeTime, fullDateTime } = useMemo(() => ({
     relativeTime: getRelativeTimeString(timestamp),
     fullDateTime: new Date(timestamp).toLocaleString(undefined, {
@@ -412,7 +434,7 @@ export const SessionListItem = memo<SessionListItemProps>(function SessionListIt
       hour12: true,
       timeZoneName: 'short'
     }),
-  }), [timestamp]);
+  }), [timestamp, relativeTimeTick]);
 
   // Extract model ID from provider:model format
   const displayModel = model?.includes(':') ? model.split(':')[1] : model;
@@ -480,7 +502,7 @@ export const SessionListItem = memo<SessionListItemProps>(function SessionListIt
             <line x1="8.5" y1="5.2" x2="11.5" y2="10.8" stroke="currentColor" strokeWidth="1" strokeLinecap="round"/>
           </svg>
         ) : (
-          <ProviderIcon provider={provider || 'claude'} size={16} />
+          <SessionProviderIcon sessionId={id} provider={provider} size={16} isActive={isActive} />
         )}
       </div>
       {isPinned && (

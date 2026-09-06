@@ -571,7 +571,7 @@ public struct SessionListView: View {
                         .foregroundStyle(.secondary)
                     Text("No Sessions")
                         .font(.title3)
-                    Text("Start a session in Nimbalyst on your Mac, or tap + to create one.")
+                    Text("Start a session in Nimbalyst on your computer, or tap + to create one.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
@@ -1000,21 +1000,28 @@ public struct SessionListView: View {
 
             // Watch for the new workstream to appear (created async by desktop),
             // then reparent the original session under it.
+            // The task outlives the `do/catch` below, so it has to report its own
+            // failures — an unhandled throw here would abandon the reparent with
+            // the session silently left at the top level.
             Task {
                 let sessionId = session.id
-                for _ in 0..<20 { // Poll for up to ~10s
-                    try await Task.sleep(nanoseconds: 500_000_000)
-                    let newWorkstream = sessions.first { s in
-                        s.sessionType == "workstream" && !existingIds.contains(s.id)
-                    }
-                    if let ws = newWorkstream {
-                        try sync.updateSessionParent(sessionId: sessionId, parentSessionId: ws.id)
-                        await MainActor.run {
-                            expandedWorkstreams.insert(ws.id)
-                            saveExpandedState()
+                do {
+                    for _ in 0..<20 { // Poll for up to ~10s
+                        try await Task.sleep(nanoseconds: 500_000_000)
+                        let newWorkstream = sessions.first { s in
+                            s.sessionType == "workstream" && !existingIds.contains(s.id)
                         }
-                        return
+                        if let ws = newWorkstream {
+                            try sync.updateSessionParent(sessionId: sessionId, parentSessionId: ws.id)
+                            await MainActor.run {
+                                expandedWorkstreams.insert(ws.id)
+                                saveExpandedState()
+                            }
+                            return
+                        }
                     }
+                } catch {
+                    print("Failed to reparent session under new workstream: \(error)")
                 }
             }
         } catch {

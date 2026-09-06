@@ -1011,7 +1011,7 @@ export { TrackerDocumentHeader, shouldRenderTrackerHeader } from './documentHead
 
 // Export data models
 export { ModelLoader, loadBuiltinTrackers } from './models/ModelLoader';
-export type { TrackerDataModel, FieldDefinition, TrackerSyncPolicy, TrackerSyncMode, TrackerSchemaRole } from './models/TrackerDataModel';
+export type { TrackerDataModel, FieldDefinition, TrackerSharing, TrackerSharingPolicy, TrackerSchemaRole } from './models/TrackerDataModel';
 export { parseTrackerYAML } from './models/YAMLParser';
 export { globalRegistry, getRoleField, getFieldByRole } from './models/TrackerDataModel';
 
@@ -1020,7 +1020,7 @@ export { StatusBar } from './components/StatusBar';
 export { TrackerTable, convertFullDocumentToTrackerItems, resolveTrackerFrontmatter, renderCell } from './components/TrackerTable';
 export type { SortColumn, SortDirection } from './components/TrackerTable';
 export { TrackerRowContextMenu, ContextSubmenu } from './components/TrackerRowContextMenu';
-export type { TrackerRowContextMenuProps } from './components/TrackerRowContextMenu';
+export type { TrackerRowContextMenuProps, TrackerLinkedSessionOption } from './components/TrackerRowContextMenu';
 export { TrackerFavoriteStar } from './components/TrackerFavoriteStar';
 export { useTrackerRows } from './components/useTrackerRows';
 export type { UseTrackerRowsOptions, UseTrackerRowsResult, EditingCellRef, EditingField } from './components/useTrackerRows';
@@ -1038,12 +1038,16 @@ export {
   getPriorityColor,
   getTypeColor,
   getTypeIcon,
+  getTypeLabel,
+  applyTypeColumnDisplay,
+  resolveTypeColumnDisplay,
   formatRelativeDate,
   formatRelativeCalendarDay,
   formatTrackerDateCell,
   getEffectiveUpdatedDate,
 } from './components/trackerColumns';
-export type { TrackerColumnDef, TypeColumnConfig, ColumnRenderType } from './components/trackerColumns';
+export type { TrackerColumnDef, TypeColumnConfig, ColumnRenderType, TypeColumnDisplay } from './components/trackerColumns';
+export { TrackerTypeCell } from './components/TrackerTypeCell';
 export {
   resolveCellEditor,
   coerceCellValue,
@@ -1064,6 +1068,12 @@ export {
 export type { TrackerRecordGroup } from './components/trackerRowData';
 export type { TrackerFieldEditorProps } from './components/TrackerFieldEditor';
 
+// Export GitHub tracker reference resolution
+export { buildPrUrl, getRecordPrReferences, parsePrUrl, prTrackerReferencesAtom } from './prReferences';
+export type { PrReference } from './prReferences';
+export { buildIssueUrl, getRecordIssueReferences, issueTrackerReferencesAtom, parseIssueUrl } from './issueReferences';
+export type { IssueReference } from './issueReferences';
+
 // Export tracker data atoms (cross-platform reactive state)
 export {
   trackerItemsMapAtom,
@@ -1076,6 +1086,8 @@ export {
   upsertTrackerItemAtom,
   removeTrackerItemAtom,
   replaceAllTrackerItemsAtom,
+  orgTrackerItemsAtom,
+  replaceOrgTrackerItemsAtom,
 } from './trackerDataAtoms';
 
 // Export tracker node and types

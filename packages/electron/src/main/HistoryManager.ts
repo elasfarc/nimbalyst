@@ -7,6 +7,8 @@ import { promisify } from 'util';
 import { database } from './database/PGLiteDatabaseWorker';
 import { logger } from './utils/logger';
 import { parseJsonObjectColumn } from './utils/jsonColumn';
+import { jsonKeyExpr } from './database/jsonKeyExpr';
+import { getWorkspaceRoots } from './utils/store';
 
 const gzip = promisify(zlib.gzip);
 const gunzip = promisify(zlib.gunzip);
@@ -47,6 +49,16 @@ export interface HistoryTag {
  * Storage: All data is stored in the PGLite database (document_history table) with
  * compressed content to minimize disk usage.
  */
+/**
+ * How long a tag may sit in `pending-review` before it is retired unreviewed.
+ *
+ * Two weeks: no real AI review waits that long, and reconciliation on the read
+ * path has had every chance to reach the file first. Deliberately independent
+ * of `maxAgeDays`, which governs when a snapshot row is DELETED — this only
+ * flips a status.
+ */
+const PENDING_REVIEW_RETENTION_MS = 14 * 24 * 60 * 60 * 1000;
+
 export class HistoryManager {
   private maxSnapshots = 250;
   private maxAgeDays = 30;
@@ -78,6 +90,53 @@ export class HistoryManager {
   private readonly PENDING_COUNT_EMIT_DEBOUNCE_MS = 50;
 
   constructor() {}
+
+  /**
+   * SQL for a `metadata` JSON key, in the form the live backend indexes.
+   *
+   * Every partial index on `document_history` is declared over
+   * `json_extract(metadata,'$.key')`, and SQLite will not match a `->>`
+   * predicate against one — the query still returns the right rows, off a full
+   * scan of the whole table. Use this for WHERE predicates; projections don't
+   * affect planning and can stay as they are.
+   */
+  private md(key: string): string {
+    return jsonKeyExpr(database.getEngine(), 'metadata', key);
+  }
+
+  /**
+   * Predicate matching every file under a workspace, across all of its roots.
+   *
+   * A project can span several folders, so "in this workspace" stopped being
+   * "under one path prefix". Every pending query used to be a bare
+   * `file_path LIKE workspacePath || '%'`, which skipped anything under an
+   * attached folder: no review dot, an under-reported count, and rows that
+   * "Clear all pending" could never reach (#1403 by another route).
+   *
+   * `workspace_id` is not usable as the key here despite being on the row and
+   * indexed — real rows carry a *directory* there, not the workspace root
+   * (16k rows on one machine, many set to the file's own parent), so matching
+   * on it would lose more than it found.
+   *
+   * `firstParam` is the 1-based index this predicate's first bind takes, since
+   * callers place it at different positions in their parameter list.
+   *
+   * The trailing separator matters: without it `/proj/app` also swept
+   * `/proj/app-legacy`. That was survivable with one root and is not with
+   * several, so it is fixed here rather than left as a known nit.
+   */
+  private workspaceScope(
+    workspacePath: string,
+    firstParam: number,
+  ): { sql: string; params: string[] } {
+    // An unknown key (a worktree root, say) yields just itself, so callers
+    // outside the workspace-settings world keep their plain prefix behavior.
+    const roots = getWorkspaceRoots(workspacePath);
+    return {
+      sql: `(${roots.map((_, i) => `file_path LIKE $${firstParam + i}`).join(' OR ')})`,
+      params: roots.map((root) => `${root.replace(/[/\\]+$/, '')}${path.sep}%`),
+    };
+  }
 
   /**
    * Configure the history retention limits.
@@ -349,33 +408,92 @@ export class HistoryManager {
       const now = Date.now();
       const maxAge = this.maxAgeDays * 24 * 60 * 60 * 1000;
 
+      // Isolated: cleanup()'s single catch would otherwise let a failure here
+      // silently skip snapshot retention entirely, which is how this very step
+      // first went in.
+      try {
+        await this.retireStalePendingTags(now);
+      } catch (error) {
+        logger.main.error('[HistoryManager] Pending-review retention failed:', error);
+      }
+
       // Delete old snapshots
       await database.query(`
         DELETE FROM document_history
         WHERE timestamp < $1
       `, [now - maxAge]);
 
-      // Keep only maxSnapshots per file
-      // Use CTE to avoid race conditions with corrupted data
-      await database.query(`
-        WITH ids_to_keep AS (
-          SELECT id
-          FROM (
-            SELECT id, ROW_NUMBER() OVER (PARTITION BY file_path ORDER BY timestamp DESC) as rn
-            FROM document_history
-          ) t
-          WHERE rn <= $1
-        ),
-        ids_to_delete AS (
-          SELECT id FROM document_history WHERE id NOT IN (SELECT id FROM ids_to_keep)
-        )
-        DELETE FROM document_history
-        WHERE id IN (SELECT id FROM ids_to_delete)
-        AND EXISTS (SELECT 1 FROM document_history dh WHERE dh.id = document_history.id)
+      // Keep only maxSnapshots per file.
+      //
+      // Find the handful of files actually over the limit first, then delete
+      // within each. The previous shape ran ROW_NUMBER() over the entire table
+      // to derive the same set; because document_history holds full file
+      // content, that scan pulled every blob off disk -- 5,965ms in one call on
+      // the single-lane worker, at startup, to delete 487 rows across 5 files.
+      // Almost every file is under the limit, so this usually does no work.
+      const overLimit = await database.query(`
+        SELECT file_path
+        FROM document_history
+        GROUP BY file_path
+        HAVING count(*) > $1
       `, [this.maxSnapshots]);
+
+      for (const row of overLimit?.rows ?? []) {
+        const filePath = (row as { file_path: string }).file_path;
+        await database.query(`
+          DELETE FROM document_history
+          WHERE file_path = $1
+            AND id NOT IN (
+              SELECT id FROM document_history
+              WHERE file_path = $1
+              ORDER BY timestamp DESC
+              LIMIT $2
+            )
+        `, [filePath, this.maxSnapshots]);
+      }
     } catch (error: any) {
       logger.main.error('[HistoryManager] Cleanup failed:', error);
     }
+  }
+
+  /**
+   * Retire pending-review tags that have sat unreviewed past the bound.
+   *
+   * Before #1403 a tag could stay `pending-review` forever — 3,284 rows on one
+   * dev machine, the oldest three months old. Reconciliation on the read path
+   * heals a file the moment it is opened, but a file nobody opens again is
+   * never reached, and every one of those rows still inflates the pending
+   * counts the UI shows.
+   *
+   * This flips status only. The row and its compressed baseline stay put, so
+   * nothing here loses data — unlike the snapshot pass below, which deletes.
+   */
+  private async retireStalePendingTags(now: number): Promise<void> {
+    const cutoff = now - PENDING_REVIEW_RETENTION_MS;
+
+    const stale = await database.query<{ file_path: string }>(`
+      SELECT DISTINCT file_path
+      FROM document_history
+      WHERE timestamp < $1
+        AND ${this.md('status')} = 'pending-review'
+    `, [cutoff]);
+
+    if (stale.rows.length === 0) return;
+
+    await database.query(`
+      UPDATE document_history
+      SET metadata = jsonb_set(
+            jsonb_set(metadata, '{status}', '"reviewed"'),
+            '{updatedAt}', to_jsonb($1::bigint)
+          )
+      WHERE timestamp < $2
+        AND ${this.md('status')} = 'pending-review'
+    `, [now, cutoff]);
+
+    logger.main.info('[HistoryManager] Retired pending tags past the retention bound:', {
+      count: stale.rows.length,
+      retentionDays: PENDING_REVIEW_RETENTION_MS / (24 * 60 * 60 * 1000),
+    });
   }
 
   /**
@@ -393,6 +511,7 @@ export class HistoryManager {
       }
 
       // Query files that are in this workspace or in subdirectories of it
+      const scope = this.workspaceScope(workspacePath, 1);
       const result = await database.query<{
         file_path: string;
         latest: number;
@@ -400,10 +519,10 @@ export class HistoryManager {
       }>(`
         SELECT file_path, MAX(timestamp) as latest, COUNT(*) as count
         FROM document_history
-        WHERE file_path LIKE $1
+        WHERE ${scope.sql}
         GROUP BY file_path
         ORDER BY latest DESC
-      `, [workspacePath + '/%']);
+      `, scope.params);
 
       return result.rows.map(row => ({
         path: row.file_path,
@@ -476,7 +595,7 @@ export class HistoryManager {
                metadata->>'speculative' as speculative
         FROM document_history
         WHERE file_path = $1
-          AND metadata->>'status' = 'pending-review'
+          AND ${this.md('status')} = 'pending-review'
         LIMIT 1
       `, [filePath]);
 
@@ -611,7 +730,7 @@ export class HistoryManager {
           UPDATE document_history
           SET metadata = jsonb_set(metadata, '{status}', to_jsonb('reviewed'::text))
           WHERE file_path = $1
-            AND metadata->>'status' = 'pending-review'
+            AND ${this.md('status')} = 'pending-review'
         `, [filePath]);
       }
 
@@ -703,7 +822,7 @@ export class HistoryManager {
         FROM document_history
         WHERE file_path = $1
           AND metadata->>'tagId' = $2
-          AND metadata->>'type' = 'pre-edit'
+          AND ${this.md('type')} = 'pre-edit'
         ORDER BY timestamp DESC
         LIMIT 1
       `, [filePath, tagId]);
@@ -755,7 +874,7 @@ export class HistoryManager {
             metadata = jsonb_set(metadata, '{updatedAt}', to_jsonb($3::bigint))
         WHERE file_path = $4
           AND metadata->>'tagId' = $5
-          AND metadata->>'type' = 'pre-edit'
+          AND ${this.md('type')} = 'pre-edit'
       `, [compressed, compressed.length, now, filePath, tagId]);
 
       logger.main.debug('[HistoryManager] Updated tag content:', { filePath, tagId });
@@ -801,7 +920,7 @@ export class HistoryManager {
         SELECT metadata->>'status' as status, metadata->>'tagId' as tag_id, metadata->>'type' as type
         FROM document_history
         WHERE file_path = $1
-          AND (metadata->>'type' = 'pre-edit' OR metadata->>'type' = 'incremental-approval')
+          AND (${this.md('type')} = 'pre-edit' OR ${this.md('type')} = 'incremental-approval')
       `, [filePath]);
 
       // logger.main.info('[HistoryManager] All tags for file after update:',
@@ -837,13 +956,13 @@ export class HistoryManager {
           SELECT file_path, content, metadata
           FROM document_history
           WHERE file_path = $1
-            AND metadata->>'status' = 'pending-review'
+            AND ${this.md('status')} = 'pending-review'
           ORDER BY timestamp DESC
         `
         : `
           SELECT file_path, content, metadata
           FROM document_history
-          WHERE metadata->>'status' = 'pending-review'
+          WHERE ${this.md('status')} = 'pending-review'
           ORDER BY timestamp DESC
         `;
 
@@ -908,7 +1027,7 @@ export class HistoryManager {
         FROM document_history
         WHERE file_path = $1
           AND metadata->>'tagId' = $2
-          AND metadata->>'type' = 'pre-edit'
+          AND ${this.md('type')} = 'pre-edit'
       `, [filePath, tagId]);
 
       return result.rows[0]?.count > 0;
@@ -955,7 +1074,7 @@ export class HistoryManager {
         UPDATE document_history
         SET metadata = jsonb_set(metadata, '{status}', to_jsonb('reviewed'::text))
         WHERE file_path = $1
-          AND metadata->>'status' = 'pending-review'
+          AND ${this.md('status')} = 'pending-review'
       `, [filePath]);
 
       // Store as history entry with incremental-approval type and status = pending-review
@@ -1014,20 +1133,14 @@ export class HistoryManager {
 
       // The status predicate must textually match the partial index
       // idx_history_one_pending_per_file or the planner falls back to a full
-      // table scan (~100ms). SQLite indexes the json_extract form; PGLite the
-      // ->> form. A ->> query does NOT match a json_extract index on SQLite.
-      const isSqlite = database.getEngine() === 'sqlite';
-      const statusExpr = isSqlite
-        ? `json_extract(metadata, '$.status')`
-        : `metadata->>'status'`;
-
-      // Use file_path LIKE to match all files within the workspace directory
+      // table scan (~100ms).
+      const scope = this.workspaceScope(workspacePath, 1);
       const result = await database.query<{ count: string }>(`
         SELECT COUNT(DISTINCT file_path) as count
         FROM document_history
-        WHERE file_path LIKE $1
-          AND ${statusExpr} = 'pending-review'
-      `, [workspacePath + '%']);
+        WHERE ${scope.sql}
+          AND ${this.md('status')} = 'pending-review'
+      `, scope.params);
 
       return parseInt(result.rows[0]?.count || '0', 10);
     } catch (error) {
@@ -1053,25 +1166,17 @@ export class HistoryManager {
           await database.initialize();
         }
 
-        // SQLite uses json_extract so the planner can match
-        // idx_history_pending_session_file (migration 2). PGLite needs the
-        // PostgreSQL ->> operator: its metadata column is jsonb, and
-        // json_extract has no (jsonb, unknown) overload there. The dialect
-        // split is required -- a single form cannot satisfy both engines.
-        const isSqlite = database.getEngine() === 'sqlite';
-        const sessionIdExpr = isSqlite
-          ? `json_extract(metadata, '$.sessionId')`
-          : `metadata->>'sessionId'`;
-        const statusExpr = isSqlite
-          ? `json_extract(metadata, '$.status')`
-          : `metadata->>'status'`;
+        // Both predicates must match idx_history_pending_session_file
+        // (migration 2) -- the indexed sessionId expression and the partial
+        // index's own status clause.
+        const scope = this.workspaceScope(workspacePath, 2);
         const result = await database.query<{ file_path: string }>(`
           SELECT DISTINCT file_path
           FROM document_history
-          WHERE ${sessionIdExpr} = $1
-            AND ${statusExpr} = 'pending-review'
-            AND file_path LIKE $2
-        `, [sessionId, workspacePath + '%']);
+          WHERE ${this.md('sessionId')} = $1
+            AND ${this.md('status')} = 'pending-review'
+            AND ${scope.sql}
+        `, [sessionId, ...scope.params]);
 
         return result.rows.map((row: { file_path: string }) => row.file_path);
       } catch (error) {
@@ -1100,13 +1205,14 @@ export class HistoryManager {
         await database.initialize();
       }
 
+      const scope = this.workspaceScope(workspacePath, 2);
       const result = await database.query<{ file_path: string }>(`
         SELECT DISTINCT file_path
         FROM document_history
-        WHERE file_path LIKE $1
-          AND metadata->>'sessionId' = $2
-          AND metadata->>'type' IN ('pre-edit', 'incremental-approval')
-      `, [workspacePath + '%', sessionId]);
+        WHERE ${scope.sql}
+          AND ${this.md('sessionId')} = $1
+          AND ${this.md('type')} IN ('pre-edit', 'incremental-approval')
+      `, [sessionId, ...scope.params]);
 
       return result.rows.map((row: { file_path: string }) => row.file_path);
     } catch (error) {
@@ -1129,8 +1235,8 @@ export class HistoryManager {
         SELECT MAX(CAST(metadata->>'updatedAt' AS bigint)) as last_reviewed_at
         FROM document_history
         WHERE file_path = $1
-          AND metadata->>'status' = 'reviewed'
-          AND metadata->>'type' = 'pre-edit'
+          AND ${this.md('status')} = 'reviewed'
+          AND ${this.md('type')} = 'pre-edit'
       `, [filePath]);
 
       const val = result.rows[0]?.last_reviewed_at;
@@ -1150,13 +1256,14 @@ export class HistoryManager {
         await database.initialize();
       }
 
+      const scope = this.workspaceScope(workspacePath, 2);
       const result = await database.query<{ count: string }>(`
         SELECT COUNT(DISTINCT file_path) as count
         FROM document_history
-        WHERE file_path LIKE $1
-          AND metadata->>'status' = 'pending-review'
-          AND metadata->>'sessionId' = $2
-      `, [workspacePath + '%', sessionId]);
+        WHERE ${scope.sql}
+          AND ${this.md('status')} = 'pending-review'
+          AND ${this.md('sessionId')} = $1
+      `, [sessionId, ...scope.params]);
 
       return parseInt(result.rows[0]?.count || '0', 10);
     } catch (error) {
@@ -1178,28 +1285,29 @@ export class HistoryManager {
       const now = Date.now();
 
       // First get the list of files we're clearing (for notifying tabs)
-      // Use file_path LIKE to match all files within the workspace directory
+      const scope = this.workspaceScope(workspacePath, 1);
       const filesResult = await database.query<{ file_path: string }>(`
         SELECT DISTINCT file_path
         FROM document_history
-        WHERE file_path LIKE $1
-          AND metadata->>'status' = 'pending-review'
-      `, [workspacePath + '%']);
+        WHERE ${scope.sql}
+          AND ${this.md('status')} = 'pending-review'
+      `, scope.params);
 
       const clearedFiles = filesResult.rows.map((row: { file_path: string }) => row.file_path);
       const clearedCount = clearedFiles.length;
 
       if (clearedCount > 0) {
         // Update all pending tags to reviewed
+        const updateScope = this.workspaceScope(workspacePath, 2);
         await database.query(`
           UPDATE document_history
           SET metadata = jsonb_set(
                 jsonb_set(metadata, '{status}', '"reviewed"'),
                 '{updatedAt}', to_jsonb($1::bigint)
               )
-          WHERE file_path LIKE $2
-            AND metadata->>'status' = 'pending-review'
-        `, [now, workspacePath + '%']);
+          WHERE ${updateScope.sql}
+            AND ${this.md('status')} = 'pending-review'
+        `, [now, ...updateScope.params]);
 
         logger.main.info('[HistoryManager] Cleared all pending tags:', { workspacePath, clearedCount, clearedFiles });
 
@@ -1238,29 +1346,31 @@ export class HistoryManager {
       const now = Date.now();
 
       // First get the list of files we're clearing (for notifying tabs)
+      const scope = this.workspaceScope(workspacePath, 2);
       const filesResult = await database.query<{ file_path: string }>(`
         SELECT DISTINCT file_path
         FROM document_history
-        WHERE file_path LIKE $1
-          AND metadata->>'status' = 'pending-review'
-          AND metadata->>'sessionId' = $2
-      `, [workspacePath + '%', sessionId]);
+        WHERE ${scope.sql}
+          AND ${this.md('status')} = 'pending-review'
+          AND ${this.md('sessionId')} = $1
+      `, [sessionId, ...scope.params]);
 
       const clearedFiles = filesResult.rows.map((row: { file_path: string }) => row.file_path);
       const clearedCount = clearedFiles.length;
 
       if (clearedCount > 0) {
         // Update pending tags for this session to reviewed
+        const updateScope = this.workspaceScope(workspacePath, 3);
         await database.query(`
           UPDATE document_history
           SET metadata = jsonb_set(
                 jsonb_set(metadata, '{status}', '"reviewed"'),
                 '{updatedAt}', to_jsonb($1::bigint)
               )
-          WHERE file_path LIKE $2
-            AND metadata->>'status' = 'pending-review'
-            AND metadata->>'sessionId' = $3
-        `, [now, workspacePath + '%', sessionId]);
+          WHERE ${updateScope.sql}
+            AND ${this.md('status')} = 'pending-review'
+            AND ${this.md('sessionId')} = $2
+        `, [now, sessionId, ...updateScope.params]);
 
         logger.main.info('[HistoryManager] Cleared pending tags for session:', { workspacePath, sessionId, clearedCount, clearedFiles });
 
@@ -1312,8 +1422,8 @@ export class HistoryManager {
           SELECT content
           FROM document_history
           WHERE file_path = $1
-            AND metadata->>'sessionId' = $2
-            AND metadata->>'type' = $3
+            AND ${this.md('sessionId')} = $2
+            AND ${this.md('type')} = $3
           ORDER BY timestamp DESC
           LIMIT 1
         `,

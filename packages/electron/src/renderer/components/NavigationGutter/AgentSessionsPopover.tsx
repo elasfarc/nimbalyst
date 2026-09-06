@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useAtomValue, useSetAtom } from 'jotai';
-import { MaterialSymbol, ProviderIcon, type SessionMeta } from '@nimbalyst/runtime';
+import { MaterialSymbol, type SessionMeta } from '@nimbalyst/runtime';
 import {
   agentBubbleStateAtom,
   agentSessionAttentionAtom,
@@ -9,9 +9,9 @@ import {
 } from '../../store';
 import { selectSessionActionAtom } from '../../store/actions/sessionHistoryActions';
 import { settingAtom } from '../../store/atoms/settingAtomFamily';
-import { getRelativeTimeString } from '../../utils/dateFormatting';
 import { FloatingPortal, useFloatingMenu } from '../../hooks/useFloatingMenu';
 import { HelpTooltip } from '../../help';
+import { SessionAttentionRow } from '../AgenticCoding/SessionAttentionRow';
 import { SessionStatusIndicator } from '../AgenticCoding/SessionListItem';
 import { SessionTranscriptPeek } from '../AgenticCoding/SessionTranscriptPeek';
 
@@ -66,8 +66,7 @@ function AgentSessionAttentionRow({
 }) {
   const liveActivity = useAtomValue(sessionLastActivityAtom(session.id));
   const updatedAt = liveActivity > 0 ? liveActivity : session.updatedAt;
-  const model = session.model?.includes(':') ? session.model.split(':')[1] : session.model;
-  const rowRef = useRef<HTMLDivElement>(null);
+  const rowRef = useRef<HTMLDivElement | null>(null);
   const hoverTimerRef = useRef<number | null>(null);
 
   // `now` causes the relative label to refresh while the popover is open.
@@ -81,6 +80,8 @@ function AgentSessionAttentionRow({
     };
   }, []);
 
+  // Dwell is scoped to the peek button, not the whole row -- opening a
+  // transcript flyout just because the pointer crossed a row is too eager.
   const handlePeekEnter = useCallback(() => {
     if (isPeekOpen || !rowRef.current) return;
     hoverTimerRef.current = window.setTimeout(() => {
@@ -100,67 +101,40 @@ function AgentSessionAttentionRow({
   const title = session.title || 'Untitled Session';
 
   return (
-    // Two-row layout mirroring SessionListItem: the title owns the full row width
-    // (the popover is the only place these long generated titles are readable),
-    // with metadata and the peek trigger demoted to a second line.
-    <div
-      ref={rowRef}
-      className="agent-sessions-popover-row flex w-full cursor-pointer items-start gap-2.5 px-3 py-2 text-left transition-colors hover:bg-nim-tertiary focus-visible:outline-2 focus-visible:outline-[var(--nim-primary)] focus-visible:outline-offset-[-2px]"
-      data-session-id={session.id}
-      data-testid={`agent-sessions-row-${session.id}`}
-      role="button"
-      tabIndex={0}
-      onClick={() => onSelect(session.id)}
-      onKeyDown={(event) => {
-        if (event.key === 'Enter' || event.key === ' ') {
-          event.preventDefault();
-          onSelect(session.id);
-        }
-      }}
-    >
-      <div className="mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded bg-nim-tertiary text-nim-muted">
-        <ProviderIcon provider={session.provider || 'claude'} size={15} />
-      </div>
-      <div className="min-w-0 flex-1">
-        <div className="flex items-center gap-2">
-          <span className="min-w-0 flex-1 truncate text-[13px] font-medium text-nim" title={title}>
-            {title}
-          </span>
-          <SessionStatusIndicator sessionId={session.id} />
-        </div>
-        <div className="mt-0.5 flex items-center gap-1.5 text-[11px] text-nim-faint">
-          <span className="shrink-0 whitespace-nowrap">{getRelativeTimeString(updatedAt)}</span>
-          {(model || session.provider) && (
-            <>
-              <span aria-hidden>·</span>
-              <span className="truncate">{model || session.provider}</span>
-            </>
-          )}
-          <button
-            type="button"
-            className={`ml-auto flex h-5 w-5 shrink-0 items-center justify-center rounded transition-colors focus-visible:outline-2 focus-visible:outline-[var(--nim-primary)] ${
-              isPeekOpen
-                ? 'bg-nim-tertiary text-nim'
-                : 'text-nim-disabled hover:bg-nim-tertiary hover:text-nim-muted'
-            }`}
-            title="Preview transcript"
-            aria-label={`Preview transcript for ${title}`}
-            aria-pressed={isPeekOpen}
-            data-testid={`agent-sessions-peek-${session.id}`}
-            onMouseEnter={handlePeekEnter}
-            onMouseLeave={handlePeekLeave}
-            onClick={(event) => {
-              event.stopPropagation();
-              if (rowRef.current) {
-                onPeekToggle(session.id, rowRef.current);
-              }
-            }}
-          >
-            <MaterialSymbol icon="chat_bubble_outline" size={12} />
-          </button>
-        </div>
-      </div>
-    </div>
+    <SessionAttentionRow
+      sessionId={session.id}
+      title={title}
+      provider={session.provider || 'claude'}
+      model={session.model}
+      updatedAt={updatedAt}
+      rowRef={rowRef}
+      onSelect={onSelect}
+      statusSlot={<SessionStatusIndicator sessionId={session.id} />}
+      trailingSlot={(
+        <button
+          type="button"
+          className={`flex h-5 w-5 shrink-0 items-center justify-center rounded transition-colors focus-visible:outline-2 focus-visible:outline-[var(--nim-primary)] ${
+            isPeekOpen
+              ? 'bg-nim-tertiary text-nim'
+              : 'text-nim-disabled hover:bg-nim-tertiary hover:text-nim-muted'
+          }`}
+          title="Preview transcript"
+          aria-label={`Preview transcript for ${title}`}
+          aria-pressed={isPeekOpen}
+          data-testid={`agent-sessions-peek-${session.id}`}
+          onMouseEnter={handlePeekEnter}
+          onMouseLeave={handlePeekLeave}
+          onClick={(event) => {
+            event.stopPropagation();
+            if (rowRef.current) {
+              onPeekToggle(session.id, rowRef.current);
+            }
+          }}
+        >
+          <MaterialSymbol icon="chat_bubble_outline" size={12} />
+        </button>
+      )}
+    />
   );
 }
 

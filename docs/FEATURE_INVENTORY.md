@@ -15,6 +15,8 @@ A concise reference of all features in the product. Keep this up to date as feat
 - **Browser** (`.html`, `.htm`, `.browser.json`) -- native Chromium `WebContentsView` (not an iframe, so frame-blocking sites load), URL bar / back-forward / reload, workspace-scoped `nim-preview://` local preview, source-mode toggle, and agentic control AI tools (navigate, click, type, evaluate, scroll, get_page_info, screenshot) over editor-backed or agent-owned headless sessions
 - **Image generation project editor** (`.imgproj`) -- multi-variant AI image generation with iterative refinement
 - **Astro editor** (`.astro`) -- schema-aware frontmatter form header
+- **Animation editor** (`.anim.json`) -- step-based animated explainer diagrams with a scrubbable timeline, drag-to-retime step boundaries, click-a-part-to-chat selection, and HTML/GIF/MP4 export
+- **Project Canvas** (`.canvas`) -- infinite JSON Canvas board whose cards mount the real editor for the file or shared document they reference, with frames, stickies, labeled edges, and zoom-driven card mounting
 - **Image viewer** (`.png`, `.jpg`, `.gif`, `.svg`, `.webp`, `.bmp`, `.ico`)
 
 ### Cross-Editor Features
@@ -70,6 +72,7 @@ A concise reference of all features in the product. Keep this up to date as feat
 - Configurable columns
 - Auto-exit kanban when navigating to a session
 - Agent-assisted cleanup (`/session-cleanup` slash command in the Planning extension) — audits sessions, proposes phase corrections and "mark complete" candidates for approval, and flags old sessions to archive
+- Workspace coaching (`/planning:nimbalyst-coach` slash command in the Planning extension) — reviews the project and recent sessions, then recommends extensions matching the project's file types, product features going unused, and additions to the project's agent instructions; read-only until the user approves each edit
 
 ## Agent Mode
 
@@ -226,6 +229,7 @@ A concise reference of all features in the product. Keep this up to date as feat
 - Mobile voice mode (soft chime + haptic cue when the session connects and it's your turn to talk)
 - Mobile voice: asking the voice agent to start a new session opens it automatically on the device that asked
 - Mobile voice: the floating mic shows a tool-call indicator (animated ring + tool-icon badge) while the agent runs a tool
+- Session fleet Live Activity — Lock Screen card and Dynamic Island mirroring the macOS menu bar strip, with the sessions waiting on you ranked by wait time; tap a row to open that session. Server-started, so it appears without opening the app; dims when the Mac stops reporting, ends when the fleet goes quiet. Toggled in Settings
 
 ## Mobile (Android)
 
@@ -334,6 +338,7 @@ Companion app; pairs with a desktop over encrypted sync. Voice mode is not inclu
 
 ### Built-in Extensions
 
+- Animation — step-based animated explainer diagrams, with an authoring skill and an `/animate` command
 - Automations
 - Astro Editor
 - CSV Spreadsheet
@@ -348,6 +353,7 @@ Companion app; pairs with a desktop over encrypted sync. Voice mode is not inclu
 - Nimbalyst Memory — local project-knowledge brain (hybrid search + facts) for the voice and coding agents
 - PDF Viewer
 - Planning
+- Project Canvas — authoring skill for `.canvas` boards; the editor itself is built in
 - Project Graph — navigable whole-project graph of plans, trackers, sessions, commits, and files, with a horizontally scrollable **Timeline mode** (phase-colored lifecycle bars per item; collapse items into per-tag activity lanes)
 - SQLite Browser
 
@@ -421,6 +427,7 @@ Companion app; pairs with a desktop over encrypted sync. Voice mode is not inclu
 - Multi-window support with per-project state persistence
 - Project Manager (Cmd+P)
 - System tray with session status and click-to-navigate
+- macOS menu bar fleet strip — names a session for a few seconds as it starts, finishes, blocks or fails, flags a stalled one, and disappears when nothing is running ("Show Fleet Status" in the tray menu)
 - Dock badge for sessions needing attention
 - OS notifications for session events
 - Sound notifications

@@ -3,10 +3,10 @@ import React from 'react';
 import { Provider, createStore } from 'jotai';
 import { act, cleanup, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { asTeamMemberId } from '@nimbalyst/runtime/auth/jwtScopes';
 
 import type { TeamInboxSnapshot } from '@nimbalyst/runtime/sync';
 import type { ConversationDirectoryEntry } from '../../../../shared/conversationDirectory';
-import { selectedOrgIdAtom } from '../../../store/atoms/orgScope';
 import { teamInboxSnapshotAtom } from '../../../store/atoms/teamInbox';
 import {
   conversationDirectoryAtomFamily,
@@ -14,10 +14,12 @@ import {
 } from '../../../store/atoms/conversations';
 import { InboxProviderContext, type InboxProvider } from '../Inbox/inboxProvider';
 import { inboxUnreadCount } from '../orgSidebarViewModel';
-import { orgWindowRouteAtom } from '../orgWindowState';
-import { TeamMode } from '../TeamMode';
+import { ORG_WINDOW_SURFACE_ID, orgWindowRouteAtomFamily } from '../orgWindowState';
+import { OrgModeHost } from '../OrgModeHost';
 
-vi.mock('@nimbalyst/runtime', () => ({
+const orgWindowRouteAtom = orgWindowRouteAtomFamily(ORG_WINDOW_SURFACE_ID);
+
+vi.mock('@nimbalyst/runtime/ui/icons/MaterialSymbol', () => ({
   MaterialSymbol: ({ icon }: { icon: string }) => <span>{icon}</span>,
 }));
 vi.mock('../Inbox', () => ({ InboxSection: () => <div data-testid="inbox" /> }));
@@ -25,9 +27,6 @@ vi.mock('../RoomView', () => ({
   RoomView: ({ entry }: { entry: ConversationDirectoryEntry }) => (
     <div data-testid="org-room-view" data-conversation-id={entry.id} />
   ),
-}));
-vi.mock('../../Settings/panels/OrganizationMembersRolesPanel', () => ({
-  OrganizationMembersRolesPanel: () => <div />,
 }));
 vi.mock('../../Settings/panels/OrganizationProjectsPanel', () => ({ OrganizationProjectsPanel: () => <div /> }));
 vi.mock('../../Settings/panels/OrganizationBillingPanel', () => ({ OrganizationBillingPanel: () => <div /> }));
@@ -63,7 +62,7 @@ function snapshotWith(
 function delivery(id: string, conversationId: string) {
   return {
     id,
-    recipientUserId: 'member-a',
+    teamMemberId: asTeamMemberId('member-a'),
     orgId: 'org-1',
     orgName: 'Acme',
     source: {
@@ -121,7 +120,6 @@ describe('TeamMode marks a room read while it is open', () => {
   it('marks the routed conversation\'s deliveries read, once, and drops the count', async () => {
     installApi();
     const store = createStore();
-    store.set(selectedOrgIdAtom, 'org-1');
     store.set(conversationDirectoryAtomFamily('org-1'), [general]);
     store.set(conversationDirectoryLoadStateAtomFamily('org-1'), { status: 'ready' });
     store.set(teamInboxSnapshotAtom, snapshotWith([
@@ -142,7 +140,7 @@ describe('TeamMode marks a room read while it is open', () => {
     render(
       <Provider store={store}>
         <InboxProviderContext.Provider value={provider}>
-          <TeamMode />
+          <OrgModeHost orgId="org-1" surfaceId={ORG_WINDOW_SURFACE_ID} chrome="window" />
         </InboxProviderContext.Provider>
       </Provider>,
     );

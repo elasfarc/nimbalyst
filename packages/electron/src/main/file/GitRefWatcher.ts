@@ -4,6 +4,7 @@ import simpleGit, { SimpleGit } from 'simple-git';
 import { BrowserWindow } from 'electron';
 import { logger } from '../utils/logger';
 import { clearGitStatusCache } from '../ipc/GitStatusHandlers';
+import { clearGitFactsCache } from '../utils/gitUncommittedFiles';
 
 type NativeFileWatchListener = (curr: fs.Stats, prev: fs.Stats) => void;
 
@@ -15,9 +16,18 @@ interface NativeFileWatcher {
 interface WatcherEntry {
   refWatcher: NativeFileWatcher;
   indexWatcher: NativeFileWatcher;
+  headWatcher: NativeFileWatcher;
   lastCommitHash: string;
   currentBranch: string;
+  /** Where refs/heads lives — the shared parent dir for a worktree. */
+  commonDir: string;
   git: SimpleGit;
+  /**
+   * The workspace this repo was registered under, which is not the repo path
+   * once a project spans several folders. Git status is routed by repo, but
+   * pending reviews are workspace-scoped, so the two must not be conflated.
+   */
+  owningWorkspace: string;
 }
 
 /**
@@ -176,9 +186,14 @@ export class GitRefWatcher {
   }
 
   /**
-   * Start watching a workspace for git state changes
+   * Start watching a repo for git state changes.
+   *
+   * `owningWorkspace` is the workspace this repo was registered under. It
+   * differs from `workspacePath` whenever the repo lives in an attached folder
+   * or below a container root, and it is what pending-review updates must be
+   * attributed to. Defaults to the repo itself for single-root callers.
    */
-  async start(workspacePath: string): Promise<void> {
+  async start(workspacePath: string, owningWorkspace?: string): Promise<void> {
     // Already watching this workspace
     if (this.watchers.has(workspacePath)) {
       logger.main.debug('[GitRefWatcher] Already watching workspace:', path.basename(workspacePath));
@@ -263,12 +278,30 @@ export class GitRefWatcher {
         },
       );
 
+      // Watch HEAD for branch switches. Without this the ref watcher above
+      // stays pinned to whichever branch was current at start(), so after a
+      // checkout no commit on the new branch is ever detected — no
+      // auto-approve, no `git:commit-detected`, no cache invalidation (#1403).
+      const headPath = path.join(gitDir, 'HEAD');
+      const headWatcher = watchGitFile(
+        headPath,
+        async () => {
+          await this.handleHeadChange(workspacePath);
+        },
+        (error) => {
+          logger.main.error('[GitRefWatcher] HEAD watcher error:', error);
+        },
+      );
+
       this.watchers.set(workspacePath, {
         refWatcher,
         indexWatcher,
+        headWatcher,
         lastCommitHash,
         currentBranch,
+        commonDir,
         git,
+        owningWorkspace: owningWorkspace ?? workspacePath,
       });
 
       logger.main.info('[GitRefWatcher] Started watching:', {
@@ -290,6 +323,7 @@ export class GitRefWatcher {
     if (entry) {
       unwatchGitFile(entry.refWatcher);
       unwatchGitFile(entry.indexWatcher);
+      unwatchGitFile(entry.headWatcher);
       this.watchers.delete(workspacePath);
 
       // Clear any pending debounce timer
@@ -378,6 +412,7 @@ export class GitRefWatcher {
 
       // Clear git status cache so next query gets fresh data
       clearGitStatusCache(workspacePath);
+      clearGitFactsCache(workspacePath);
 
       // Notify main-process listeners (e.g., CommitTrackerLinker)
       const commitEvent: CommitDetectedEvent = {
@@ -401,9 +436,68 @@ export class GitRefWatcher {
 
       this.emitToAllWindows('git:status-changed', {
         workspacePath,
+        // The watcher is registered per repo, so this IS the repo root. Named
+        // explicitly because a multi-root renderer routes on it: the repo may
+        // sit inside an attached folder, not the workspace path.
+        repoPath: workspacePath,
       });
     } catch (error) {
       logger.main.error('[GitRefWatcher] Error handling ref change:', error);
+    }
+  }
+
+  /**
+   * Handle .git/HEAD changes (branch switches).
+   *
+   * Re-points the branch-ref watcher at the new branch and refreshes cached git
+   * facts. Deliberately does NOT run the auto-approve sweep: the files that
+   * differ between two branch tips are not "files that were just committed",
+   * and retiring their pending reviews on that basis would drop edits the user
+   * never saw. Reconciliation on the read path handles those.
+   */
+  private async handleHeadChange(workspacePath: string): Promise<void> {
+    try {
+      const entry = this.watchers.get(workspacePath);
+      if (!entry) return;
+
+      const status = await entry.git.status();
+      // Detached HEAD (mid-rebase, bisect, checkout of a tag): nothing to
+      // re-point at. Leave the existing watcher alone until HEAD names a branch
+      // again.
+      if (!status.current || status.current === entry.currentBranch) return;
+
+      const previousBranch = entry.currentBranch;
+      const branchRefPath = path.join(entry.commonDir, 'refs/heads', status.current);
+
+      unwatchGitFile(entry.refWatcher);
+      entry.refWatcher = watchGitFile(
+        branchRefPath,
+        async () => {
+          await this.handleRefChange(workspacePath);
+        },
+        (error) => {
+          logger.main.error('[GitRefWatcher] Ref watcher error:', error);
+        },
+      );
+      entry.currentBranch = status.current;
+
+      // Re-baseline the commit hash to the new branch tip, so the next commit
+      // on it is detected as a delta from here rather than diffed against the
+      // old branch.
+      const log = await entry.git.log({ maxCount: 1 });
+      entry.lastCommitHash = log.latest?.hash || '';
+
+      logger.main.info('[GitRefWatcher] Branch switch detected, re-pointed ref watcher:', {
+        workspace: path.basename(workspacePath),
+        from: previousBranch,
+        to: status.current,
+      });
+
+      clearGitStatusCache(workspacePath);
+      clearGitFactsCache(workspacePath);
+      this.emitToAllWindows('git:status-changed', { workspacePath, repoPath: workspacePath });
+    } catch (error) {
+      logger.main.error('[GitRefWatcher] Error handling HEAD change:', error);
     }
   }
 
@@ -432,10 +526,15 @@ export class GitRefWatcher {
   private handleIndexChange(workspacePath: string): void {
     // Clear git status cache so next query gets fresh data
     clearGitStatusCache(workspacePath);
+    clearGitFactsCache(workspacePath);
 
     // Emit event to update UI
     this.emitToAllWindows('git:status-changed', {
       workspacePath,
+      // The watcher is registered per repo, so this IS the repo root. Named
+      // explicitly because a multi-root renderer routes on it: the repo may
+      // sit inside an attached folder, not the workspace path.
+      repoPath: workspacePath,
     });
   }
 
@@ -444,10 +543,24 @@ export class GitRefWatcher {
    */
   private async autoApprovePendingReviews(
     workspacePath: string,
-    committedFiles: string[]
+    committedFiles: string[],
+    injectedHistoryManager?: Pick<
+      typeof import('../HistoryManager').historyManager,
+      'getPendingTags' | 'updateTagStatus'
+    >,
   ): Promise<void> {
     try {
-      const { historyManager } = await import('../HistoryManager');
+      const historyManager =
+        injectedHistoryManager ?? (await import('../HistoryManager')).historyManager;
+
+      // Pending reviews are workspace-scoped, but this watcher is keyed by repo.
+      // `updateTagStatus`'s last argument becomes the key of the debounced
+      // `history:pending-count-changed` broadcast, and the renderer matches
+      // sessions on exact workspace equality -- so passing the repo root here
+      // would silently drop the badge refresh for any repo that is not itself
+      // the workspace root.
+      const owningWorkspace =
+        this.watchers.get(workspacePath)?.owningWorkspace ?? workspacePath;
 
       // logger.main.info('[GitRefWatcher] Auto-approving pending reviews for committed files:', {
       //   workspace: path.basename(workspacePath),
@@ -473,7 +586,7 @@ export class GitRefWatcher {
           // });
 
           for (const tag of pendingTags) {
-            await historyManager.updateTagStatus(filePath, tag.id, 'reviewed', workspacePath);
+            await historyManager.updateTagStatus(filePath, tag.id, 'reviewed', owningWorkspace);
             approvedCount++;
           }
         }

@@ -456,6 +456,47 @@
   height: 100%;
 }
 
+.git-detail-session {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--nim-border);
+  font-size: 11px;
+  flex-shrink: 0;
+  overflow: hidden;
+}
+
+.git-detail-session-label {
+  color: var(--nim-text-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  flex-shrink: 0;
+}
+
+.git-detail-session-link {
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--nim-primary);
+  font-family: inherit;
+  font-size: 11px;
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+}
+
+.git-detail-session-link:hover {
+  text-decoration: underline;
+}
+
+.git-detail-session-provider {
+  color: var(--nim-text-faint);
+  flex-shrink: 0;
+}
+
 .git-detail-message {
   margin: 0;
   padding: 10px 12px;
@@ -523,6 +564,10 @@
 
 .git-log-th--author {
   width: 120px;
+}
+
+.git-log-th--session {
+  width: 150px;
 }
 
 .git-log-th--date {
@@ -599,6 +644,35 @@
   overflow: hidden;
   text-overflow: ellipsis;
   color: var(--nim-text-muted);
+}
+
+/*
+ * Commits made outside a session (bash, release scripts) render an empty cell
+ * rather than a placeholder -- the column reads as sparse-by-design.
+ */
+.git-log-td--session {
+  max-width: 0;
+  overflow: hidden;
+}
+
+.git-log-session-chip {
+  display: block;
+  max-width: 100%;
+  padding: 1px 6px;
+  border: none;
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--nim-primary) 12%, transparent);
+  color: var(--nim-primary);
+  font-family: inherit;
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+}
+
+.git-log-session-chip:hover {
+  background: color-mix(in srgb, var(--nim-primary) 22%, transparent);
 }
 
 .git-log-td--date {
@@ -696,10 +770,90 @@
   line-height: 1;
 }
 
+/* Repo picker (multi-root workspaces only; hidden when there is one repo) */
+.git-repo-picker-chevron {
+  font-size: 8px;
+  color: var(--nim-text-faint);
+  flex-shrink: 0;
+}
+
+.git-repo-menu {
+  min-width: 220px;
+}
+
+.git-repo-menu-branch {
+  color: var(--nim-text-faint);
+  font-size: 11px;
+  flex-shrink: 0;
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .git-branch-menu-empty {
   padding: 8px 10px;
   color: var(--nim-text-faint);
   font-style: italic;
+}
+
+/* All-repositories Changes scope: one collapsible section per repo. */
+.git-changes-all-repos {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow-y: auto;
+  flex: 1;
+}
+
+.git-changes-repo-section {
+  display: flex;
+  flex-direction: column;
+  border-bottom: 1px solid var(--nim-border);
+  min-height: 0;
+}
+
+.git-changes-repo-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 5px 8px;
+  background: var(--nim-bg-secondary);
+  border: none;
+  cursor: pointer;
+  color: var(--nim-text);
+  font-size: 11px;
+  font-weight: 600;
+  text-align: left;
+}
+
+.git-changes-repo-header:hover {
+  background: var(--nim-bg-hover);
+}
+
+.git-changes-repo-caret {
+  color: var(--nim-text-faint);
+  font-size: 9px;
+  flex-shrink: 0;
+}
+
+.git-changes-repo-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.git-changes-repo-count {
+  flex-shrink: 0;
+  min-width: 16px;
+  padding: 0 5px;
+  border-radius: 8px;
+  background: var(--nim-bg);
+  color: var(--nim-text-muted);
+  font-size: 10px;
+  font-weight: 600;
+  text-align: center;
 }
 
 /* Commit context menu */
@@ -1523,6 +1677,9 @@
   flex: 1;
   overflow-y: auto;
   padding: 8px 0;
+  /* .git-log-panel sets user-select: none; command output has to opt back in. */
+  user-select: text;
+  -webkit-user-select: text;
 }
 
 .git-output-entry {
@@ -1559,6 +1716,17 @@
   font-size: 11px;
   font-family: var(--nim-font-mono, monospace);
   flex-shrink: 0;
+}
+
+.git-output-source {
+  flex-shrink: 0;
+  padding: 0 5px;
+  border: 1px solid var(--nim-border);
+  border-radius: 4px;
+  color: var(--nim-text-muted);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
 }
 
 .git-output-command {

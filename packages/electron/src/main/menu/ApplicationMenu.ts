@@ -36,6 +36,7 @@ import {
     registerTeamManagementFocusChange,
 } from '../window/TeamManagementWindow';
 import { buildMessagesMenu } from './messagesMenu';
+import { resolveCreateAction, type CreateActionMode } from '../../shared/createActions';
 import { createAIUsageReportWindow } from '../window/AIUsageReportWindow';
 import { createDatabaseBrowserWindow } from '../window/DatabaseBrowserWindow';
 import { createDeveloperDashboardWindow } from '../window/DeveloperDashboardWindow';
@@ -64,6 +65,17 @@ import {
 import { ensureExtensionSDKDocsTrusted, getExtensionSDKDocsPath } from '../utils/workspaceDetection';
 import { database } from '../database/PGLiteDatabaseWorker';
 import { getRegisteredWalkthroughs, getRegisteredTips } from '../ipc/WalkthroughHandlers';
+import { BrowserSessionService } from '../services/BrowserSessionService';
+
+/**
+ * Applies a zoom factor to the focused window and re-positions any native
+ * browser views hosted in it. Those views live outside the renderer's CSS
+ * pixel grid, so their bounds have to be re-derived from the new factor.
+ */
+function applyZoomFactor(window: BrowserWindow, factor: number): void {
+    window.webContents.setZoomFactor(factor);
+    BrowserSessionService.getInstance().refreshBoundsForWindow(window);
+}
 
 // Create window list menu items
 function createWindowListMenu(): any[] {
@@ -298,6 +310,23 @@ export async function createApplicationMenu() {
                     }
                 },
                 {
+                    id: 'file-new-tracker-item',
+                    label: 'New Tracker Item...',
+                    accelerator: KeyboardShortcuts.file.trackerQuickCreate,
+                    click: async () => {
+                        const focusedWindow = getFocusedWindow();
+                        if (!focusedWindow) return;
+
+                        const windowId = getWindowId(focusedWindow);
+                        if (windowId === null) return;
+
+                        const state = windowStates.get(windowId);
+                        if (state?.mode !== 'workspace' || !state.workspacePath) return;
+
+                        focusedWindow.webContents.send('tracker-quick-create-open');
+                    }
+                },
+                {
                     id: 'file-new-browser-tab',
                     label: 'New Browser Tab',
                     accelerator: KeyboardShortcuts.file.newBrowserTab,
@@ -380,12 +409,27 @@ export async function createApplicationMenu() {
                         const workspaceState = getWorkspaceState(state.workspacePath);
                         const currentMode = workspaceState?.activeMode;
 
-                        if (currentMode === 'agent') {
-                            // In agent mode, create new AI session
-                            focusedWindow.webContents.send('agent-new-session');
-                        } else {
-                            // In files/plan/settings mode, create new file
-                            focusedWindow.webContents.send('file-new-in-workspace');
+                        // One resolver decides what Cmd+N makes, shared with the
+                        // title bar's create control. Before this, every mode
+                        // that was not `agent` fell through to the local-file
+                        // branch, so Cmd+N in Shared Docs opened the local file
+                        // dialog and Cmd+N in Tracker did nothing useful.
+                        const action = resolveCreateAction(currentMode as CreateActionMode);
+
+                        switch (action?.kind) {
+                            case 'session':
+                                focusedWindow.webContents.send('agent-new-session');
+                                return;
+                            case 'file':
+                                focusedWindow.webContents.send('file-new-in-workspace');
+                                return;
+                            case 'sharedDoc':
+                            case 'trackerItem':
+                                focusedWindow.webContents.send('create-in-tree', action.kind);
+                                return;
+                            default:
+                                // No tree of creatable things in this mode.
+                                return;
                         }
                     }
                 },
@@ -436,6 +480,30 @@ export async function createApplicationMenu() {
                         });
 
                         createWorkspaceManagerWindow();
+                    }
+                },
+                {
+                    id: 'file-attach-folder',
+                    label: 'Attach Folder to Workspace...',
+                    click: async () => {
+                        const focusedWindow = getFocusedWindow();
+                        if (!focusedWindow) return;
+
+                        const windowId = getWindowId(focusedWindow);
+                        if (windowId === null) return;
+
+                        const state = windowStates.get(windowId);
+                        if (state?.mode !== 'workspace' || !state.workspacePath) return;
+
+                        AnalyticsService.getInstance().sendEvent('menu_action_used', {
+                            menu: 'file',
+                            action: 'attach_folder',
+                            hasKeyboardEquivalent: false,
+                        });
+
+                        // The renderer owns the picker and the trust prompt, so
+                        // every attach entry point runs the same flow.
+                        focusedWindow.webContents.send('workspace-attach-folder-requested');
                     }
                 },
                 { type: 'separator' },
@@ -718,6 +786,18 @@ export async function createApplicationMenu() {
                         }
                     }
                 },
+                {
+                    // Same action as double-clicking a tab: collapse the active
+                    // mode's surrounding panels so the editor fills the window.
+                    label: 'Toggle Expanded Tab',
+                    accelerator: KeyboardShortcuts.view.toggleExpandedTab,
+                    click: async () => {
+                        const focused = getFocusedWindow();
+                        if (focused) {
+                            focused.webContents.send('toggle-expanded-tab');
+                        }
+                    }
+                },
                 { type: 'separator' },
                 // Navigation
                 {
@@ -769,7 +849,7 @@ export async function createApplicationMenu() {
                     accelerator: KeyboardShortcuts.view.actualSize,
                     click: async () => {
                         const focused = getFocusedWindow();
-                        if (focused) focused.webContents.setZoomFactor(1);
+                        if (focused) applyZoomFactor(focused, 1);
                     }
                 },
                 {
@@ -779,7 +859,7 @@ export async function createApplicationMenu() {
                         const focused = getFocusedWindow();
                         if (focused) {
                             const currentZoom = focused.webContents.getZoomFactor();
-                            focused.webContents.setZoomFactor(currentZoom + 0.1);
+                            applyZoomFactor(focused, currentZoom + 0.1);
                         }
                     }
                 },
@@ -797,7 +877,7 @@ export async function createApplicationMenu() {
                         const focused = getFocusedWindow();
                         if (focused) {
                             const currentZoom = focused.webContents.getZoomFactor();
-                            focused.webContents.setZoomFactor(currentZoom + 0.1);
+                            applyZoomFactor(focused, currentZoom + 0.1);
                         }
                     }
                 },
@@ -813,7 +893,7 @@ export async function createApplicationMenu() {
                         const focused = getFocusedWindow();
                         if (focused) {
                             const currentZoom = focused.webContents.getZoomFactor();
-                            focused.webContents.setZoomFactor(currentZoom + 0.1);
+                            applyZoomFactor(focused, currentZoom + 0.1);
                         }
                     }
                 },
@@ -828,7 +908,7 @@ export async function createApplicationMenu() {
                         const focused = getFocusedWindow();
                         if (focused) {
                             const currentZoom = focused.webContents.getZoomFactor();
-                            focused.webContents.setZoomFactor(currentZoom + 0.1);
+                            applyZoomFactor(focused, currentZoom + 0.1);
                         }
                     }
                 },
@@ -839,7 +919,7 @@ export async function createApplicationMenu() {
                         const focused = getFocusedWindow();
                         if (focused) {
                             const currentZoom = focused.webContents.getZoomFactor();
-                            focused.webContents.setZoomFactor(Math.max(0.5, currentZoom - 0.1));
+                            applyZoomFactor(focused, Math.max(0.5, currentZoom - 0.1));
                         }
                     }
                 },
@@ -853,7 +933,7 @@ export async function createApplicationMenu() {
                         const focused = getFocusedWindow();
                         if (focused) {
                             const currentZoom = focused.webContents.getZoomFactor();
-                            focused.webContents.setZoomFactor(Math.max(0.5, currentZoom - 0.1));
+                            applyZoomFactor(focused, Math.max(0.5, currentZoom - 0.1));
                         }
                     }
                 },

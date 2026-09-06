@@ -21,6 +21,7 @@ import { setMetaAgentToolFns } from '../mcp/metaAgentServer';
 import { computeNotificationSignature } from './metaAgentNotificationSignature';
 import { extractMessageText, extractUserPrompts } from './metaAgentMessageText';
 import type { NotificationOptions, NotificationResult } from './NotificationService';
+import type { MobilePushResult } from '@nimbalyst/runtime/sync/types';
 import { composeNotificationTitle } from '../../shared/notificationTitle';
 
 type SessionStatusValue = 'idle' | 'running' | 'waiting_for_input' | 'error' | 'interrupted';
@@ -129,6 +130,18 @@ type ShowNotificationWithResult = (
   options: NotificationOptions
 ) => Promise<NotificationResult>;
 
+/**
+ * Injected rather than imported: `SyncManager` pulls in the runtime barrel, the
+ * window manager and the Stytch client, and this service is imported by a lot of
+ * tests that have no business loading any of that.
+ */
+type RequestMobilePush = (
+  sessionId: string,
+  title: string,
+  body: string,
+  options: { force?: boolean; reason?: string }
+) => Promise<MobilePushResult | null>;
+
 /** Notification-only bound for the reinjected original task text. The stored,
  *  returned `SessionResultData.originalPrompt` value itself stays unbounded --
  *  only the text appended into a `[Child Session Update]` notification (which
@@ -185,6 +198,7 @@ export class MetaAgentService {
   private notificationSignatures = new Map<string, string>();
   private ipcHandlersRegistered = false;
   private showNotificationWithResult: ShowNotificationWithResult | null = null;
+  private requestMobilePush: RequestMobilePush | null = null;
 
   private constructor() {}
 
@@ -225,7 +239,8 @@ export class MetaAgentService {
 
   public async start(
     aiService: AIService,
-    showNotificationWithResult: ShowNotificationWithResult
+    showNotificationWithResult: ShowNotificationWithResult,
+    requestMobilePush?: RequestMobilePush
   ): Promise<void> {
     if (this.started) {
       return;
@@ -239,6 +254,7 @@ export class MetaAgentService {
     this.starting = (async () => {
       this.aiService = aiService;
       this.showNotificationWithResult = showNotificationWithResult;
+      this.requestMobilePush = requestMobilePush ?? null;
       this.sessionManager = new SessionManager();
       await this.sessionManager.initialize();
 
@@ -255,8 +271,8 @@ export class MetaAgentService {
           this.getSessionResultJson(targetSessionId, workspaceId, options),
         listQueuedPrompts: (_metaSessionId, workspaceId, targetSessionId, options) =>
           this.listQueuedPromptsJson(targetSessionId, workspaceId, options),
-        sendPrompt: (metaSessionId, workspaceId, targetSessionId, prompt) =>
-          this.sendPromptToSession(metaSessionId, targetSessionId, workspaceId, prompt),
+        sendPrompt: (metaSessionId, workspaceId, targetSessionId, prompt, interrupt) =>
+          this.sendPromptToSession(metaSessionId, targetSessionId, workspaceId, prompt, interrupt),
         notifyUser: (callerSessionId, workspaceId, args) =>
           this.notifyUserJson(callerSessionId, workspaceId, args),
         respondToPrompt: (_metaSessionId, workspaceId, args) =>
@@ -960,11 +976,22 @@ export class MetaAgentService {
     }, null, 2);
   }
 
+  /**
+   * Queue a prompt for another session, optionally stopping whatever that
+   * session is doing first.
+   *
+   * `interrupt` is the tool-side twin of the transcript's send-now lightning
+   * bolt (SessionTranscript.handleSendNowQueuedPrompt): stop the turn, then
+   * drive the queue. Like the button, it drains FIFO -- if the target already
+   * has pending rows, the interrupt delivers the oldest one, not necessarily
+   * this prompt.
+   */
   private async sendPromptToSession(
     originSessionId: string,
     sessionId: string,
     workspaceId: string,
     prompt: string,
+    interrupt = false,
   ): Promise<string> {
     if (!this.aiService) {
       throw new Error('AI service not initialized');
@@ -996,10 +1023,14 @@ export class MetaAgentService {
         prompt: normalizedPrompt,
         statusBeforeQueue,
         processingTriggered: false,
+        interrupted: false,
         bypassedExecutionForTest: true,
       }, null, 2);
     }
 
+    // Queue before interrupting: the drive that follows the interrupt has to
+    // find this row, and an interrupt that lands first would just idle the
+    // session with nothing waiting for it.
     const queued = await this.aiService.queuePromptForSession(
       sessionId,
       normalizedPrompt,
@@ -1007,12 +1038,36 @@ export class MetaAgentService {
       { promptProvenance },
     );
     const status = (statusRow?.status || 'idle') as SessionStatusValue;
-    const processingTriggered = status === 'idle' || status === 'interrupted' || status === 'error';
+    const workspaceForDrive = session.worktreePath || session.workspacePath || workspaceId;
+    const idleEnoughToDrive = status === 'idle' || status === 'interrupted' || status === 'error';
+    const interruptSkippedReason = interrupt
+      ? this.reasonToSkipInterrupt(status, session.provider)
+      : null;
+    const shouldInterrupt = interrupt && !interruptSkippedReason;
 
-    if (processingTriggered) {
+    let processingTriggered = idleEnoughToDrive;
+    let interrupted = false;
+    let interruptMethod: string | null = null;
+    let driveOutcome: string | null = null;
+
+    if (shouldInterrupt) {
+      const result = await this.aiService.interruptCurrentTurn(sessionId);
+      interrupted = result.success;
+      interruptMethod = result.method ?? null;
+      // The drive runs even when the interrupt found no live provider: a session
+      // that only nominally reports running has nothing else coming to trigger it.
+      //
+      // 'send-now' rather than 'meta-agent' so a closed project window can be
+      // opened to receive the prompt, matching the lightning bolt.
+      const outcome = await this.aiService.driveQueuedPrompts(sessionId, workspaceForDrive, 'send-now');
+      driveOutcome = outcome.kind;
+      // A deferred drive is not a failure: the interrupt may not have settled
+      // yet, and the driver arms a session-idle wake to dispatch when it does.
+      processingTriggered = outcome.kind === 'dispatched';
+    } else if (idleEnoughToDrive) {
       await this.aiService.triggerQueuedPromptProcessingForSession(
         sessionId,
-        session.worktreePath || session.workspacePath || workspaceId,
+        workspaceForDrive,
         'meta-agent'
       );
     }
@@ -1023,7 +1078,32 @@ export class MetaAgentService {
       prompt: queued.prompt,
       statusBeforeQueue: status,
       processingTriggered,
+      interrupted,
+      ...(interruptMethod ? { interruptMethod } : {}),
+      ...(interruptSkippedReason ? { interruptSkippedReason } : {}),
+      ...(driveOutcome ? { driveOutcome } : {}),
     }, null, 2);
+  }
+
+  /**
+   * Why an `interrupt: true` request must not actually interrupt.
+   *
+   * - `waiting_for_input`: the session is parked on an interactive prompt.
+   *   Interrupting aborts the question instead of answering it; the caller
+   *   wants respond_to_prompt.
+   * - `claude-code-cli`: a terminal-backed session drains its queue through the
+   *   CLI flush path, not the provider queue driver. The transcript hides the
+   *   lightning bolt for these for the same reason.
+   * - Already idle: there is no turn in the way, so the ordinary drive applies.
+   */
+  private reasonToSkipInterrupt(
+    status: SessionStatusValue,
+    provider: string | undefined,
+  ): string | null {
+    if (provider === 'claude-code-cli') return 'terminal-session';
+    if (status === 'waiting_for_input') return 'waiting-for-input';
+    if (status === 'idle' || status === 'interrupted' || status === 'error') return 'session-not-running';
+    return null;
   }
 
   private async notifyUserJson(
@@ -1056,6 +1136,7 @@ export class MetaAgentService {
     const result = await this.showNotificationWithResult({
       title: composeNotificationTitle(sourceLabel, title),
       body: boundedBody,
+      kind: 'agent-complete',
       sessionId: targetSessionId,
       workspacePath: session.workspacePath,
       sourceLabel,
@@ -1065,10 +1146,27 @@ export class MetaAgentService {
       urgency: args.urgency || 'normal',
     });
 
+    // Forced (#1268): `urgency: 'critical'` is the agent saying the human is
+    // needed now, which is exactly the case the server's presence suppression
+    // must not swallow. Anything below critical stays desktop-only.
+    const isUrgent = args.urgency === 'critical';
+    let mobilePush: MobilePushResult | null = null;
+    if (isUrgent && this.requestMobilePush) {
+      try {
+        mobilePush = await this.requestMobilePush(targetSessionId, sourceLabel, boundedBody, {
+          force: true,
+          reason: 'notify_urgent',
+        });
+      } catch (err) {
+        console.warn('[MetaAgentService] notify_user mobile push failed:', err);
+      }
+    }
+
     return JSON.stringify({
       tool: 'notify_user',
-      deliveryChannel: 'os_notification',
-      mobilePushAttempted: false,
+      deliveryChannel: mobilePush ? 'os_notification+mobile_push' : 'os_notification',
+      mobilePushAttempted: mobilePush !== null,
+      mobilePush: mobilePush ?? undefined,
       sessionId: targetSessionId,
       bypassFocusCheck: args.bypassFocusCheck === true,
       result,
@@ -1390,7 +1488,13 @@ export class MetaAgentService {
     let editedFiles: string[] = [];
     try {
       const fileLinks = await SessionFilesRepository.getFilesBySession(sessionId, 'edited');
-      editedFiles = fileLinks.map((file: any) => this.stripWorkspacePath(file.filePath, workspaceId));
+      // #1244: these rows are the per-edit-EVENT history (deduped upstream on
+      // toolUseId, not on path), so a file edited twenty times appears twenty
+      // times. Consumers here want the set of files touched -- collapse to
+      // unique paths, keeping first-edit order.
+      editedFiles = [
+        ...new Set(fileLinks.map((file: any) => this.stripWorkspacePath(file.filePath, workspaceId))),
+      ];
     } catch {
       editedFiles = [];
     }

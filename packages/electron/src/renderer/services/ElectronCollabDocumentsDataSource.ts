@@ -19,12 +19,15 @@ import {
   type TeamSyncConfig,
 } from '@nimbalyst/runtime/sync';
 import { asTeamMemberId } from '@nimbalyst/runtime/auth/jwtScopes';
-import { createProxiedWebSocket } from '../utils/proxiedWebSocket';
+import { appendCollabUrlQuery, createProxiedWebSocket } from '../utils/proxiedWebSocket';
+import { teamMemberDisplayName } from '../utils/teamMemberDisplayName';
 
 export interface ElectronCollabDocumentsDataSourceEvents {
   observeStatus?: (status: ReturnType<TeamSyncProvider['getStatus']>, error?: unknown) => void;
   onOrgSettingsUpdated?: NonNullable<TeamSyncConfig['onOrgSettingsUpdated']>;
   onConversationDescriptorUpdated?: NonNullable<TeamSyncConfig['onConversationDescriptorUpdated']>;
+  onFeedbackIndexLoaded?: NonNullable<TeamSyncConfig['onFeedbackIndexLoaded']>;
+  onFeedbackIndexChanged?: NonNullable<TeamSyncConfig['onFeedbackIndexChanged']>;
   onMemberAdded?: NonNullable<TeamSyncConfig['onMemberAdded']>;
   onMemberRemoved?: NonNullable<TeamSyncConfig['onMemberRemoved']>;
   onMemberRoleChanged?: NonNullable<TeamSyncConfig['onMemberRoleChanged']>;
@@ -79,6 +82,7 @@ function mapMember(member: TeamMemberInfo): TeamMemberSummary {
   return {
     memberId: asTeamMemberId(member.userId),
     email: member.email,
+    name: teamMemberDisplayName(member),
     role: member.role,
   };
 }
@@ -88,6 +92,7 @@ export class ElectronCollabDocumentsDataSource implements CollabDocsDataSource {
   private readonly listeners = new Set<(
     change: CollabDataChange<SharedDocument, SharedFolder>,
   ) => void>();
+  private readonly memberListeners = new Set<() => void>();
   private readonly provider: TeamSyncProvider;
   private readonly observeStatus?: ElectronCollabDocumentsDataSourceEvents['observeStatus'];
   private connectPromise: Promise<void> | null = null;
@@ -101,11 +106,11 @@ export class ElectronCollabDocumentsDataSource implements CollabDocsDataSource {
       type: 'snapshot',
       snapshot: this.currentSnapshot(),
     });
-    const config: TeamSyncConfig = {
+    const baseConfig: TeamSyncConfig = {
       serverUrl: scope.indexConfig.serverUrl,
       orgId: scope.orgId,
       teamProjectId: scope.indexConfig.teamProjectId,
-      userId: scope.indexConfig.userId,
+      teamMemberId: scope.indexConfig.teamMemberId,
       getJwt: options.getJwt,
       onTeamStateLoaded: emitSnapshot,
       onDocumentsLoaded: emitSnapshot,
@@ -135,8 +140,31 @@ export class ElectronCollabDocumentsDataSource implements CollabDocsDataSource {
       // desktop collab socket. A browser WebSocket sends an Origin header the
       // sync server rejects for non-allowlisted origins (the dev renderer's
       // http://localhost:5273), which surfaces as an opaque 1006 close.
-      ...(hasWebSocketProxy() ? { createWebSocket: createProxiedWebSocket } : {}),
+      ...(hasWebSocketProxy()
+        ? {
+            createWebSocket: (url: string) => createProxiedWebSocket(
+              appendCollabUrlQuery(url, scope.indexConfig.urlExtraQuery),
+            ),
+          }
+        : {}),
       ...providerEvents,
+    };
+    // The member directory is only populated once the team room replies, and
+    // then mutates for the rest of the session. Wrap the four callbacks that
+    // move it AFTER the `providerEvents` spread, so a host's own handlers
+    // (which the spread installs) still run alongside the notification.
+    const alsoNotifyMembers = <TArgs extends unknown[]>(
+      handler: ((...args: TArgs) => void) | undefined,
+    ) => (...args: TArgs) => {
+      handler?.(...args);
+      for (const listener of this.memberListeners) listener();
+    };
+    const config: TeamSyncConfig = {
+      ...baseConfig,
+      onTeamStateLoaded: alsoNotifyMembers(baseConfig.onTeamStateLoaded),
+      onMemberAdded: alsoNotifyMembers(baseConfig.onMemberAdded),
+      onMemberRemoved: alsoNotifyMembers(baseConfig.onMemberRemoved),
+      onMemberRoleChanged: alsoNotifyMembers(baseConfig.onMemberRoleChanged),
     };
     this.provider = (options.createProvider ?? ((providerConfig) => (
       new TeamSyncProvider(providerConfig)
@@ -159,8 +187,20 @@ export class ElectronCollabDocumentsDataSource implements CollabDocsDataSource {
     return this.provider.getStatus();
   }
 
-  getMembers(): TeamMemberSummary[] {
+  /**
+   * Connect first: team state (and with it the member directory) is null until
+   * the room replies, so reading the snapshot without connecting returns an
+   * empty directory that never fills in. Pair with `onMembersChanged` — the
+   * connect resolves as soon as the socket exists, not when the reply lands.
+   */
+  async getMembers(): Promise<TeamMemberSummary[]> {
+    await this.ensureConnected();
     return (this.provider.getTeamState()?.members ?? []).map(mapMember);
+  }
+
+  onMembersChanged(cb: () => void): () => void {
+    this.memberListeners.add(cb);
+    return () => { this.memberListeners.delete(cb); };
   }
 
   /** Compatibility seam for editor/comment providers until step 4 moves UI. */

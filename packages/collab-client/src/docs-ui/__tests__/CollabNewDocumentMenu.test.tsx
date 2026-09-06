@@ -32,7 +32,6 @@ function descriptor(
       sharedCreate: ready,
       history: ready,
       export: ready,
-      embed: false,
       ...(ready ? {} : { disabledReason: `${displayName} is pending collaborative support.` }),
     },
   };

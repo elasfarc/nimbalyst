@@ -33,6 +33,9 @@ export type ClientMessage =
   | SessionControlCommandMessage
   | RegisterPushTokenMessage
   | UnregisterPushTokenMessage
+  | RegisterLiveActivityTokenMessage
+  | UnregisterLiveActivityTokenMessage
+  | FleetActivityUpdateMessage
   | RequestMobilePushMessage
   | ProjectConfigUpdateMessage
   | SettingsSyncMessage
@@ -138,6 +141,8 @@ export interface DeviceAnnounceMessage {
 export interface CreateSessionRequestMessage {
   type: 'createSessionRequest';
   request: EncryptedCreateSessionRequest;
+  /** Execute on this host only. Absent preserves legacy untargeted routing. */
+  targetDeviceId?: string;
 }
 
 /** Response to session creation request from desktop */
@@ -182,6 +187,8 @@ export interface EncryptedCreateSessionResponse {
 export interface CreateWorktreeRequestMessage {
   type: 'createWorktreeRequest';
   request: EncryptedCreateWorktreeRequest;
+  /** Execute on this host only. Absent preserves legacy untargeted routing. */
+  targetDeviceId?: string;
 }
 
 /** Response to worktree creation request from desktop */
@@ -254,6 +261,10 @@ export interface SessionControlMessage {
   payload?: Record<string, unknown>;
   timestamp: number;
   sentBy: 'desktop' | 'mobile';
+  /** Stable ID of the sending device. Absent on legacy clients. */
+  sentByDeviceId?: string;
+  /** Deliver to this device only. Absent preserves legacy broadcast routing. */
+  targetDeviceId?: string;
 }
 
 /** Register a push notification token for this device */
@@ -270,6 +281,116 @@ export interface UnregisterPushTokenMessage {
   deviceId: string;
 }
 
+/**
+ * Which ActivityKit token this is.
+ *
+ * They are not interchangeable and they are not the device token either. A
+ * push-to-start token belongs to the app and lets the server create an activity
+ * on a phone whose owner has not opened the app; an update token belongs to one
+ * live activity and dies with it. Sending a content-state update to a
+ * push-to-start token, or a start payload to an update token, fails at APNs with
+ * an error that reads like a bad token — so the kinds are stored separately and
+ * never merged.
+ */
+export type LiveActivityTokenKind = 'pushToStart' | 'update';
+
+/**
+ * Register an ActivityKit push token for the Live Activity lane.
+ *
+ * Deliberately a different message from `registerPushToken`: the alert lane and
+ * the Live Activity lane use different APNs topics and different payload shapes,
+ * and conflating the two kinds of token server-side would send fleet updates to
+ * the alert channel or vice versa.
+ */
+export interface RegisterLiveActivityTokenMessage {
+  type: 'registerLiveActivityToken';
+  token: string;
+  kind: LiveActivityTokenKind;
+  deviceId: string;
+  /** Only iOS has Live Activities today; carried so the server never has to guess. */
+  platform: 'ios';
+  /** `development` uses the APNs sandbox host. Absent means production. */
+  environment?: 'development' | 'production';
+}
+
+/**
+ * Drop a Live Activity token.
+ *
+ * Sent when the activity ends, when the user turns the feature off, and when the
+ * phone notices its own activity is gone. Omitting `kind` drops both kinds for
+ * the device, which is what turning the feature off means.
+ */
+export interface UnregisterLiveActivityTokenMessage {
+  type: 'unregisterLiveActivityToken';
+  deviceId: string;
+  kind?: LiveActivityTokenKind;
+}
+
+/**
+ * One row on the Live Activity card.
+ *
+ * Plaintext, like the existing push titles: the plan settled that lock-screen
+ * exposure of session names rather than coarsening to counts-plus-project.
+ */
+export interface FleetActivityRow {
+  sessionId: string;
+  title: string;
+  /** Workspace basename. The card has no room for a path. */
+  project: string;
+  state: 'approval' | 'decision' | 'failed' | 'stalled';
+  /** Epoch ms this session entered `state`; the phone ticks the elapsed time itself. */
+  since: number;
+}
+
+/**
+ * The whole ambient fleet, as the phone renders it.
+ *
+ * The same derived value the macOS menu bar strip renders, so the two surfaces
+ * cannot disagree. `revision` is monotonic per desktop process and lets the
+ * server (and the phone) drop an update that arrives out of order.
+ */
+export interface FleetActivitySnapshot {
+  running: number;
+  needsApproval: number;
+  needsDecision: number;
+  failed: number;
+  stalled: number;
+  unread: number;
+  /** Ranked, at most three. Empty means nothing is waiting on the user. */
+  rows: FleetActivityRow[];
+  /** Waiting sessions that did not fit in `rows`. */
+  overflow: number;
+  revision: number;
+  /** Epoch ms the desktop generated this. */
+  updatedAt: number;
+  /** How long after `updatedAt` the card should dim itself. */
+  staleAfterMs: number;
+}
+
+/**
+ * Desktop -> server: the fleet changed, update the Live Activity.
+ *
+ * Coalesced on the desktop — this arrives on transitions, not on streaming
+ * ticks. The server decides between starting, updating and ending an activity
+ * from the payload and the tokens it holds.
+ */
+export interface FleetActivityUpdateMessage {
+  type: 'fleetActivityUpdate';
+  activity: FleetActivitySnapshot;
+  /**
+   * Whether this desktop is itself displaying the fleet right now.
+   *
+   * Deliberately on the message rather than on the snapshot: it is routing
+   * metadata, not card content, and the snapshot is sent verbatim to the phone
+   * as `content-state`. The server pairs this with its own presence check
+   * before suppressing the card — a Mac that says it is showing the strip but
+   * that nobody is sitting at should not silence the phone. Absent from older
+   * desktops, and absent means "not showing", which preserves the previous
+   * always-publish behaviour.
+   */
+  shownOnDesktop?: boolean;
+}
+
 /** Request to send a push notification to mobile devices */
 export interface RequestMobilePushMessage {
   type: 'requestMobilePush';
@@ -278,6 +399,20 @@ export interface RequestMobilePushMessage {
   body: string;
   /** Device ID of the requesting device, used for active-device routing */
   requestingDeviceId?: string;
+  /**
+   * Correlates the `mobilePushResult` frame with this request. Absent on older
+   * clients, and the server only acknowledges when it is present — an unknown
+   * discriminator is a decoding risk for clients that predate the result frame.
+   */
+  requestId?: string;
+  /**
+   * Explicit user-authorized attention request. Bypasses presence suppression:
+   * the notification is delivered even when the user is demonstrably at another
+   * device. Subject to a server-side rate limit.
+   */
+  force?: boolean;
+  /** Short machine-readable cause, for rate limiting and audit. */
+  reason?: string;
 }
 
 /** Update project config (encrypted blob with commands, etc.) */
@@ -390,6 +525,7 @@ export type ServerMessage =
   | SettingsSyncBroadcastMessage
   | ReadReceiptSyncBroadcastMessage
   | TrackerPersonalStateSyncBroadcastMessage
+  | MobilePushResultMessage
   | ErrorMessage;
 
 /** Response to syncRequest */
@@ -484,6 +620,8 @@ export interface DeviceLeftMessage {
 export interface CreateSessionRequestBroadcastMessage {
   type: 'createSessionRequestBroadcast';
   request: EncryptedCreateSessionRequest;
+  /** Host selected to execute this request. */
+  targetDeviceId?: string;
   fromConnectionId?: string;
 }
 
@@ -498,6 +636,8 @@ export interface CreateSessionResponseBroadcastMessage {
 export interface CreateWorktreeRequestBroadcastMessage {
   type: 'createWorktreeRequestBroadcast';
   request: EncryptedCreateWorktreeRequest;
+  /** Host selected to execute this request. */
+  targetDeviceId?: string;
   fromConnectionId?: string;
 }
 
@@ -550,6 +690,42 @@ export interface TrackerPersonalStateSyncBroadcastMessage {
   fromConnectionId?: string;
 }
 
+/** Why a reachable device was not sent a given push. */
+export type SkipReason =
+  /** The device that asked for the push. */
+  | 'requesting_device'
+  /** Connected, foreground, and recently used — the user is already looking at it. */
+  | 'device_present'
+  /** APNs/FCM rejected the token; the server drops it. */
+  | 'bad_token'
+  /** The push provider failed for this token. */
+  | 'send_failed';
+
+/** Why a push request produced no delivery at all. */
+export type PushRejectionCause =
+  | 'no_registered_tokens'
+  | 'rate_limited'
+  | 'suppressed_active_device'
+  | 'unknown_session'
+  | 'provider_error'
+  /** Client-side only: no result frame arrived before the timeout. */
+  | 'no_ack';
+
+/**
+ * Acknowledgement for a `requestMobilePush`. Sent only when the request carried
+ * a `requestId`, so it is strictly opt-in for older clients.
+ */
+export interface MobilePushResultMessage {
+  type: 'mobilePushResult';
+  requestId: string;
+  sessionId: string;
+  accepted: boolean;
+  attemptedCount: number;
+  deliveredCount: number;
+  skipped: Array<{ deviceId: string; reason: SkipReason }>;
+  rejection?: PushRejectionCause;
+}
+
 /** Error response */
 export interface ErrorMessage {
   type: 'error';
@@ -571,7 +747,7 @@ export interface DeviceInfo {
   /** Human-readable device name (e.g., "MacBook Pro", "iPhone 15") */
   name: string;
   /** Device type for icon display */
-  type: 'desktop' | 'mobile' | 'tablet' | 'unknown';
+  type: 'desktop' | 'mobile' | 'tablet' | 'headless' | 'unknown';
   /** Platform (e.g., "macos", "ios", "windows", "android", "web") */
   platform: string;
   /** App version */
@@ -666,6 +842,8 @@ export interface SessionIndexEntry {
   sessionType?: string;
   /** Worktree ID for git worktree association (plaintext UUID) */
   worktreeId?: string;
+  /** Device that owns execution for this session (plaintext stable device ID). */
+  hostDeviceId?: string;
   /** Agent role marker (e.g. 'meta-agent', 'standard'). Plaintext - drives mobile meta-agent grouping. */
   agentRole?: string;
   /** Meta-agent parent session ID for spawned children (plaintext UUID). Drives mobile meta-agent grouping. */

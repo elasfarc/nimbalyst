@@ -14,6 +14,13 @@ export interface CollabDocumentState {
   replica?: LocalDocumentReplicaState;
   transport: DocumentSyncStatus;
   outbox: LocalDocumentReplicaOutboxState;
+  /**
+   * A remote update reached this client and was applied to the Y.Doc, but the
+   * editor binding threw while rendering it. The socket stays open and presence
+   * keeps flowing, so without this flag the document reports itself fully
+   * synced while silently showing stale content.
+   */
+  renderFailed?: boolean;
 }
 
 export type CollabProductStatusKind =
@@ -23,6 +30,7 @@ export type CollabProductStatusKind =
   | 'offline-safe'
   | 'replaying'
   | 'access-changed'
+  | 'not-receiving-changes'
   | 'local-copy-damaged'
   | 'local-saving-unavailable';
 
@@ -84,21 +92,28 @@ export function deriveCollabProductStatus(
       showRejectedActions: true,
     };
   }
-  if (state.outbox === 'replaying' || state.transport === 'replaying') {
+  // Must outrank the connected/'Synced' branch below. A binding failure leaves
+  // the socket healthy and the outbox clean, so every remaining check would
+  // report this document as fully synced while it silently stops showing other
+  // people's edits, which is the exact way this failure goes unnoticed.
+  if (state.renderFailed) {
     return {
-      kind: 'replaying',
-      label: 'Syncing offline changes…',
-      detail: null,
-      severity: 'info',
-      showPresence: false,
+      kind: 'not-receiving-changes',
+      label: 'Not showing other people’s changes',
+      detail: 'Edits from collaborators are arriving but cannot be displayed. Reopen this document; if it persists, avoid editing to prevent conflicting with changes you cannot see.',
+      severity: 'error',
+      showPresence: state.transport === 'connected',
       showRejectedActions: false,
     };
   }
-  // A pending outbox while connected is normal in-flight typing (every
-  // keystroke enqueues durably, the server ack clears it moments later).
-  // Surfacing it flip-flopped the pill between "Synced" and "Syncing…" on
-  // every keystroke. A genuine post-reconnect backlog reports the distinct
-  // outbox 'replaying' state, which is handled above.
+  // Any outbox work while connected is normal in-flight typing: every
+  // keystroke walks the outbox clean -> pending -> in-flight -> clean, and
+  // in-flight reports as outbox 'replaying'. Surfacing either state
+  // flip-flopped the pill between "Synced" and "Syncing…" and unmounted the
+  // presence avatars on every character. A genuine post-reconnect backlog is
+  // reported by the transport itself as 'replaying' (the provider only
+  // surfaces that status when the replay started from a non-connected
+  // socket), so the connected check has to come first.
   if (state.transport === 'connected') {
     return {
       kind: 'synced',
@@ -106,6 +121,16 @@ export function deriveCollabProductStatus(
       detail: null,
       severity: 'success',
       showPresence: true,
+      showRejectedActions: false,
+    };
+  }
+  if (state.outbox === 'replaying' || state.transport === 'replaying') {
+    return {
+      kind: 'replaying',
+      label: 'Syncing offline changes…',
+      detail: null,
+      severity: 'info',
+      showPresence: false,
       showRejectedActions: false,
     };
   }

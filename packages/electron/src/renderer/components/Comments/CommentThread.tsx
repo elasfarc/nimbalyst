@@ -42,6 +42,7 @@ import {
   hydrateConversationDraftInputAtom,
   setConversationDraftInputAtom,
 } from '../../store/atoms/conversations';
+import { conversationPendingAgentSessionsAtomFamily } from '../../store/atoms/teamInbox';
 
 /** Stable identity, so an absent `activity` prop does not churn the timeline memo. */
 const NO_ACTIVITY: ActivityView[] = [];
@@ -249,6 +250,9 @@ export function CommentThread({
 
   const previews = useResourcePreviews(allRefs, resolver);
   const clock = now ?? Date.now();
+  const pendingAgentSessions = useAtomValue(
+    conversationPendingAgentSessionsAtomFamily(context.conversationId ?? ''),
+  );
 
   const byId = useMemo(() => new Map(comments.map((comment) => [comment.ref.commentId, comment])), [comments]);
 
@@ -265,9 +269,10 @@ export function CommentThread({
           pending: pendingKeys.has(comment.ref.commentId),
           pendingLabel: pendingKeys.has(comment.ref.commentId) ? 'Sending' : undefined,
           failed: failedKeys.has(comment.ref.commentId),
+          pendingAgentSessionIds: pendingAgentSessions[comment.ref.commentId],
         }),
       ),
-    [byId, clock, comments, directory, failedKeys, pendingKeys, previews, reactionsSupported, viewerUserId],
+    [byId, clock, comments, directory, failedKeys, pendingAgentSessions, pendingKeys, previews, reactionsSupported, viewerUserId],
   );
 
   /**

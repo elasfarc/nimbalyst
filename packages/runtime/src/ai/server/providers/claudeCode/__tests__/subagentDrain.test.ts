@@ -1,7 +1,11 @@
+// @vitest-environment node
 import { describe, it, expect } from 'vitest';
 import {
   hasRunningTasks,
   shouldDeferTeardownForSubagents,
+  resolvePromptEndDelay,
+  resolveShellDrainMs,
+  DEFAULT_SHELL_DRAIN_MS,
   shouldExitDrain,
   classifyDrainOutcome,
   shouldSettleTaskFromToolResult,
@@ -213,6 +217,20 @@ describe('shouldContinueWithTaskResults', () => {
     ).toBe(false);
   });
 
+  // Regression: GitHub #1355. A background shell (local_bash) streams no chunks
+  // while it runs, so the drain grace timer never resets and closes stdin after
+  // its window — the CLI then kills the shell and reports it 'stopped'. That is
+  // OUR teardown, not a user stop, but it took the same silent path: the session
+  // woke with no message at all and neither the agent nor the user could tell
+  // "killed" from "stopped". A killed-by-teardown task must be reported.
+  it('continues for a task our own teardown killed, unlike a user stop', () => {
+    expect(
+      shouldContinueWithTaskResults('resolved', [
+        { taskId: 'b1', description: 'gh run watch', status: 'stopped', killedByTeardown: true },
+      ]),
+    ).toBe(true);
+  });
+
   it('does not continue when the drain did not resolve cleanly', () => {
     expect(
       shouldContinueWithTaskResults('aborted', [
@@ -241,6 +259,26 @@ describe('buildTaskResultContinuationMessage', () => {
     expect(msg).toContain('/tmp/tasks/b1.output');
     expect(msg).not.toContain('stopped watcher');
   });
+
+  // #1355: name the cause instead of leaving a bare "stopped". The agent reads
+  // this to decide whether to re-run the work — an ambiguous status caused a
+  // duplicate paid re-run in the reporter's workspace.
+  it('reports a teardown kill as killed, names the grace window, and keeps a user stop out', () => {
+    const msg = buildTaskResultContinuationMessage([
+      {
+        taskId: 'b1',
+        description: 'gh run watch 32603089993',
+        status: 'stopped',
+        killedByTeardown: true,
+        outputFile: '/tmp/tasks/b1.output',
+      },
+      { taskId: 'b2', description: 'user stopped watcher', status: 'stopped' },
+    ]);
+    expect(msg).toContain('gh run watch 32603089993');
+    expect(msg).toContain('killed');
+    expect(msg).toContain('/tmp/tasks/b1.output');
+    expect(msg).not.toContain('user stopped watcher');
+  });
 });
 
 describe('hasRunningTasks', () => {
@@ -258,6 +296,71 @@ describe('shouldDeferTeardownForSubagents', () => {
   it('defers only while a sub-agent is still running', () => {
     expect(shouldDeferTeardownForSubagents(true)).toBe(true);
     expect(shouldDeferTeardownForSubagents(false)).toBe(false);
+  });
+});
+
+describe('resolvePromptEndDelay', () => {
+  const WINDOWS = { idle: 30_000, subagent: 300_000, shell: 1_800_000 };
+
+  it('uses the short idle window when nothing is running', () => {
+    expect(resolvePromptEndDelay([], WINDOWS)).toBe(30_000);
+    expect(
+      resolvePromptEndDelay(
+        [{ status: 'completed', taskType: 'local_bash' }, { status: 'stopped' }],
+        WINDOWS,
+      ),
+    ).toBe(30_000);
+  });
+
+  it('uses the sub-agent stall window for running sub-agents', () => {
+    expect(resolvePromptEndDelay([{ status: 'running' }], WINDOWS)).toBe(300_000);
+    expect(
+      resolvePromptEndDelay([{ status: 'running', taskType: 'agent' }], WINDOWS),
+    ).toBe(300_000);
+  });
+
+  // Regression: GitHub #1355. A local_bash task streams no chunks while it runs,
+  // so it never reset the grace timer and the 5-minute sub-agent window killed
+  // every background shell that outran it.
+  it('uses the long shell window for a running background shell', () => {
+    expect(
+      resolvePromptEndDelay([{ status: 'running', taskType: 'local_bash' }], WINDOWS),
+    ).toBe(1_800_000);
+  });
+
+  it('takes the max so a stalled sub-agent cannot cut short a live shell', () => {
+    expect(
+      resolvePromptEndDelay(
+        [{ status: 'running' }, { status: 'running', taskType: 'local_bash' }],
+        WINDOWS,
+      ),
+    ).toBe(1_800_000);
+  });
+
+  it('ignores a settled shell so it stops holding the stream open', () => {
+    expect(
+      resolvePromptEndDelay(
+        [{ status: 'completed', taskType: 'local_bash' }, { status: 'running' }],
+        WINDOWS,
+      ),
+    ).toBe(300_000);
+  });
+});
+
+describe('resolveShellDrainMs', () => {
+  it('defaults to 30 minutes', () => {
+    expect(resolveShellDrainMs({})).toBe(DEFAULT_SHELL_DRAIN_MS);
+    expect(DEFAULT_SHELL_DRAIN_MS).toBe(1_800_000);
+  });
+
+  it('honors a positive override', () => {
+    expect(resolveShellDrainMs({ NIMBALYST_CC_SHELL_DRAIN_MS: '5000' })).toBe(5000);
+  });
+
+  it('falls back on a non-numeric or non-positive override', () => {
+    expect(resolveShellDrainMs({ NIMBALYST_CC_SHELL_DRAIN_MS: 'soon' })).toBe(DEFAULT_SHELL_DRAIN_MS);
+    expect(resolveShellDrainMs({ NIMBALYST_CC_SHELL_DRAIN_MS: '0' })).toBe(DEFAULT_SHELL_DRAIN_MS);
+    expect(resolveShellDrainMs({ NIMBALYST_CC_SHELL_DRAIN_MS: '-1' })).toBe(DEFAULT_SHELL_DRAIN_MS);
   });
 });
 

@@ -9,15 +9,17 @@
  */
 
 import React, { useCallback, useState, useEffect, useRef, useMemo, forwardRef, useImperativeHandle } from 'react';
-import { useAtomValue } from 'jotai';
+import { useAtomValue, useSetAtom } from 'jotai';
+import { setTitleBarCreateMenuAtom } from '../../store/atoms/titleBarCreate';
 import type { CollabScope } from '@nimbalyst/collab-client/core';
 import { createCollabDocsScopeLifecycle } from '@nimbalyst/collab-client/docs';
 import { store } from '@nimbalyst/runtime/store';
-import { CollabSidebar } from '@nimbalyst/collab-client/docs-ui';
+import { CollabSidebar, type CollabSidebarCreateMenu } from '@nimbalyst/collab-client/docs-ui';
 import { ElectronCollabDocsUIProvider } from './ElectronCollabDocsUIProvider';
 import { TabsProvider, useTabsActions, useTabs, useTabNavigationShortcuts, type TabData } from '../../contexts/TabsContext';
 import { TabManager } from '../TabManager/TabManager';
 import { TabContent } from '../TabContent/TabContent';
+import type { DocumentSessionActions } from '../TabEditor/DocumentSessionControl';
 import { ChatSidebar, type ChatSidebarRef } from '../ChatSidebar';
 import { useEditorMaximize } from '../../hooks/useEditorMaximize';
 import { useResizeDragShield } from '../../hooks/useResizeDragShield';
@@ -45,7 +47,7 @@ import {
 } from '../../store/atoms/collabDocuments';
 import { changedDocIdsAtom } from '../../store/atoms/collabDiscovery';
 import { SHARED_HOME_TAB_URI, SHARED_HOME_TAB_TITLE, isSharedHomeTab } from './sharedHomeTab';
-import { isCollabUri, parseCollabUri } from '../../utils/collabUri';
+import { isCollabUri, parseCollabUri } from '@nimbalyst/collab-protocol';
 import {
   getCollabNodeName,
   getSharedDocumentDisplayName,
@@ -54,7 +56,7 @@ import {
   reconcileSharedDocumentDisplayName,
 } from './collabTree';
 import { errorNotificationService } from '../../services/ErrorNotificationService';
-import type { SerializableDocumentContext } from '../../hooks/useDocumentContext';
+import { collabFileType, type SerializableDocumentContext } from '../../hooks/useDocumentContext';
 import { getTextSelection } from '../UnifiedAI/TextSelectionIndicator';
 import { getActiveEditorContextItems } from '../../stores/editorContextStore';
 import { categorizeTeamAnalyticsError, toStableAnalyticsCategory } from '../../../shared/analytics/teamAnalytics';
@@ -77,7 +79,10 @@ export interface CollabModeRef {
   getActiveDocumentPath: () => string | null;
   toggleSidebarCollapsed: () => void;
   toggleChatCollapsed: () => void;
+  toggleEditorMaximized: () => void;
   createNewChatSession: () => Promise<void>;
+  /** Creates a shared Markdown doc in the sidebar's current target folder. */
+  createNewDocument: () => void;
 }
 
 export const CollabMode = forwardRef<CollabModeRef, CollabModeProps>(function CollabMode({
@@ -213,6 +218,39 @@ export const CollabModeInner = forwardRef<CollabModeRef, CollabModeInnerProps>(f
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [chatCollapsed, setChatCollapsed] = useState(false);
   const chatSidebarRef = useRef<ChatSidebarRef>(null);
+  /**
+   * The sidebar builds the shared-document type list (it owns the catalog
+   * filtering); this republishes it for the title bar's create control.
+   */
+  const setTitleBarCreateMenu = useSetAtom(setTitleBarCreateMenuAtom);
+  const createPrimaryRef = useRef<(() => void) | null>(null);
+  const registerCreateMenu = useCallback(
+    (menu: CollabSidebarCreateMenu | null) => {
+      createPrimaryRef.current = menu?.onPrimary ?? null;
+      if (!menu) {
+        setTitleBarCreateMenu('collab', null);
+        return;
+      }
+      setTitleBarCreateMenu('collab', {
+        mode: 'collab',
+        destination: menu.destination,
+        heading: { label: 'Shared with team', icon: 'groups' },
+        onPrimary: menu.onPrimary,
+        primaryTrailing: menu.primaryTrailing,
+        items: [
+          ...menu.items,
+          {
+            id: 'folder',
+            label: 'New folder',
+            icon: 'create_new_folder',
+            separatorBefore: true,
+            onSelect: menu.onNewFolder,
+          },
+        ],
+      });
+    },
+    [setTitleBarCreateMenu]
+  );
 
   useEffect(() => {
     onPanelStateChange?.({ sidebarCollapsed, chatCollapsed });
@@ -272,7 +310,7 @@ export const CollabModeInner = forwardRef<CollabModeRef, CollabModeInnerProps>(f
 
     return {
       filePath: activeTab.filePath,
-      fileType: 'collab-markdown',
+      fileType: collabFileType(activeTab.filePath),
       content,
       textSelection,
       textSelectionTimestamp: textSelection?.timestamp,
@@ -310,7 +348,7 @@ export const CollabModeInner = forwardRef<CollabModeRef, CollabModeInnerProps>(f
     window.electronAPI.updateMcpDocumentState({
       content: '',
       filePath: activeTab.filePath,
-      fileType: 'collab-markdown',
+      fileType: collabFileType(activeTab.filePath),
       workspacePath: scope.scopeKey,
       cursorPosition: undefined,
       selection: undefined,
@@ -705,6 +743,20 @@ export const CollabModeInner = forwardRef<CollabModeRef, CollabModeInnerProps>(f
     return tab && isCollabUri(tab.filePath) ? tab.filePath : '';
   }, [activeTabId, tabs]);
 
+  // The header-bar session chip acts on the chat sidebar this mode already
+  // owns. Deliberately no `openInAgentMode` — a shared document isn't a file
+  // Agent mode can open.
+  const documentSessionActions = useMemo<DocumentSessionActions>(() => ({
+    openInChat: (sessionId: string) => {
+      setChatCollapsed(false);
+      chatSidebarRef.current?.loadSession(sessionId);
+    },
+    startNew: () => {
+      setChatCollapsed(false);
+      void chatSidebarRef.current?.createNewSession();
+    },
+  }), []);
+
   const handleTabClose = useCallback((tabId: string) => {
     tabsActions.removeTab(tabId);
   }, [tabsActions]);
@@ -725,11 +777,20 @@ export const CollabModeInner = forwardRef<CollabModeRef, CollabModeInnerProps>(f
     },
     toggleSidebarCollapsed,
     toggleChatCollapsed,
+    // Menu/shortcut path for the same action as double-clicking a tab. With no
+    // tab open there is nothing to expand into, so only the restore direction
+    // stays live.
+    toggleEditorMaximized: () => {
+      if (isEditorMaximized || tabs.length > 0) toggleEditorMaximized();
+    },
     createNewChatSession: async () => {
       if (chatCollapsed) {
         setChatCollapsed(false);
       }
       await chatSidebarRef.current?.createNewSession();
+    },
+    createNewDocument: () => {
+      createPrimaryRef.current?.();
     },
   }), [
     activeTabId,
@@ -737,6 +798,8 @@ export const CollabModeInner = forwardRef<CollabModeRef, CollabModeInnerProps>(f
     tabsActions,
     toggleSidebarCollapsed,
     toggleChatCollapsed,
+    toggleEditorMaximized,
+    isEditorMaximized,
     chatCollapsed,
   ]);
 
@@ -749,10 +812,15 @@ export const CollabModeInner = forwardRef<CollabModeRef, CollabModeInnerProps>(f
       {!sidebarCollapsed && (
         <>
           <div style={{ width: sidebarWidth, minWidth: COLLAB_SIDEBAR_MIN, maxWidth: COLLAB_SIDEBAR_MAX }} className="shrink-0">
+            {/* No Feedback action here any more: the request list is an
+                organization surface, not a shared-docs one, and it moved beside
+                the Inbox in Org mode (#3704). A document's own feedback still
+                reaches it through the per-artifact backlinks. */}
             <CollabSidebar
               activeDocumentId={activeCollabDocumentId}
               onShowHome={() => openSharedHomeTab(true)}
               homeActive={activeTabIsHome}
+              registerCreateMenu={registerCreateMenu}
             />
           </div>
 
@@ -787,6 +855,7 @@ export const CollabModeInner = forwardRef<CollabModeRef, CollabModeInnerProps>(f
               collabScope={scope}
               onTabClose={handleTabClose}
               onGetContentReady={handleGetContentReady}
+              documentSessionActions={documentSessionActions}
             />
           </TabManager>
         )}

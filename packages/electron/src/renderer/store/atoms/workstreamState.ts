@@ -113,8 +113,9 @@ export type AgentRightPanelMode = 'edited-files' | 'review' | 'session-chat';
  * Kind of resource that can occupy a workstream editor tab.
  * - file: a disk-backed file (canonical absolute path is the identity)
  * - tracker: a tracker item rendered as a host resource (not a fake file)
+ * - feedbackRequest: a sent request's results, rendered as a host resource
  */
-export type WorkstreamResourceKind = 'file' | 'tracker';
+export type WorkstreamResourceKind = 'file' | 'tracker' | 'feedbackRequest';
 
 /**
  * A typed resource that can live in the shared workstream editor tab strip.
@@ -136,6 +137,13 @@ export type WorkstreamResource =
       /** `tracker://<trackerItemId>`. */
       resourceId: string;
       trackerItemId: string;
+    }
+  | {
+      kind: 'feedbackRequest';
+      /** `virtual://feedback-request/<orgId>/<requestId>`, built by the tab module. */
+      resourceId: string;
+      orgId: string;
+      requestId: string;
     };
 
 /**
@@ -175,6 +183,21 @@ export function fileResource(filePath: string): WorkstreamResource {
 /** Build a tracker resource descriptor. */
 export function trackerResource(trackerItemId: string): WorkstreamResource {
   return { kind: 'tracker', resourceId: trackerResourceId(trackerItemId), trackerItemId };
+}
+
+/**
+ * Build a feedback request resource descriptor.
+ *
+ * The tab uri is passed in rather than built here: its format belongs to the
+ * feedback request tab module, and this module stays free of that dependency.
+ * A distinct kind (rather than a file resource wearing a `virtual://` path)
+ * keeps the request out of the file-centric derivations below — otherwise the
+ * agent is handed the tab uri as the "current file" it is looking at.
+ */
+export function feedbackRequestResource(
+  { resourceId, orgId, requestId }: { resourceId: string; orgId: string; requestId: string }
+): WorkstreamResource {
+  return { kind: 'feedbackRequest', resourceId, orgId, requestId };
 }
 
 /**
@@ -305,6 +328,16 @@ export function migrateWorkstreamResources(
       ) {
         openResources.push({
           resource: trackerResource((resource as { trackerItemId: string }).trackerItemId),
+          presentation: (entry as PersistedWorkstreamTab).presentation,
+        });
+      } else if (
+        resource.kind === 'feedbackRequest' &&
+        typeof (resource as { orgId?: unknown }).orgId === 'string' &&
+        typeof (resource as { requestId?: unknown }).requestId === 'string'
+      ) {
+        const persisted = resource as { resourceId: string; orgId: string; requestId: string };
+        openResources.push({
+          resource: feedbackRequestResource(persisted),
           presentation: (entry as PersistedWorkstreamTab).presentation,
         });
       }
@@ -757,6 +790,29 @@ export const addWorkstreamTrackerAtom = atom(
 );
 
 /**
+ * Open a sent request's results as a workstream resource tab (or focus it if
+ * already open). The caller supplies the tab uri as the resource id.
+ */
+export const addWorkstreamFeedbackRequestAtom = atom(
+  null,
+  (
+    get,
+    set,
+    {
+      workstreamId,
+      resourceId,
+      orgId,
+      requestId,
+    }: { workstreamId: string; resourceId: string; orgId: string; requestId: string }
+  ) => {
+    set(openWorkstreamResourceAtom, {
+      workstreamId,
+      resource: feedbackRequestResource({ resourceId, orgId, requestId }),
+    });
+  }
+);
+
+/**
  * Open (or focus) any typed resource in the workstream tab strip.
  * Opening an already-open resource focuses the existing tab rather than
  * duplicating it. This is the single primitive both file and tracker opens
@@ -1156,20 +1212,15 @@ function schedulePersist(workstreamId: string): void {
     try {
       const state = store.get(workstreamStateAtom(workstreamId));
       // console.log(`[workstreamState] Persisting workstream ${workstreamId}:`, JSON.stringify(state));
-      const workspaceState = await window.electronAPI.invoke(
-        'workspace:get-state',
-        workspacePath
-      );
-
-      const existingStates = workspaceState?.workstreamStates ?? {};
-
-      const result = await window.electronAPI.invoke('workspace:update-state', workspacePath, {
-        workstreamStates: {
-          ...existingStates,
-          [workstreamId]: state,
-        },
+      // Send only this workstream's entry. Reading the whole workspace state
+      // here and spreading every other entry back made each persist cost a
+      // multi-megabyte round trip once enough workstreams had accumulated.
+      await window.electronAPI.invoke('workspace:set-workstream-state', {
+        workspacePath,
+        workstreamId,
+        state,
       });
-      // console.log(`[workstreamState] Persist complete for ${workstreamId}, result:`, result);
+      // console.log(`[workstreamState] Persist complete for ${workstreamId}`);
     } catch (err) {
       console.error('[workstreamState] Failed to persist state:', err);
     }

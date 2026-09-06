@@ -17,6 +17,17 @@ export * from './ai/adapters/sessionStore';
 export { SessionManager } from './ai/server/SessionManager';
 export { slimClaudeCodeChunkForStorage } from './ai/server/providers/claudeCode/toolChunkUtils';
 export {
+  capClaudeCodeChunkForStorage,
+  capToolResultContent,
+  capToolResultText,
+  STORAGE_TOOL_RESULT_BUDGET_BYTES,
+} from './storage/toolOutputBudget';
+export {
+  isTombstoned,
+  tombstoneMarker,
+  tombstoneRawContent,
+} from './storage/toolOutputRetention';
+export {
   DocumentContextService,
   type IDocumentContextService,
   type RawDocumentContext,
@@ -90,6 +101,8 @@ export {
   upsertTrackerItemAtom,
   removeTrackerItemAtom,
   replaceAllTrackerItemsAtom,
+  orgTrackerItemsAtom,
+  replaceOrgTrackerItemsAtom,
 } from './plugins/TrackerPlugin';
 export type {
   TrackerItemData,
@@ -98,16 +111,27 @@ export type {
   TrackerItemPriority,
   TrackerPluginProps,
   TrackerDataModel,
-  TrackerSyncPolicy,
-  TrackerSyncMode,
+  TrackerSharing,
+  TrackerSharingPolicy,
   TrackerSchemaRole,
   FieldDefinition,
   DocumentHeaderProvider,
   DocumentHeaderComponentProps,
 } from './plugins/TrackerPlugin';
 // Canonical TrackerRecord type
-export type { TrackerRecord, TrackerRecordSystem, LinkedCommit } from './core/TrackerRecord';
+export type { TrackerRecord, TrackerRecordSystem, LinkedCommit, TrackerDerivedSignal } from './core/TrackerRecord';
 export { trackerItemToRecord, trackerRecordToItem, dbRowToRecord, recordToDbParams } from './core/TrackerRecord';
+export {
+  PLAN_INVALID_STATUS_SIGNAL_KIND,
+  PLAN_STATUS_DRIFT_SIGNAL_KIND,
+  derivePlanStatusSignals,
+  normalizePlanStatusForProjection,
+} from './plugins/TrackerPlugin/models/planStatusIntegrity';
+export type {
+  InvalidPlanStatusSignal,
+  PlanStatusDriftSignal,
+  StalePlanStatus,
+} from './plugins/TrackerPlugin/models/planStatusIntegrity';
 // Generic Frontmatter Plugin
 // Import triggers registration with DocumentHeaderRegistry (priority 50, below tracker's 100)
 export {
@@ -149,32 +173,6 @@ export type {
 } from './mockup/types';
 // Import for side effects - registers globals on Window
 import './mockup/types';
-// Mockup Plugin - Node exported separately to avoid circular dependency
-export {
-  MockupNode,
-  $createMockupNode,
-  $isMockupNode,
-} from './plugins/MockupPlugin/MockupNode';
-export type {
-  MockupPayload,
-  SerializedMockupNode,
-} from './plugins/MockupPlugin/MockupNode';
-export { MOCKUP_TRANSFORMER } from './plugins/MockupPlugin/MockupTransformer';
-export {
-  INSERT_MOCKUP_COMMAND,
-  MockupLexicalExtension,
-  generateMockupScreenshot,
-} from './plugins/MockupPlugin';
-export type {
-  MockupPlatformService,
-  MockupFileInfo,
-  MockupPickerResult,
-} from './plugins/MockupPlugin/MockupPlatformService';
-export {
-  setMockupPlatformService,
-  getMockupPlatformService,
-  hasMockupPlatformService,
-} from './plugins/MockupPlugin/MockupPlatformService';
 // Config
 export { STYTCH_CONFIG, getStytchConfig } from './config/stytch';
 // Extensions
@@ -195,6 +193,7 @@ export * from './editors';
 // Sync types (for capacitor)
 export type { SessionIndexEntry } from './sync/types';
 export * from './sync/ConversationSync';
+export * from './sync/FeedbackRequestSync';
 // Read receipts (unread indicators for trackers/docs)
 export {
   isEntityUnread,

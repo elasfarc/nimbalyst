@@ -162,6 +162,28 @@ describe('CollabLexicalProvider', () => {
       expect(provider.getYDoc().get('root', Y.XmlText).toString()).toBe('remote warm content');
     });
 
+    it('keeps document comments observable across the shared and mounted editor docs', async () => {
+      const sharedDoc = new Y.Doc();
+      const syncProvider = createSyncProviderStub('connected', sharedDoc);
+      const provider = new CollabLexicalProvider(syncProvider as any);
+      provider.prepareForBinding();
+      const editorDoc = provider.getYDoc();
+      const mountedComments = editorDoc.getArray<{ id: string }>('comments');
+      const observed = vi.fn();
+      mountedComments.observe(observed);
+      await provider.connect();
+
+      sharedDoc.getArray<{ id: string }>('comments').push([{ id: 'from-shared' }]);
+      expect(observed).toHaveBeenCalled();
+      expect(mountedComments.toArray()).toEqual([{ id: 'from-shared' }]);
+
+      mountedComments.push([{ id: 'from-editor' }]);
+      expect(sharedDoc.getArray<{ id: string }>('comments').toArray()).toEqual([
+        { id: 'from-shared' },
+        { id: 'from-editor' },
+      ]);
+    });
+
     it('does not echo bridged updates back and forth', async () => {
       const sharedDoc = populatedSharedDoc('warm content');
       const syncProvider = createSyncProviderStub('connected', sharedDoc);

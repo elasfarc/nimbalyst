@@ -109,6 +109,17 @@ export function InboxRow({
             </span>
           )}
 
+          {row.awaitsResponse && (
+            <span
+              className="inbox-row-response-chip flex shrink-0 items-center gap-1 rounded bg-[color-mix(in_srgb,var(--nim-purple)_18%,transparent)] px-1.5 text-[10px] font-bold uppercase tracking-wide text-[var(--nim-purple)]"
+              data-testid="inbox-row-response-chip"
+              title="This asks you for a typed answer"
+            >
+              <MaterialSymbol icon="pending_actions" size={10} />
+              Response requested
+            </span>
+          )}
+
           <span className={`inbox-row-where min-w-0 truncate text-[13px] ${
             row.unread ? 'font-semibold text-[var(--nim-text)]' : 'text-[var(--nim-text-muted)]'
           }`}
