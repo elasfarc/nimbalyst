@@ -10,6 +10,7 @@
   ],
   "packages/electron/src/main/services/CredentialService.ts": [
     "personalUserId?: string,",
+    "personalUserId?: string;",
     "personalUserId?: string;"
   ],
   "packages/electron/src/main/services/PersonalSyncProfiles.ts": [
