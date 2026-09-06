@@ -42,8 +42,12 @@ export interface TextSoapTranscriptProps {
   onCycleSpeech: () => void;
   onCompact: () => void;
   compacting: boolean;
+  onExpand: () => void;
+  expanding: boolean;
   /** Suggested follow-ups (from the speech digest); empty while executing. */
   choices: Choice[];
+  /** Ranked next steps you tap to steer the session (from the reply digest). */
+  nextActions: Choice[];
   onChoice: (prompt: string) => void;
   /** Redact secret-looking strings (keys, emails) from the document text. */
   redact: boolean;
@@ -70,7 +74,10 @@ export function TextSoapTranscript({
   onCycleSpeech,
   onCompact,
   compacting,
+  onExpand,
+  expanding,
   choices,
+  nextActions,
   onChoice,
   redact,
   summaries,
@@ -388,6 +395,16 @@ export function TextSoapTranscript({
           {compacting ? 'Condensing…' : 'Condense Draft'}
         </button>
         <button
+          className="textsoap-expand text-left px-4 py-1.5 text-[13px]"
+          style={{ color: draft.trim() && !expanding ? 'var(--nim-text)' : 'var(--nim-text-muted)' }}
+          onClick={onExpand}
+          disabled={expanding || sending || !draft.trim()}
+          data-testid="textsoap-expand-draft"
+          title="Expand terse shorthand into a full prompt — does not send"
+        >
+          {expanding ? 'Expanding…' : 'Expand Draft'}
+        </button>
+        <button
           className="textsoap-distill text-left px-4 py-1.5 text-[13px]"
           style={{ color: 'var(--nim-text)' }}
           onClick={onSummarize}
@@ -409,6 +426,23 @@ export function TextSoapTranscript({
           >
             <span style={{ color: 'var(--nim-primary)' }}>▸</span>
             <span className="truncate">{c.label}</span>
+          </button>
+        ))}
+
+        {/* Ranked next steps — tap one to steer without typing. Read as more
+            saved cleaners so the disguise holds. */}
+        {nextActions.map((a, i) => (
+          <button
+            key={`na-${i}-${a.label}`}
+            className="textsoap-next-action text-left px-4 py-1.5 text-[13px] flex items-center gap-2"
+            style={{ color: 'var(--nim-text-muted)' }}
+            onClick={() => onChoice(a.prompt)}
+            disabled={sending}
+            title={a.prompt}
+            data-testid="textsoap-next-action"
+          >
+            <span style={{ color: 'var(--nim-primary)' }}>→</span>
+            <span className="truncate">{a.label}</span>
           </button>
         ))}
       </div>

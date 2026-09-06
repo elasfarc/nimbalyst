@@ -40,7 +40,7 @@ describe('pickDigestTarget', () => {
 });
 
 describe('shouldSpeak / composeUtterance', () => {
-  const digest = { spoken: 'Done. Commit?', kind: 'question' as const, needsYou: true, choices: [{ label: 'yes', prompt: 'Yes.' }] };
+  const digest = { spoken: 'Done. Commit?', kind: 'question' as const, needsYou: true, choices: [{ label: 'yes', prompt: 'Yes.' }], nextActions: [] };
 
   it('speaks only what the mode allows', () => {
     expect(shouldSpeak(digest, 'off')).toBe(false);

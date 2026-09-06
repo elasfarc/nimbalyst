@@ -932,6 +932,10 @@ interface ElectronAPI {
       text: string,
       ratio?: number,
     ) => Promise<import('./types/remoteSessions').RemoteCompactResponse>;
+    expandPrompt: (
+      sessionId: string,
+      text: string,
+    ) => Promise<import('./types/remoteSessions').RemoteExpandResponse>;
     speechDigest: (
       sessionId: string,
       messageId: string,

@@ -30,7 +30,7 @@ vi.mock('../SyncManager', () => ({
   }),
 }));
 
-const { compactRemotePrompt, requestRemoteSpeechDigest } = await import('../RemoteSessionService');
+const { compactRemotePrompt, expandRemotePrompt, requestRemoteSpeechDigest } = await import('../RemoteSessionService');
 const { encryptDigestPayload } = await import('../RemoteSpeechDigestService');
 
 /** The requestId the service just put on the wire. */
@@ -94,8 +94,53 @@ describe('compactRemotePrompt', () => {
   });
 });
 
+describe('expandRemotePrompt', () => {
+  it('matches on requestId and returns the trimmed expansion', async () => {
+    const pending = expandRemotePrompt('session-1', 'fix null auth');
+    await vi.waitFor(() => expect(sent).toHaveLength(1));
+    expect(sent[0]).toMatchObject({ type: 'prompt_expand', sentBy: 'mobile' });
+
+    deliver({
+      sessionId: 'session-1',
+      type: 'prompt_expanded',
+      sentBy: 'desktop',
+      payload: { requestId: 'someone-else', text: 'wrong' },
+    });
+    deliver({
+      sessionId: 'session-1',
+      type: 'prompt_expanded',
+      sentBy: 'desktop',
+      payload: { requestId: lastRequestId(), text: '  Fix the null auth check.  ' },
+    });
+
+    await expect(pending).resolves.toEqual({ success: true, text: 'Fix the null auth check.' });
+  });
+
+  it('reports the host error and treats an empty expansion as failure', async () => {
+    const errored = expandRemotePrompt('session-1', 'x');
+    await vi.waitFor(() => expect(sent).toHaveLength(1));
+    deliver({
+      sessionId: 'session-1',
+      type: 'prompt_expand_error',
+      sentBy: 'desktop',
+      payload: { requestId: lastRequestId(), error: 'The claude CLI is not installed on the host.' },
+    });
+    await expect(errored).resolves.toEqual({ success: false, error: 'The claude CLI is not installed on the host.' });
+
+    const empty = expandRemotePrompt('session-1', 'x');
+    await vi.waitFor(() => expect(sent).toHaveLength(2));
+    deliver({
+      sessionId: 'session-1',
+      type: 'prompt_expanded',
+      sentBy: 'desktop',
+      payload: { requestId: lastRequestId(), text: '   ' },
+    });
+    await expect(empty).resolves.toMatchObject({ success: false });
+  });
+});
+
 describe('requestRemoteSpeechDigest', () => {
-  const DIGEST = { spoken: 'Done. Commit?', kind: 'question', needsYou: true, choices: [{ label: 'yes', prompt: 'Yes.' }] };
+  const DIGEST = { spoken: 'Done. Commit?', kind: 'question', needsYou: true, choices: [{ label: 'yes', prompt: 'Yes.' }], nextActions: [] };
 
   beforeEach(async () => {
     encryptionKey = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']);

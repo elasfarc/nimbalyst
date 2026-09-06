@@ -44,15 +44,23 @@ export interface SpeechDigest {
   needsYou: boolean;
   /** Zero to three proposed answers. Empty for 'progress'. */
   choices: SpeechDigestChoice[];
+  /**
+   * Three to five ranked next steps the user can tap to steer the session,
+   * likeliest/most-valuable first — offered on EVERY reply, even 'done'. Distinct
+   * from `choices` (spoken answers to a pending decision): these drive the session
+   * by picking instead of typing, and are shown, not read aloud.
+   */
+  nextActions: SpeechDigestChoice[];
 }
 
 export const MAX_SPEECH_CHOICES = 3;
+export const MAX_NEXT_ACTIONS = 5;
 
 /** The JSON Schema handed to `claude --json-schema`. */
 export const SPEECH_DIGEST_SCHEMA = {
   type: 'object',
   additionalProperties: false,
-  required: ['spoken', 'kind', 'needsYou', 'choices'],
+  required: ['spoken', 'kind', 'needsYou', 'choices', 'nextActions'],
   properties: {
     spoken: { type: 'string' },
     kind: { type: 'string', enum: SPEECH_DIGEST_KINDS },
@@ -60,6 +68,16 @@ export const SPEECH_DIGEST_SCHEMA = {
     choices: {
       type: 'array',
       maxItems: MAX_SPEECH_CHOICES,
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['label', 'prompt'],
+        properties: { label: { type: 'string' }, prompt: { type: 'string' } },
+      },
+    },
+    nextActions: {
+      type: 'array',
+      maxItems: MAX_NEXT_ACTIONS,
       items: {
         type: 'object',
         additionalProperties: false,
@@ -88,13 +106,17 @@ export function buildSpeechDigestSystemPrompt(language: SpeechLanguage = 'en'): 
     'else "progress". Set "needsYou" true for question, permission and blocked.',
     `Offer at most ${MAX_SPEECH_CHOICES} "choices", the likeliest answers first, each with a`,
     'three-to-six-word "label" and the full "prompt" to send. Offer none for progress.',
+    `Always propose ${MAX_NEXT_ACTIONS > 3 ? 'three to five' : 'a few'} "nextActions": concrete next`,
+    'steps the listener could take, most likely or most valuable first, each with a three-to-six-word',
+    '"label" and the full "prompt" to send. Offer them even when the task looks finished (e.g. review,',
+    'test, commit, extend); never leave "nextActions" empty. They may overlap with "choices".',
   ];
   if (language === 'ar-EG') {
     lines.push(
-      'Write "spoken" and every choice "label" in Egyptian Arabic (Cairene colloquial),',
-      'in Arabic script, the way a native Cairo speaker talks; say numbers in Arabic words.',
-      'Keep the JSON keys and the "kind" values in English, and keep each choice "prompt"',
-      'in English so the agent receives it unchanged.',
+      'Write "spoken" and every "label" (in both "choices" and "nextActions") in Egyptian Arabic',
+      '(Cairene colloquial), in Arabic script, the way a native Cairo speaker talks; say numbers in',
+      'Arabic words. Keep the JSON keys and the "kind" values in English, and keep every "prompt"',
+      '(in both arrays) in English so the agent receives it unchanged.',
     );
   }
   lines.push('Output ONLY the JSON object.');
@@ -141,7 +163,22 @@ export function fallbackSpoken(raw: string | null | undefined, max = 240): strin
 
 /** The digest a client uses when the host cannot produce one. Never speaks choices it did not get. */
 export function fallbackDigest(raw: string | null | undefined): SpeechDigest {
-  return { spoken: fallbackSpoken(raw), kind: 'progress', needsYou: false, choices: [] };
+  return { spoken: fallbackSpoken(raw), kind: 'progress', needsYou: false, choices: [], nextActions: [] };
+}
+
+/** Parse a `{label, prompt}[]` field, trimming, dropping blanks, capping at `max`. */
+function coerceChoiceList(value: unknown, max: number): SpeechDigestChoice[] {
+  const out: SpeechDigestChoice[] = [];
+  if (!Array.isArray(value)) return out;
+  for (const item of value) {
+    if (!isRecord(item)) continue;
+    const label = typeof item.label === 'string' ? item.label.trim() : '';
+    const prompt = typeof item.prompt === 'string' ? item.prompt.trim() : label;
+    if (!label || !prompt) continue;
+    out.push({ label, prompt });
+    if (out.length === max) break;
+  }
+  return out;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -194,18 +231,9 @@ function coerce(value: unknown): SpeechDigest | null {
     typeof value.needsYou === 'boolean'
       ? value.needsYou
       : kind === 'question' || kind === 'permission' || kind === 'blocked';
-  const choices: SpeechDigestChoice[] = [];
-  if (Array.isArray(value.choices)) {
-    for (const item of value.choices) {
-      if (!isRecord(item)) continue;
-      const label = typeof item.label === 'string' ? item.label.trim() : '';
-      const prompt = typeof item.prompt === 'string' ? item.prompt.trim() : label;
-      if (!label || !prompt) continue;
-      choices.push({ label, prompt });
-      if (choices.length === MAX_SPEECH_CHOICES) break;
-    }
-  }
-  return { spoken, kind, needsYou, choices };
+  const choices = coerceChoiceList(value.choices, MAX_SPEECH_CHOICES);
+  const nextActions = coerceChoiceList(value.nextActions, MAX_NEXT_ACTIONS);
+  return { spoken, kind, needsYou, choices, nextActions };
 }
 
 /**

@@ -111,6 +111,7 @@ export function RemoteSessionTranscript({ sessionId, isActive }: RemoteSessionTr
   const composerImages = useComposerImages();
   const { replyStyle, setReplyStyle } = useControllerReplyStyle();
   const [compacting, setCompacting] = useState(false);
+  const [expanding, setExpanding] = useState(false);
   const speech = useControllerSpeech();
   /** The newest digest, kept so its choices can be answered with a click. */
   const [digest, setDigest] = useState<{ messageId: string; digest: SpeechDigest } | null>(null);
@@ -497,6 +498,27 @@ export function RemoteSessionTranscript({ sessionId, isActive }: RemoteSessionTr
     }
   };
 
+  /**
+   * The mirror of handleCompact: send terse shorthand to the host, get a full
+   * prompt back in the composer to edit. Like compaction, it never sends.
+   */
+  const handleExpand = async () => {
+    const text = draft.trim();
+    const api = window.electronAPI?.remoteSessions;
+    if (!text || !api?.expandPrompt || expanding) return;
+    setExpanding(true);
+    setActionError(null);
+    try {
+      const result = await api.expandPrompt(sessionId, text);
+      if (result?.success) setDraft(result.text);
+      else setActionError(result?.error ?? 'Failed to expand the draft');
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Failed to expand the draft');
+    } finally {
+      setExpanding(false);
+    }
+  };
+
   // Ask the host to summarize the last reply, drop it into a fresh note, and open
   // Notes — where the summary can be sent back to the composer to answer from.
   const handleSummarize = async (opts?: { silent?: boolean }) => {
@@ -646,6 +668,15 @@ export function RemoteSessionTranscript({ sessionId, isActive }: RemoteSessionTr
   };
 
   const canSend = !sending && (!!draft.trim() || images.length > 0);
+  // Ranked "next actions" you tap to steer, from the always-on reply digest.
+  // Deduped against the spoken `choices` (a decision reply carries both) so the
+  // same prompt never shows twice, and hidden while the agent is still working.
+  const nextActions =
+    digest && !isExecuting
+      ? digest.digest.nextActions.filter(
+          (a) => !digest.digest.choices.some((c) => c.prompt === a.prompt),
+        )
+      : [];
   // TextSoap and Buffer appearances swap the chat-style body + composer for a
   // full-surface disguise (a document, or a code-editor buffer). Any other
   // appearance keeps the normal transcript, so each disguise is fully reversible.
@@ -1044,7 +1075,10 @@ export function RemoteSessionTranscript({ sessionId, isActive }: RemoteSessionTr
           }}
           onCompact={() => void handleCompact()}
           compacting={compacting}
+          onExpand={() => void handleExpand()}
+          expanding={expanding}
           choices={digest && !isExecuting ? digest.digest.choices : []}
+          nextActions={nextActions}
           onChoice={(prompt) => void sendText(prompt)}
           redact={privacy.redactSecrets}
           summaries={docSummaries}
@@ -1074,7 +1108,10 @@ export function RemoteSessionTranscript({ sessionId, isActive }: RemoteSessionTr
           }}
           onCompact={() => void handleCompact()}
           compacting={compacting}
+          onExpand={() => void handleExpand()}
+          expanding={expanding}
           choices={digest && !isExecuting ? digest.digest.choices : []}
+          nextActions={nextActions}
           onChoice={(prompt) => void sendText(prompt)}
           redact={privacy.redactSecrets}
           composerImages={composerImages}
@@ -1150,6 +1187,25 @@ export function RemoteSessionTranscript({ sessionId, isActive }: RemoteSessionTr
                 title={choice.prompt}
               >
                 {i + 1}. {choice.label}
+              </button>
+            ))}
+          </div>
+        )}
+        {/* Ranked next actions — tap to steer without typing. Shown on every
+            reply, not just decisions, so most turns are one tap. */}
+        {digest && nextActions.length > 0 && (
+          <div className="remote-session-next-actions flex flex-wrap gap-1 px-2 pb-1" data-testid="remote-session-next-actions">
+            {nextActions.map((action, i) => (
+              <button
+                key={`${digest.messageId}-na-${i}`}
+                className="remote-session-next-action text-[11px] px-1.5 py-0.5 rounded"
+                style={{ color: 'var(--nim-text-muted)', border: '1px solid var(--nim-border)' }}
+                onClick={() => void sendText(action.prompt)}
+                disabled={sending}
+                title={action.prompt}
+              >
+                <span style={{ color: 'var(--nim-primary)' }}>→ </span>
+                {action.label}
               </button>
             ))}
           </div>
@@ -1263,6 +1319,16 @@ export function RemoteSessionTranscript({ sessionId, isActive }: RemoteSessionTr
             title="Rewrite this draft into terse shorthand on the host. Does not send it."
           >
             {compacting ? '…' : 'Compact'}
+          </button>
+          <button
+            className="remote-session-expand-button text-[11px] px-1.5 py-1 rounded shrink-0"
+            style={{ color: 'var(--nim-text-muted)' }}
+            onClick={() => void handleExpand()}
+            disabled={expanding || sending || !draft.trim()}
+            data-testid="remote-session-expand-button"
+            title="Expand this shorthand into a full prompt on the host. Does not send it."
+          >
+            {expanding ? '…' : 'Expand'}
           </button>
           <button
             className="remote-session-send-button text-[13px] px-2 py-1 rounded shrink-0"

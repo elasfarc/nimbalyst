@@ -32,6 +32,7 @@ import { buildToolPermissionResponseRecord } from './claudeCliToolPermission';
 import { handleRemoteTerminalControl, closeAllRemoteTerminals } from '../RemoteTerminalService';
 import { handleRemoteFileControl } from '../RemoteFileService';
 import { handleRemotePromptCompactControl } from '../RemotePromptCompactService';
+import { handleRemotePromptExpandControl } from '../RemotePromptExpandService';
 import { handleRemoteSpeechDigestControl } from '../RemoteSpeechDigestService';
 import { handleRemoteSummarizeReplyControl } from '../RemoteReplySummaryService';
 import { getGitSubprocessEnv } from '../gitEnv';
@@ -202,6 +203,7 @@ function handleControlMessage(
   if (handleRemoteTerminalControl(message)) return;
   if (handleRemoteFileControl(message)) return;
   if (handleRemotePromptCompactControl(message)) return;
+  if (handleRemotePromptExpandControl(message)) return;
   if (handleRemoteSpeechDigestControl(message)) return;
   if (handleRemoteSummarizeReplyControl(message)) return;
 

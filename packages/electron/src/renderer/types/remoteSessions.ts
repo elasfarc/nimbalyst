@@ -148,6 +148,11 @@ export type RemoteCompactResponse =
   | { success: true; text: string }
   | { success: false; error: string };
 
+/** What the host sends back for terse shorthand it expanded into a full prompt. */
+export type RemoteExpandResponse =
+  | { success: true; text: string }
+  | { success: false; error: string };
+
 /** What the host sends back for a reply it digested for speech. */
 export type RemoteDigestResponse =
   | { success: true; messageId: string; digest: import('@nimbalyst/runtime/ai/prompts/speechDigest').SpeechDigest }

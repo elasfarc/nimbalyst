@@ -91,6 +91,10 @@ describe('parseSpeechDigest', () => {
       { label: 'yes commit', prompt: 'Yes, commit it.' },
       { label: 'not yet', prompt: 'Do not commit yet.' },
     ],
+    nextActions: [
+      { label: 'commit it', prompt: 'Commit the change.' },
+      { label: 'run the tests', prompt: 'Run the tests.' },
+    ],
   };
 
   it('accepts clean schema output', () => {
@@ -109,7 +113,7 @@ describe('parseSpeechDigest', () => {
 
   it('repairs a partial object instead of rejecting it', () => {
     const out = parseSpeechDigest(JSON.stringify({ spoken: 'Waiting on approval.', kind: 'permission' }));
-    expect(out).toEqual({ spoken: 'Waiting on approval.', kind: 'permission', needsYou: true, choices: [] });
+    expect(out).toEqual({ spoken: 'Waiting on approval.', kind: 'permission', needsYou: true, choices: [], nextActions: [] });
   });
 
   it('caps choices at three and drops malformed ones', () => {
@@ -122,6 +126,27 @@ describe('parseSpeechDigest', () => {
     );
     expect(out?.choices.map((c) => c.label)).toEqual(['a', 'b', 'c']);
     expect(out?.choices[0].prompt).toBe('a');
+  });
+
+  it('parses nextActions, caps them at five, and defaults to [] when absent', () => {
+    const out = parseSpeechDigest(
+      JSON.stringify({
+        spoken: 'x',
+        kind: 'progress',
+        nextActions: [
+          { label: 'a', prompt: 'A' },
+          { nope: 1 },
+          { label: 'b', prompt: 'B' },
+          { label: 'c', prompt: 'C' },
+          { label: 'd', prompt: 'D' },
+          { label: 'e', prompt: 'E' },
+          { label: 'f', prompt: 'F' },
+        ],
+      })
+    );
+    expect(out?.nextActions.map((a) => a.label)).toEqual(['a', 'b', 'c', 'd', 'e']);
+    // A reply with no nextActions field (or a legacy/cached digest) stays valid.
+    expect(parseSpeechDigest(JSON.stringify({ spoken: 'y', kind: 'done' }))?.nextActions).toEqual([]);
   });
 
   it('returns null for garbage, empty spoken, and an unknown kind without text', () => {

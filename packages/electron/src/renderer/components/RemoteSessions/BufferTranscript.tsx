@@ -47,7 +47,11 @@ export interface BufferTranscriptProps {
   onCycleSpeech: () => void;
   onCompact: () => void;
   compacting: boolean;
+  onExpand: () => void;
+  expanding: boolean;
   choices: Choice[];
+  /** Ranked next steps you tap to steer the session (from the reply digest). */
+  nextActions: Choice[];
   onChoice: (prompt: string) => void;
   redact: boolean;
   /** Images staged for the next send; paste or drop into the buffer to attach. */
@@ -67,7 +71,10 @@ export function BufferTranscript({
   onCycleSpeech,
   onCompact,
   compacting,
+  onExpand,
+  expanding,
   choices,
+  nextActions,
   onChoice,
   redact,
   composerImages,
@@ -215,6 +222,27 @@ export function BufferTranscript({
           );
         })}
 
+        {/* Ranked next steps — tap to steer without typing; ride as comment lines. */}
+        {nextActions.map((a, i) => {
+          line += 1;
+          const n = line;
+          return (
+            <div key={`next-action-${i}`} className="buffer-next-action flex items-start px-1" data-testid="buffer-next-action">
+              {lineFor(n)}
+              <button
+                className="buffer-next-action-btn flex-1 text-left"
+                style={{ color: 'var(--nim-text-muted)', opacity: 0.85 }}
+                onClick={() => onChoice(a.prompt)}
+                disabled={sending}
+                title={a.prompt}
+              >
+                <span style={{ color: 'var(--nim-primary)' }}>{`// » `}</span>
+                {a.label}
+              </button>
+            </div>
+          );
+        })}
+
         {/* Composer — the live last line. */}
         <div className="buffer-composer-line flex items-start px-1">
           {lineFor(line + 1)}
@@ -300,6 +328,16 @@ export function BufferTranscript({
           title="Rewrite the draft into terse shorthand — does not send"
         >
           {compacting ? '…' : '⤳'}
+        </button>
+        <button
+          className="buffer-expand px-2 py-1"
+          style={{ color: draft.trim() && !expanding ? 'var(--nim-text-muted)' : 'var(--nim-border)' }}
+          onClick={onExpand}
+          disabled={expanding || sending || !draft.trim()}
+          data-testid="buffer-expand-draft"
+          title="Expand terse shorthand into a full prompt — does not send"
+        >
+          {expanding ? '…' : '⤢'}
         </button>
         <span className="flex-1" />
         <span className="px-2 py-1">Ln {line + 1}, Col {draft.length + 1}</span>

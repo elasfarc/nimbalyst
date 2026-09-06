@@ -56,6 +56,7 @@ import {
   readRemoteFile,
   openRemoteFile,
   compactRemotePrompt,
+  expandRemotePrompt,
   requestRemoteSpeechDigest,
   requestRemoteSummarizeReply,
   cancelRemoteSession,
@@ -256,6 +257,16 @@ export function registerRemoteSessionHandlers() {
         throw new Error('remote-sessions:compact-prompt requires sessionId and text');
       }
       return compactRemotePrompt(payload.sessionId, payload.text, payload.ratio);
+    },
+  );
+
+  safeHandle(
+    'remote-sessions:expand-prompt',
+    async (_event, payload: { sessionId: string; text: string }) => {
+      if (!payload?.sessionId || !payload?.text) {
+        throw new Error('remote-sessions:expand-prompt requires sessionId and text');
+      }
+      return expandRemotePrompt(payload.sessionId, payload.text);
     },
   );
 

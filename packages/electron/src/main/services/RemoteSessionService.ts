@@ -99,6 +99,8 @@ interface RemoteSessionState {
   pendingFileOpens: Map<string, (response: RemoteFileOpenResponse) => void>;
   /** Pending draft compactions awaiting the host's rewrite, keyed by requestId. */
   pendingCompactions: Map<string, (response: RemoteCompactResponse) => void>;
+  /** Pending shorthand expansions awaiting the host's rewrite, keyed by requestId. */
+  pendingExpansions: Map<string, (response: RemoteExpandResponse) => void>;
   /** Pending speech digests awaiting the host's summary, keyed by requestId. */
   pendingDigests: Map<string, (response: RemoteDigestResponse) => void>;
   /** Pending reply summaries awaiting the host's text, keyed by requestId. */
@@ -117,6 +119,11 @@ export type RemoteFileOpenResponse =
 
 /** What the host sends back for a draft prompt it compacted. */
 export type RemoteCompactResponse =
+  | { success: true; text: string }
+  | { success: false; error: string };
+
+/** What the host sends back for terse shorthand it expanded into a full prompt. */
+export type RemoteExpandResponse =
   | { success: true; text: string }
   | { success: false; error: string };
 
@@ -139,6 +146,7 @@ const state: RemoteSessionState = {
   pendingFileReads: new Map(),
   pendingFileOpens: new Map(),
   pendingCompactions: new Map(),
+  pendingExpansions: new Map(),
   pendingDigests: new Map(),
   pendingSummaries: new Map(),
 };
@@ -257,6 +265,20 @@ export function ensureRemoteSubscriptions(): boolean {
           message.type === 'prompt_compacted' && text
             ? { success: true, text }
             : { success: false, error: String(payload.error ?? 'The host could not compact that draft.') },
+        );
+        return;
+      }
+      if (message.type === 'prompt_expanded' || message.type === 'prompt_expand_error') {
+        const payload = message.payload ?? {};
+        const requestId = String(payload.requestId ?? '');
+        const resolver = state.pendingExpansions.get(requestId);
+        if (!resolver) return;
+        state.pendingExpansions.delete(requestId);
+        const text = typeof payload.text === 'string' ? payload.text.trim() : '';
+        resolver(
+          message.type === 'prompt_expanded' && text
+            ? { success: true, text }
+            : { success: false, error: String(payload.error ?? 'The host could not expand that draft.') },
         );
         return;
       }
@@ -664,6 +686,36 @@ export async function compactRemotePrompt(
 }
 
 /**
+ * Ask the host to expand terse shorthand into a full, well-formed prompt.
+ *
+ * The mirror of compaction: same round trip, same reasons (no checkout or CLI on
+ * the controller), and it is never sent on — the expansion is handed back to the
+ * composer for the user to edit. Outlives the host's own 90s giving-up point so
+ * the host's error surfaces rather than a timeout of our own.
+ */
+export async function expandRemotePrompt(
+  sessionId: string,
+  text: string,
+): Promise<RemoteExpandResponse> {
+  ensureRemoteSubscriptions();
+  const requestId = randomUUID();
+
+  const response = new Promise<RemoteExpandResponse>((resolve) => {
+    const timer = setTimeout(() => {
+      state.pendingExpansions.delete(requestId);
+      resolve({ success: false, error: 'The host did not answer in time.' });
+    }, 120_000);
+    state.pendingExpansions.set(requestId, (res) => {
+      clearTimeout(timer);
+      resolve(res);
+    });
+  });
+
+  await sendControl({ sessionId, type: 'prompt_expand', payload: { requestId, text } });
+  return response;
+}
+
+/**
  * Ask the host to digest an assistant reply for speech: a few sentences plus
  * the answers a keypress can send. Same round trip as compaction; the host
  * caches by messageId so reopening a session does not pay twice.
@@ -783,6 +835,7 @@ export function shutdownRemoteSessionService(): void {
   state.pendingWorktrees.clear();
   state.pendingFileReads.clear();
   state.pendingCompactions.clear();
+  state.pendingExpansions.clear();
   state.pendingDigests.clear();
   state.cleanupWorktreeResponse?.();
   state.cleanupWorktreeResponse = undefined;
