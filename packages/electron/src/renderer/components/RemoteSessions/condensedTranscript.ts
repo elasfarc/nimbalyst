@@ -75,6 +75,57 @@ export function summarizeAssistant(text: string | undefined, max = 140): string 
   return stripped.length > max ? `${stripped.slice(0, max - 1).trimEnd()}…` : stripped;
 }
 
+/**
+ * Strip the loud inline Markdown from one line, keeping the prose. Underscores
+ * are left alone on purpose: LLM prose rarely uses `_emphasis_`, and stripping it
+ * mangles identifiers/paths like `my_file_name`.
+ */
+function stripMarkdownInline(s: string): string {
+  return s
+    .replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1') // image -> alt text
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_m, t, u) => (t === u ? String(t) : `${t} (${u})`)) // link -> text (url)
+    .replace(/`([^`]+)`/g, '$1') // inline code
+    .replace(/\*\*(.+?)\*\*/g, '$1') // **bold**
+    .replace(/(^|[^*])\*([^*\s][^*]*?)\*(?!\*)/g, '$1$2') // *italic* (leave bullets / bare *)
+    .replace(/~~(.+?)~~/g, '$1'); // ~~strike~~
+}
+
+/**
+ * Flatten a whole Markdown reply to clean plain text for display. Controller
+ * replies arrive as Markdown, and the syntax (`#`, `**`, fences, bullets) is both
+ * an AI "tell" and noise the user otherwise strips by hand every time. This keeps
+ * the words and structure but drops the syntax, so every disguise renders a plain
+ * document. Generalizes summarizeAssistant over the full body instead of one line.
+ */
+export function plainifyMarkdown(text: string | undefined): string {
+  if (!text) return '';
+  const lines = text.replace(/\r\n?/g, '\n').split('\n');
+  const out: string[] = [];
+  let inFence = false;
+  for (const raw of lines) {
+    // Toggle fenced code blocks: drop the fence line itself, keep the code inside
+    // verbatim (no inline stripping — code isn't prose).
+    if (/^\s*(```|~~~)/.test(raw)) {
+      inFence = !inFence;
+      continue;
+    }
+    if (inFence) {
+      out.push(raw);
+      continue;
+    }
+    // A horizontal rule becomes a blank line, not a row of dashes.
+    if (/^\s*([-*_])(\s*\1){2,}\s*$/.test(raw)) {
+      out.push('');
+      continue;
+    }
+    let l = raw.replace(/^\s*#{1,6}\s+/, ''); // heading marker
+    l = l.replace(/^\s*>\s?/, ''); // blockquote marker
+    l = l.replace(/^(\s*)[-*+]\s+/, '$1• '); // bullet marker -> plain bullet (numbered lists keep their number)
+    out.push(stripMarkdownInline(l));
+  }
+  return out.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+}
+
 /** Compact chip label for a tool call, e.g. "Edit · auth.ts" or "Bash". */
 export function toolChipLabel(m: TranscriptViewMessage): string {
   const t = m.toolCall;

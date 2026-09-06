@@ -161,7 +161,9 @@ export function NewRemoteSessionDialog({
             value={prompt}
             onChange={(e) => setPrompt(e.target.value)}
             onPaste={(e) => void composerImages.handlePaste(e)}
-            placeholder="What should the agent start on?  (paste an image to attach)"
+            onDragOver={(e) => e.preventDefault()}
+            onDrop={(e) => void composerImages.handleDrop(e)}
+            placeholder="What should the agent start on?  (paste or drop an image to attach)"
             data-testid="remote-new-session-prompt"
           />
         </label>

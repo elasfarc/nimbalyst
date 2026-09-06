@@ -5,34 +5,31 @@
  * rules) and both ship them to the host on the prompt control message.
  */
 
-import { useCallback, useState, type ClipboardEvent } from 'react';
+import { useCallback, useState, type ClipboardEvent, type DragEvent } from 'react';
 import { prepareImage, type ControllerImage } from './controllerImages';
 
 export interface ComposerImages {
   images: ControllerImage[];
-  /** How many pastes are still being shrunk/encoded. */
+  /** How many pastes/drops are still being shrunk/encoded. */
   preparing: number;
-  /** The last paste failure, if any. */
+  /** The last attach failure, if any. */
   error: string | null;
   clearError: () => void;
   handlePaste: (e: ClipboardEvent<HTMLTextAreaElement>) => Promise<void>;
+  handleDrop: (e: DragEvent<HTMLElement>) => Promise<void>;
   remove: (id: string) => void;
   clear: () => void;
 }
 
-/** Stage images pasted into a textarea, ready to ride along with the prompt. */
+/** Stage images pasted or dropped into a composer, to ride along with the prompt. */
 export function useComposerImages(): ComposerImages {
   const [images, setImages] = useState<ControllerImage[]>([]);
   const [preparing, setPreparing] = useState(0);
   const [error, setError] = useState<string | null>(null);
 
-  const handlePaste = useCallback(async (e: ClipboardEvent<HTMLTextAreaElement>) => {
-    const files = Array.from(e.clipboardData?.items ?? [])
-      .filter((item) => item.kind === 'file' && item.type.startsWith('image/'))
-      .map((item) => item.getAsFile())
-      .filter((f): f is File => !!f);
+  // Shrink/encode each image file and stage it. Shared by paste and drop.
+  const stage = useCallback(async (files: File[]) => {
     if (files.length === 0) return;
-    e.preventDefault();
     setError(null);
     setPreparing((n) => n + files.length);
     for (const file of files) {
@@ -47,12 +44,36 @@ export function useComposerImages(): ComposerImages {
     }
   }, []);
 
+  const handlePaste = useCallback(
+    async (e: ClipboardEvent<HTMLTextAreaElement>) => {
+      const files = Array.from(e.clipboardData?.items ?? [])
+        .filter((item) => item.kind === 'file' && item.type.startsWith('image/'))
+        .map((item) => item.getAsFile())
+        .filter((f): f is File => !!f);
+      if (files.length === 0) return;
+      e.preventDefault();
+      await stage(files);
+    },
+    [stage],
+  );
+
+  const handleDrop = useCallback(
+    async (e: DragEvent<HTMLElement>) => {
+      const files = Array.from(e.dataTransfer?.files ?? []).filter((f) => f.type.startsWith('image/'));
+      if (files.length === 0) return;
+      e.preventDefault();
+      await stage(files);
+    },
+    [stage],
+  );
+
   return {
     images,
     preparing,
     error,
     clearError: useCallback(() => setError(null), []),
     handlePaste,
+    handleDrop,
     remove: useCallback((id: string) => setImages((prev) => prev.filter((i) => i.id !== id)), []),
     clear: useCallback(() => setImages([]), []),
   };

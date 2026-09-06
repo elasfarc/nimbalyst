@@ -36,6 +36,11 @@ function pasteImage(el: HTMLElement) {
   });
 }
 
+function dropImage(el: HTMLElement) {
+  const file = new File(['x'], 'dropped.png', { type: 'image/png' });
+  fireEvent.drop(el, { dataTransfer: { files: [file], items: [] } });
+}
+
 describe('NewRemoteSessionDialog image attachments', () => {
   let create: ReturnType<typeof vi.fn>;
   let sendPrompt: ReturnType<typeof vi.fn>;
@@ -65,6 +70,21 @@ describe('NewRemoteSessionDialog image attachments', () => {
     expect(sendPrompt).toHaveBeenCalledWith('s1', 'look at this', [
       { name: 'shot.png', mimeType: 'image/png', data: 'BASE64' },
     ]);
+  });
+
+  it('stages and sends an image dropped onto the prompt', async () => {
+    render(<NewRemoteSessionDialog projects={projects} onClose={vi.fn()} onCreated={vi.fn()} />);
+    const prompt = screen.getByTestId('remote-new-session-prompt');
+    fireEvent.change(prompt, { target: { value: 'this one' } });
+    dropImage(prompt);
+    await screen.findByTestId('remote-session-composer-images');
+
+    fireEvent.click(screen.getByTestId('remote-new-session-create'));
+    await waitFor(() =>
+      expect(sendPrompt).toHaveBeenCalledWith('s1', 'this one', [
+        { name: 'dropped.png', mimeType: 'image/png', data: 'BASE64' },
+      ]),
+    );
   });
 
   it('still creates with an initial prompt when nothing is attached', async () => {

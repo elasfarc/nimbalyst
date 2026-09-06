@@ -6,6 +6,7 @@ import {
   parseFileRef,
   toCondensedBlocks,
   summarizeAssistant,
+  plainifyMarkdown,
   toolChipLabel,
   summarizeToolGroup,
   toolGroupHasError,
@@ -86,6 +87,37 @@ describe('summarizeAssistant', () => {
   it('returns empty for missing/blank text', () => {
     expect(summarizeAssistant(undefined)).toBe('');
     expect(summarizeAssistant('\n  \n')).toBe('');
+  });
+});
+
+describe('plainifyMarkdown', () => {
+  it('strips headings, bold/italic, inline code, and bullets across the whole body', () => {
+    const md = '# Title\n\nSome **bold** and *italic* and `code` here.\n\n- one\n- two';
+    expect(plainifyMarkdown(md)).toBe('Title\n\nSome bold and italic and code here.\n\n• one\n• two');
+  });
+
+  it('keeps fenced code verbatim and drops the fences', () => {
+    const md = 'Run this:\n```bash\nnpm **test**\n```\ndone';
+    // Inside the fence, `**test**` is code, not prose, so it is left untouched.
+    expect(plainifyMarkdown(md)).toBe('Run this:\nnpm **test**\ndone');
+  });
+
+  it('rewrites links as text (url) but leaves a bare autolink once', () => {
+    expect(plainifyMarkdown('see [the docs](https://x.dev)')).toBe('see the docs (https://x.dev)');
+    expect(plainifyMarkdown('[https://x.dev](https://x.dev)')).toBe('https://x.dev');
+  });
+
+  it('does not mangle underscores in identifiers or paths', () => {
+    expect(plainifyMarkdown('edit my_file_name.ts and run_it')).toBe('edit my_file_name.ts and run_it');
+  });
+
+  it('collapses a horizontal rule and extra blank lines', () => {
+    expect(plainifyMarkdown('a\n\n---\n\n\n\nb')).toBe('a\n\nb');
+  });
+
+  it('returns empty for missing text', () => {
+    expect(plainifyMarkdown(undefined)).toBe('');
+    expect(plainifyMarkdown('')).toBe('');
   });
 });
 

@@ -15,10 +15,11 @@ import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent }
 import { useAtomValue, useSetAtom } from 'jotai';
 import { InteractivePromptWidget } from '@nimbalyst/runtime/ui/AgentTranscript/components/InteractivePromptWidget';
 import { CondensedRemoteTranscript } from './CondensedRemoteTranscript';
-import { buildSessionMarkdown } from './condensedTranscript';
+import { buildSessionMarkdown, plainifyMarkdown } from './condensedTranscript';
 import { resolvePendingPrompt } from './pendingPrompt';
 import { RemoteCommitProposal, type CommitProposalResponse } from './RemoteCommitProposal';
 import { ComposerImageStrip, useComposerImages } from './composerImages';
+import { SelectionCopyButton } from './SelectionCopyButton';
 import {
   applyReplyStyle,
   nextReplyStyle,
@@ -147,6 +148,7 @@ export function RemoteSessionTranscript({ sessionId, isActive }: RemoteSessionTr
     return undefined;
   }, [speech.isSpeaking, sessionId, setSpeakingSession]);
   const { images, clear: clearImages } = composerImages;
+  const transcriptRootRef = useRef<HTMLDivElement>(null);
   const [sending, setSending] = useState(false);
   const [promptSubmitting, setPromptSubmitting] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -356,14 +358,22 @@ export function RemoteSessionTranscript({ sessionId, isActive }: RemoteSessionTr
     }));
     void projectRawMessagesToViewMessages(raw, provider)
       .then((projected) => {
-        // Hide the reply-style directive the composer appends to outgoing
-        // prompts. Strip it from the projected user text (not the raw
-        // `{"prompt":...}` envelope, which JSON.parse must still unwrap).
-        const cleaned = projected.map((m) =>
-          m.type === 'user_message' && typeof m.text === 'string'
-            ? { ...m, text: stripReplyStyle(m.text) }
-            : m,
-        );
+        // Two cleanups on the projected text, one per role:
+        //  - user_message: hide the reply-style directive the composer appends
+        //    to outgoing prompts (not the raw `{"prompt":...}` envelope, which
+        //    JSON.parse must still unwrap).
+        //  - assistant_message: flatten Markdown to plain text. The syntax is an
+        //    AI "tell" and noise the user otherwise strips by hand, so every skin
+        //    renders a plain document.
+        const cleaned = projected.map((m) => {
+          if (m.type === 'user_message' && typeof m.text === 'string') {
+            return { ...m, text: stripReplyStyle(m.text) };
+          }
+          if (m.type === 'assistant_message' && typeof m.text === 'string') {
+            return { ...m, text: plainifyMarkdown(m.text) };
+          }
+          return m;
+        });
         if (projectionToken.current === token) setViewMessages(cleaned);
       })
       .catch(() => {
@@ -707,7 +717,12 @@ export function RemoteSessionTranscript({ sessionId, isActive }: RemoteSessionTr
   };
 
   return (
-    <div className="remote-session-transcript relative flex flex-col flex-1 min-h-0" data-testid="remote-session-transcript">
+    <div
+      ref={transcriptRootRef}
+      className="remote-session-transcript relative flex flex-col flex-1 min-h-0"
+      data-testid="remote-session-transcript"
+    >
+      <SelectionCopyButton containerRef={transcriptRootRef} />
       {/* Header. Deliberately understated: no bar of its own — no fill, no rule
           under it — and ghost actions plus a ghost title that only come up to
           full contrast on hover, so a glance at the popover reads as text
@@ -1035,6 +1050,7 @@ export function RemoteSessionTranscript({ sessionId, isActive }: RemoteSessionTr
           summaries={docSummaries}
           onSummarize={() => void handleSummarize()}
           summarizing={summarizing}
+          composerImages={composerImages}
         />
       )}
 
@@ -1061,6 +1077,7 @@ export function RemoteSessionTranscript({ sessionId, isActive }: RemoteSessionTr
           choices={digest && !isExecuting ? digest.digest.choices : []}
           onChoice={(prompt) => void sendText(prompt)}
           redact={privacy.redactSecrets}
+          composerImages={composerImages}
         />
       )}
 
@@ -1147,11 +1164,13 @@ export function RemoteSessionTranscript({ sessionId, isActive }: RemoteSessionTr
               maxHeight: 160,
             }}
             rows={1}
-            title="Shift+Enter to send · paste an image to attach"
+            title="Shift+Enter to send · paste or drop an image to attach"
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
             onKeyDown={handleComposerKeyDown}
             onPaste={(e) => void composerImages.handlePaste(e)}
+            onDragOver={(e) => e.preventDefault()}
+            onDrop={(e) => void composerImages.handleDrop(e)}
             data-testid="remote-session-composer-input"
           />
           <button

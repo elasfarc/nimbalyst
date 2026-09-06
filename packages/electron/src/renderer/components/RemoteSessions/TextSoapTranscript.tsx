@@ -17,6 +17,7 @@
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent, type PointerEvent as ReactPointerEvent } from 'react';
 import type { TranscriptViewMessage } from '@nimbalyst/runtime/ai/server/transcript';
 import { toParagraphs, TEXT_CLEANERS, type TextSoapPara } from './textSoapDocument';
+import { ComposerImageStrip, type ComposerImages } from './composerImages';
 import { redactSecrets } from './controllerPrivacy';
 import { REPLY_STYLE_LABELS, type ReplyStyle } from './controllerReplyStyle';
 import { SPEECH_MODE_LABELS, type SpeechMode } from './controllerSpeech';
@@ -50,6 +51,8 @@ export interface TextSoapTranscriptProps {
   summaries: string[];
   onSummarize: () => void;
   summarizing: boolean;
+  /** Images staged for the next send; paste or drop into the document to attach. */
+  composerImages: ComposerImages;
 }
 
 export function TextSoapTranscript({
@@ -73,6 +76,7 @@ export function TextSoapTranscript({
   summaries,
   onSummarize,
   summarizing,
+  composerImages,
 }: TextSoapTranscriptProps) {
   const paragraphs = useMemo(() => {
     const paras = toParagraphs(messages);
@@ -285,8 +289,17 @@ export function TextSoapTranscript({
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
             onKeyDown={onKeyDown}
+            onPaste={(e) => void composerImages.handlePaste(e)}
+            onDragOver={(e) => e.preventDefault()}
+            onDrop={(e) => void composerImages.handleDrop(e)}
+            title="Paste or drop an image to attach it"
             data-testid="textsoap-composer-input"
           />
+        </div>
+
+        {/* Staged images ride along with the next Scrub, framed like an attachment. */}
+        <div className="textsoap-composer-images px-1 pl-[40px]">
+          <ComposerImageStrip {...composerImages} />
         </div>
       </div>
 

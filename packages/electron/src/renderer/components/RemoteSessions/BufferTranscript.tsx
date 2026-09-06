@@ -15,6 +15,7 @@
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react';
 import type { TranscriptViewMessage } from '@nimbalyst/runtime/ai/server/transcript';
 import { toParagraphs } from './textSoapDocument';
+import { ComposerImageStrip, type ComposerImages } from './composerImages';
 import { redactSecrets } from './controllerPrivacy';
 import { REPLY_STYLE_LABELS, type ReplyStyle } from './controllerReplyStyle';
 import { SPEECH_MODE_LABELS, type SpeechMode } from './controllerSpeech';
@@ -49,6 +50,8 @@ export interface BufferTranscriptProps {
   choices: Choice[];
   onChoice: (prompt: string) => void;
   redact: boolean;
+  /** Images staged for the next send; paste or drop into the buffer to attach. */
+  composerImages: ComposerImages;
 }
 
 export function BufferTranscript({
@@ -67,6 +70,7 @@ export function BufferTranscript({
   choices,
   onChoice,
   redact,
+  composerImages,
 }: BufferTranscriptProps) {
   const paragraphs = useMemo(() => {
     const paras = toParagraphs(messages);
@@ -223,8 +227,17 @@ export function BufferTranscript({
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
             onKeyDown={onKeyDown}
+            onPaste={(e) => void composerImages.handlePaste(e)}
+            onDragOver={(e) => e.preventDefault()}
+            onDrop={(e) => void composerImages.handleDrop(e)}
+            title="Paste or drop an image to attach it"
             data-testid="buffer-composer-input"
           />
+        </div>
+
+        {/* Staged images ride along with the next send, indented under the buffer. */}
+        <div className="buffer-composer-images px-1 pl-[46px]">
+          <ComposerImageStrip {...composerImages} />
         </div>
       </div>
       {/* Minimap — a fake code overview like a real editor. Decorative. */}
