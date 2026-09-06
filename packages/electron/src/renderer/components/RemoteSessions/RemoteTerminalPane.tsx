@@ -2,49 +2,50 @@
  * RemoteTerminalPane — a shell running on the HOST, typed into from here.
  *
  * The host spawns a real PTY in the session's working directory and relays its
- * bytes back over the session-control channel; this pane renders them as a plain
- * scrolling log (see controllerTerminal.ts for why there is no emulator) and
- * sends each submitted line back as input.
+ * bytes over the session-control channel. Those bytes are fed to a real terminal
+ * emulator — the same `ghostty-web` the desktop's own terminal uses — so colour,
+ * cursor addressing and full-screen programs (vim, htop, a pager, the CLI's own
+ * TUI) render the way they do in a local terminal. Keystrokes go back the same
+ * way, unbuffered, so tab completion, Ctrl+R, Ctrl+C and readline editing are the
+ * shell's to handle rather than something reimplemented here.
+ *
+ * The cost of that fidelity is a round trip per keystroke: the pane echoes
+ * nothing locally, because only the host knows whether the shell is echoing at
+ * all (it must not echo a `sudo` password). On a slow relay typing feels remote,
+ * which is the honest representation of what it is.
  *
  * The pane owns the terminal's lifetime: it opens one on mount and closes it on
  * unmount, so nothing is left running on the host after you close it.
  */
 
-import {
-  useCallback,
-  useEffect,
-  useRef,
-  useState,
-  type KeyboardEvent,
-  type PointerEvent as ReactPointerEvent,
-} from 'react';
-import { appendTerminalOutput } from './controllerTerminal';
+import { useCallback, useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
+import { Terminal, FitAddon } from 'ghostty-web';
+import { loadTerminalGhostty } from '../Terminal/ghosttyInstance';
+import { waitUntilElementMeasurable } from '../Terminal/terminalVisibility';
+import { readControllerTerminalTheme } from './controllerTerminalTheme';
 
-/** Smallest useful pane; below this the input and a line of output don't fit. */
+/** Smallest useful pane; below this the prompt and a line of output don't fit. */
 const MIN_HEIGHT = 120;
 const DEFAULT_HEIGHT = 280;
 const HEIGHT_STORAGE_KEY = 'controller.remoteTerminal.height';
 
 /**
- * Measure one monospace cell in the log element's own font, so the PTY can be
- * told a cols/rows that matches what the pane actually shows. Reuses a single
- * offscreen canvas; falls back to sane defaults if the context is unavailable.
+ * Scrollback is far shorter than the desktop terminal's 50k: this pane is
+ * ephemeral by construction (it dies with the mount), and every line in it
+ * crossed a relay, so retaining a session's worth of it buys nothing.
  */
-let cellCanvas: HTMLCanvasElement | null = null;
-function measureCell(el: HTMLElement): { w: number; h: number } {
-  const cs = getComputedStyle(el);
-  cellCanvas ??= document.createElement('canvas');
-  const ctx = cellCanvas.getContext('2d');
-  let w = 6.6;
-  if (ctx) {
-    ctx.font = `${cs.fontSize} ${cs.fontFamily}`;
-    const measured = ctx.measureText('0'.repeat(10)).width / 10;
-    if (measured > 0) w = measured;
-  }
-  const lineHeight = parseFloat(cs.lineHeight);
-  const h = Number.isFinite(lineHeight) && lineHeight > 0 ? lineHeight : parseFloat(cs.fontSize) * 1.45 || 16;
-  return { w, h };
-}
+const SCROLLBACK_LINES = 5_000;
+
+/** A terminal must be monospace, whatever font the controller skin is wearing. */
+const TERMINAL_FONT =
+  'ui-monospace, SFMono-Regular, "SF Mono", Menlo, Monaco, "Cascadia Code", "Roboto Mono", monospace';
+
+/**
+ * A resize burst (a height drag, the column changing width) would send one
+ * SIGWINCH per frame, and a TUI reflows fully on each — over a relay that is
+ * both a flood and a source of half-drawn frames. Collapse the burst.
+ */
+const RESIZE_DEBOUNCE_MS = 120;
 
 interface RemoteTerminalPaneProps {
   sessionId: string;
@@ -58,15 +59,11 @@ function newTerminalId(): string {
 
 export function RemoteTerminalPane({ sessionId, onClose }: RemoteTerminalPaneProps) {
   const terminalIdRef = useRef<string>(newTerminalId());
-  const [output, setOutput] = useState('');
-  const [command, setCommand] = useState('');
   const [status, setStatus] = useState<'opening' | 'ready' | 'closed'>('opening');
   const [error, setError] = useState<string | null>(null);
   const [cwd, setCwd] = useState<string | null>(null);
-  const logRef = useRef<HTMLPreElement>(null);
-  // Shell history, newest last; index is a position walked by Arrow Up/Down.
-  const historyRef = useRef<string[]>([]);
-  const historyIndexRef = useRef<number | null>(null);
+  const hostRef = useRef<HTMLDivElement>(null);
+  const terminalRef = useRef<Terminal | null>(null);
   // Drag-resizable pane height, remembered across mounts.
   const [height, setHeight] = useState<number>(() => {
     const saved = Number(localStorage.getItem(HEIGHT_STORAGE_KEY));
@@ -92,62 +89,157 @@ export function RemoteTerminalPane({ sessionId, onClose }: RemoteTerminalPanePro
 
   useEffect(() => {
     const terminalId = terminalIdRef.current;
+    let disposed = false;
+    let terminal: Terminal | null = null;
+    let fitAddon: FitAddon | null = null;
+    let inputDisposable: { dispose: () => void } | null = null;
+    let resizeObserver: ResizeObserver | null = null;
+    let resizeTimer: ReturnType<typeof setTimeout> | null = null;
+
+    // Output can arrive before the WASM emulator has finished loading, because
+    // the shell is spawned in parallel with it (below). Hold those bytes and
+    // replay them in order once there is something to write them to.
+    let pending: string[] | null = [];
+    const write = (data: string) => {
+      if (pending) pending.push(data);
+      else terminalRef.current?.write(data);
+    };
+
     const off = window.electronAPI?.remoteSessions?.onTerminalEvent?.((event) => {
       if (event.sessionId !== sessionId || event.payload?.terminalId !== terminalId) return;
       if (event.type === 'terminal_output') {
-        setOutput((prev) => appendTerminalOutput(prev, String(event.payload.data ?? '')));
+        write(String(event.payload.data ?? ''));
       } else if (event.type === 'terminal_ready') {
         setStatus('ready');
         setCwd(typeof event.payload.cwd === 'string' ? event.payload.cwd : null);
       } else if (event.type === 'terminal_exit') {
         setStatus('closed');
+        // Written as dim text rather than shown in the header: it belongs after
+        // the last line of output, where the reader is already looking.
+        write('\r\n\x1b[2m[the host shell exited]\x1b[0m\r\n');
       } else if (event.type === 'terminal_error') {
         setError(String(event.payload.error ?? 'The host refused the terminal'));
         setStatus('closed');
       }
     });
 
-    send('terminal_open', { cols: 100, rows: 30 });
+    // Spawn the shell now rather than after the emulator is up: the relay round
+    // trip dwarfs the WASM decode, so asking first means the prompt is usually
+    // already in flight by the time there is a screen to paint it on. The size
+    // is provisional — `fit()` sends the real one below, and the shell repaints
+    // on the resulting SIGWINCH.
+    send('terminal_open', { cols: 80, rows: 24 });
+
+    void (async () => {
+      const ghostty = await loadTerminalGhostty();
+      if (disposed || !hostRef.current) return;
+      // The pane can mount while the transcript column is still laying out; a
+      // terminal built against a zero-size element renders nothing.
+      if ((await waitUntilElementMeasurable(hostRef.current, { isDisposed: () => disposed })) !== 'measurable') {
+        return;
+      }
+      if (!hostRef.current) return;
+
+      terminal = new Terminal({
+        ghostty,
+        fontSize: 12,
+        fontFamily: TERMINAL_FONT,
+        scrollback: SCROLLBACK_LINES,
+        cursorBlink: false,
+        cursorStyle: 'bar',
+        theme: readControllerTerminalTheme(),
+      });
+      fitAddon = new FitAddon();
+      terminal.loadAddon(fitAddon);
+      terminal.open(hostRef.current);
+      // Let the canvas take its size before measuring it.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      if (disposed) return;
+
+      terminalRef.current = terminal;
+      const buffered = pending ?? [];
+      pending = null;
+      for (const chunk of buffered) terminal.write(chunk);
+
+      inputDisposable = terminal.onData((data) => {
+        if (!disposed) send('terminal_input', { data });
+      });
+
+      const applyResize = () => {
+        if (!fitAddon || disposed) return;
+        try {
+          fitAddon.fit();
+          const dims = fitAddon.proposeDimensions();
+          if (dims && dims.cols > 0 && dims.rows > 0) {
+            send('terminal_resize', { cols: dims.cols, rows: dims.rows });
+          }
+        } catch {
+          /* a fit against a disposed or unmeasurable canvas is not worth reporting */
+        }
+      };
+      applyResize();
+
+      // Covers both the height drag and the column changing width, so neither
+      // needs its own effect.
+      if (typeof ResizeObserver !== 'undefined') {
+        resizeObserver = new ResizeObserver(() => {
+          if (disposed) return;
+          if (resizeTimer) clearTimeout(resizeTimer);
+          resizeTimer = setTimeout(() => {
+            resizeTimer = null;
+            applyResize();
+          }, RESIZE_DEBOUNCE_MS);
+        });
+        resizeObserver.observe(hostRef.current);
+      }
+
+      terminal.focus();
+    })();
 
     return () => {
+      disposed = true;
       send('terminal_close');
       if (typeof off === 'function') off();
+      resizeObserver?.disconnect();
+      if (resizeTimer) clearTimeout(resizeTimer);
+      inputDisposable?.dispose();
+      terminal?.dispose();
+      fitAddon?.dispose();
+      terminalRef.current = null;
     };
   }, [sessionId, send]);
 
-  // Follow the tail; the pane is short enough that scrolling back is a
-  // deliberate act, so there is no "stick only when at the bottom" dance.
+  // Keystrokes that reached the terminal belong to the shell, not to the
+  // popover. The controller binds several window-level chords — ⌥N for notes,
+  // Cmd/Ctrl+F for session search, Ctrl+Arrow/Home/End to jump the transcript —
+  // and several of those guard only against INPUT/TEXTAREA targets or nothing at
+  // all, so Alt-meta sequences and readline's own Ctrl+F would be swallowed
+  // before the PTY ever saw them.
+  //
+  // Stopped on the way OUT (bubble phase, on the terminal's own container) so
+  // ghostty still handles the event first: stopping it on the way in would take
+  // the key away from the emulator too. The controller's deliberate Ctrl+Shift
+  // chords and the auto-blur idle bump listen in the capture phase and are
+  // untouched by design — they should keep working while the terminal is focused.
   useEffect(() => {
-    const el = logRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
-  }, [output]);
-
-  // Tell the host PTY the size the pane actually shows, so its own wrapping and
-  // the shell's line editor match what the reader sees.
-  const sendResize = useCallback(() => {
-    const el = logRef.current;
+    const el = hostRef.current;
     if (!el) return;
-    const cell = measureCell(el);
-    const cols = Math.max(20, Math.min(400, Math.floor(el.clientWidth / cell.w) || 80));
-    const rows = Math.max(5, Math.min(200, Math.floor(el.clientHeight / cell.h) || 24));
-    send('terminal_resize', { cols, rows });
-  }, [send]);
+    const swallow = (e: KeyboardEvent) => e.stopPropagation();
+    el.addEventListener('keydown', swallow);
+    return () => el.removeEventListener('keydown', swallow);
+  }, []);
 
-  // Resync on ready and whenever the pane's own height changes (a drag)…
+  // The skin can change while the pane is open (the appearance menu writes the
+  // `--nim-*` palette straight onto documentElement), and the emulator holds a
+  // snapshot of those colours rather than the vars themselves.
   useEffect(() => {
-    if (status === 'ready') sendResize();
-  }, [status, height, sendResize]);
-
-  // …and when the column it lives in changes width.
-  useEffect(() => {
-    const el = logRef.current;
-    if (!el || typeof ResizeObserver === 'undefined') return;
-    const observer = new ResizeObserver(() => {
-      if (status === 'ready') sendResize();
+    if (typeof MutationObserver === 'undefined' || typeof document === 'undefined') return;
+    const observer = new MutationObserver(() => {
+      if (terminalRef.current) terminalRef.current.options.theme = readControllerTerminalTheme();
     });
-    observer.observe(el);
+    observer.observe(document.documentElement, { attributes: true, attributeFilter: ['style'] });
     return () => observer.disconnect();
-  }, [status, sendResize]);
+  }, []);
 
   const onResizeStart = (e: ReactPointerEvent) => {
     e.preventDefault();
@@ -166,46 +258,6 @@ export function RemoteTerminalPane({ sessionId, onClose }: RemoteTerminalPanePro
     };
     window.addEventListener('pointermove', onMove);
     window.addEventListener('pointerup', onUp);
-  };
-
-  const run = () => {
-    if (status !== 'ready') return;
-    const line = command;
-    if (line.trim()) {
-      historyRef.current = [...historyRef.current.filter((h) => h !== line), line].slice(-100);
-    }
-    historyIndexRef.current = null;
-    send('terminal_input', { data: `${line}\n` });
-    setCommand('');
-  };
-
-  const onKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === 'Enter') {
-      e.preventDefault();
-      run();
-      return;
-    }
-    // Ctrl+C goes to the shell as a signal, not as a copy — there is no
-    // selection in a one-line input to copy anyway.
-    if (e.key === 'c' && e.ctrlKey) {
-      e.preventDefault();
-      send('terminal_input', { data: '\u0003' });
-      setCommand('');
-      return;
-    }
-    if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
-      const history = historyRef.current;
-      if (history.length === 0) return;
-      e.preventDefault();
-      e.stopPropagation();
-      const current = historyIndexRef.current ?? history.length;
-      const next =
-        e.key === 'ArrowUp'
-          ? Math.max(0, current - 1)
-          : Math.min(history.length, current + 1);
-      historyIndexRef.current = next;
-      setCommand(next >= history.length ? '' : history[next]);
-    }
   };
 
   return (
@@ -243,32 +295,12 @@ export function RemoteTerminalPane({ sessionId, onClose }: RemoteTerminalPanePro
         </button>
       </div>
 
-      <pre
-        ref={logRef}
-        className="remote-terminal-log flex-1 min-h-0 overflow-y-auto px-2 pb-1 text-[11px] leading-[1.45] whitespace-pre-wrap break-words select-text"
-        style={{ color: 'var(--nim-text)' }}
-        data-testid="remote-terminal-log"
-      >
-        {output}
-      </pre>
-
-      <div className="flex items-center gap-1 px-2 py-1 shrink-0">
-        <span style={{ color: 'var(--nim-primary)' }} className="text-[11px] select-none">
-          $
-        </span>
-        <input
-          className="remote-terminal-input flex-1 min-w-0 bg-transparent text-[11px] outline-none"
-          style={{ color: 'var(--nim-text)' }}
-          value={command}
-          onChange={(e) => setCommand(e.target.value)}
-          onKeyDown={onKeyDown}
-          disabled={status !== 'ready'}
-          placeholder={status === 'closed' ? 'shell closed' : 'command'}
-          spellCheck={false}
-          autoComplete="off"
-          data-testid="remote-terminal-input"
-        />
-      </div>
+      <div
+        ref={hostRef}
+        className="remote-terminal-surface flex-1 min-h-0 px-2 pb-1"
+        onClick={() => terminalRef.current?.focus()}
+        data-testid="remote-terminal-surface"
+      />
     </div>
   );
 }
