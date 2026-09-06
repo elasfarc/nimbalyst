@@ -13,6 +13,38 @@ One launcher runs all three: `packages/electron/scripts/controller-stack.sh`.
 
 ---
 
+## DEV VS PROD — the stack is always dev
+
+`controller-stack.sh start` launches both windows off the Vite dev servers:
+- **host** → `npm run dev` (default profile, real data, port 5273)
+- **controller** → `npm run dev:user2` (isolated profile, popover, port 5274)
+
+`npm run dev` **is** dev mode — so as long as you launch via this script, both
+windows are dev builds. That is by design: it lets source edits hot-reload on
+both sides. There is no packaged equivalent of the full host+controller+relay
+stack; the script only knows how to start the dev servers.
+
+**To run a packaged (prod) host instead:** `... stop` the stack, then use
+**Plan 3** below (the installed `Nimbalyst.app`) — that is a real build. The
+controller still has to be started separately (`npm run dev:user2:relay`); only
+the host goes packaged.
+
+**Don't switch to prod to fix a bug.** A packaged build ignores source changes,
+so any code fix needs the dev host anyway. Prod is only for "does it behave in a
+real build." Two implications worth remembering:
+- **`nimbalyst://` deep links don't fire in this dev stack.** All dev copies
+  share Electron's `com.github.Electron` bundle id, so the scheme is deliberately
+  not claimed (`src/main/utils/protocolRegistration.ts`); `npm run dev:url-handler`
+  only points one checkout at it and can't disambiguate host vs controller.
+  For same-machine controller→host actions, prefer a localhost loopback over the
+  URL scheme.
+- **Which window is which:** the host (5273) renders normal sessions in
+  `RichTranscriptView`; the controller (5274) renders remote sessions in
+  `RemoteSessionTranscript`. Match a screenshot to the right instance before
+  debugging.
+
+---
+
 ## THE ONE HARD RULE
 **Quit the normal Nimbalyst app before starting the fork host.** They share the
 same data folder and the DB lock is exclusive — running both at once risks
